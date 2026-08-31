@@ -68,7 +68,7 @@ pub async fn run() -> Result<()> {
             async move |req: NewSessionRequest, responder, _cx| {
                 tracing::info!(cwd = %req.cwd.display(), "ACP session/new");
                 let mut pi = PiProcess::spawn(&pi_command, timeout).await?;
-                let state = pi.get_session_state().await?;
+                let state = pi.get_state().await?;
                 tracing::info!(session_id = %state.session_id, "pi session ready");
                 let session_id: SessionId = state.session_id.into();
                 sessions_new.lock().await.insert(session_id.clone(), pi);

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Lint + test across the three target platforms (decision 4: Win/Mac/Linux).
+  lint-test:
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test
+        run: cargo test --all --all-features
+
+  # Cross-compile smoke check (no execution, just `cargo check` for the targets).
+  cross-compile:
+    name: cross-compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: add targets
+        run: rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin x86_64-unknown-linux-gnu
+      - name: check windows-gnu
+        run: cargo check --target x86_64-pc-windows-gnu
+      - name: check aarch64-apple-darwin
+        run: cargo check --target aarch64-apple-darwin

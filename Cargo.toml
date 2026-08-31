@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/pi-acp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/AndPuQing/pi-acp"
+authors = ["PuQing <me@puqing.work>"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+# --- ACP (Agent Client Protocol) — first-party SDK (added in S2 spike, W-449) ---
+# agent-client-protocol = "2.0"
+# agent-client-protocol-schema = "1.7"
+# --- async runtime (added in S2 spike, W-449; runtime locked by spike) ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# --- error handling ---
+thiserror = "2"
+anyhow = "1"
+# --- logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# --- misc ---
+dirs = "6"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

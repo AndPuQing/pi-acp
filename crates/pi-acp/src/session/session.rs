@@ -1,0 +1,1505 @@
+//! `PiAcpSession` — the per-session state machine (S5, W-452).
+//!
+//! Ports `acp/session.ts` (`PiAcpSession`) onto tokio. One session = one pi
+//! `--mode rpc` subprocess plus a **pump task** that owns the process handle
+//! and the pi event stream:
+//!
+//! - **TurnQueue**: client-side `one-at-a-time` queueing. A `prompt` while a
+//!   turn is running is queued; the queue is drained one turn at a time, each
+//!   completing only on pi's `agent_settled` event (**not** `agent_end`, which
+//!   pi may emit repeatedly for retries/compaction/continuations). `cancel()`
+//!   clears the queue (each queued turn resolves `Cancelled`) and aborts the
+//!   in-flight turn.
+//! - **Event pump**: a single `tokio::select!` loop consumes pi events and
+//!   session commands; every outbound ACP notification goes through one
+//!   ordered channel (`[`OutboundMessage`]`), so `session/update` frames leave
+//!   in the exact order the state machine produced them (design D4).
+//! - **Monotonic tool status**: `pending -> in_progress -> completed/failed`
+//!   never downgrades. pi events can arrive out of order (late `toolcall_*`
+//!   deltas after execution started); a tool already marked `in_progress`
+//!   stays `in_progress` when a streaming event re-surfaces it.
+//! - **edit/write diff**: on `tool_execution_start` the file is snapshotted
+//!   *before* the mutation; on `tool_execution_end` the new content is read
+//!   back and emitted as ACP `ToolCallContent::Diff` (old/new text) instead of
+//!   plain text. `edit` calls also resolve a 1-based line number from the
+//!   first uniquely-located `oldText` (S4 `find_unique_line_number`).
+//! - **Extension UI bridge**: pi `select`/`confirm` requests are bridged to
+//!   ACP `session/request_permission` (options map to `PermissionOption`s);
+//!   `input`/`editor`/`notify` and anything else are answered with a v1
+//!   `cancelled` response (parity with the TS reference).
+//!
+//! The pump task is created by [`PiAcpSession::spawn`]; external callers
+//! (`prompt` / `cancel` / `dispose`) talk to it over a command channel. The
+//! outbound channel is consumed either by a test recorder or by
+//! [`spawn_outbound_connector`], which bridges it to the ACP SDK connection
+//! (wired in S6).
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_client_protocol::schema::v1::{
+    ContentBlock, ContentChunk, Diff, PermissionOption, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
+    SessionInfoUpdate, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+};
+use agent_client_protocol::{Client, ConnectionTo};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot, Mutex};
+
+use crate::error::{AcpxError, Result};
+use crate::pi::process::PiProcess;
+use crate::pi::rpc::{
+    AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
+    RpcCommand, RpcEvent,
+};
+use crate::translate::bash::{
+    bash_command, bash_exit_code, bash_output_delta, bash_result_text, bash_terminal_content,
+    bash_terminal_exit_meta, bash_terminal_info_meta, bash_terminal_output_meta, is_bash_tool,
+};
+use crate::translate::tools::{
+    edit_old_texts, find_unique_line_number, to_tool_call_locations, to_tool_kind, tool_path,
+    tool_result_to_text,
+};
+
+/// How a turn ended (mirrors TS `StopReason`, minus `'error'` — the Rust
+/// rewrite surfaces failures as explicit `Err(AcpxError)`, design D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The turn completed normally (`agent_settled`).
+    EndTurn,
+    /// The turn was cancelled by the client (`session/cancel`).
+    Cancelled,
+}
+
+/// Outbound ACP messages produced by the session pump.
+///
+/// Everything the session sends to the ACP client travels this single ordered
+/// channel (design §8.1: *all `sessionUpdate` notifications through one
+/// ordered sink*). Production bridges it to the SDK connection via
+/// [`spawn_outbound_connector`]; tests record and answer it directly.
+#[derive(Debug)]
+pub enum OutboundMessage {
+    /// A `session/update` notification (full frame, including the session id).
+    Notify(SessionNotification),
+    /// A `session/request_permission` request; the answer is delivered back on
+    /// the oneshot. If the responder is dropped without sending, the request
+    /// is treated as cancelled by the caller.
+    RequestPermission(
+        RequestPermissionRequest,
+        oneshot::Sender<std::result::Result<RequestPermissionResponse, AcpxError>>,
+    ),
+}
+
+/// Parameters for spawning a session (S6 agent wiring / tests).
+pub struct SessionParams {
+    /// `pi` executable to spawn.
+    pub pi_command: String,
+    /// Extra CLI flags appended after the standard pi RPC arguments
+    /// (test fixtures like `--mock-rpc`; empty in production).
+    pub extra_args: Vec<String>,
+    /// Per-request pi RPC deadline.
+    pub timeout: Duration,
+    /// Working directory of the session (resolves relative tool paths).
+    pub cwd: PathBuf,
+    /// Outbound ACP message sink (see [`OutboundMessage`]).
+    pub outbound: mpsc::Sender<OutboundMessage>,
+}
+
+/// A handle to a running session. The heavy lifting lives in the pump task;
+/// this handle is cheaply cloneable (`Arc`) so the `SessionManager` can share
+/// it with the ACP agent handlers.
+#[derive(Debug)]
+pub struct PiAcpSession {
+    session_id: SessionId,
+    cwd: PathBuf,
+    cmd_tx: mpsc::Sender<SessionCommand>,
+}
+
+/// Commands the pump task accepts from the outside world.
+enum SessionCommand {
+    /// Start (or queue) a turn.
+    Prompt {
+        message: String,
+        images: Vec<ImageContent>,
+        respond: oneshot::Sender<Result<StopReason>>,
+    },
+    /// Clear the queue and abort the in-flight turn.
+    Cancel {
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Graceful teardown: dispose the pi process, then signal completion.
+    Shutdown { done: oneshot::Sender<()> },
+}
+
+/// A queued (not yet started) turn.
+struct QueuedTurn {
+    message: String,
+    images: Vec<ImageContent>,
+    resolve: oneshot::Sender<Result<StopReason>>,
+}
+
+/// The currently running turn.
+struct PendingTurn {
+    resolve: oneshot::Sender<Result<StopReason>>,
+}
+
+/// Monotonic tool-call status tracked by the session. pi may surface a tool
+/// multiple times (streaming `toolcall_*` deltas, then `tool_execution_*`);
+/// the tracked status only ever moves forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackedStatus {
+    Pending,
+    InProgress,
+}
+
+/// Pre-mutation snapshot of a file an `edit`/`write` tool call is about to
+/// touch, used to emit an ACP structured diff on completion.
+#[derive(Debug, Clone)]
+struct FileSnapshot {
+    /// The path as given in the tool args (kept verbatim — TS parity: the
+    /// diff's `path` field carries the raw path).
+    path: String,
+    /// Prior content; `None` when the file did not exist / could not be read
+    /// (a new file, so the diff's `oldText` is `None`).
+    old_text: Option<String>,
+}
+
+/// Per-session state machine state, owned by the pump task.
+struct Pump {
+    proc: Arc<Mutex<PiProcess>>,
+    outbound: mpsc::Sender<OutboundMessage>,
+    session_id: SessionId,
+    cwd: PathBuf,
+    event_rx: mpsc::Receiver<RpcEvent>,
+    cmd_rx: mpsc::Receiver<SessionCommand>,
+    /// Extension-UI answers written back to pi (fire-and-forget writes). Kept
+    /// on their own channel so the *command* channel closes — and the pump
+    /// shuts down — the moment every [`PiAcpSession`] handle is dropped.
+    extension_rx: mpsc::Receiver<ExtensionUiResponse>,
+    /// Held so `extension_rx.recv()` parks when no answer is pending; cloned
+    /// into the spawned extension-UI tasks.
+    extension_tx: mpsc::Sender<ExtensionUiResponse>,
+    /// Receives the result of the in-flight `prompt` RPC (the *early*
+    /// acceptance response — the turn itself completes at `agent_settled`).
+    prompt_rx: mpsc::Receiver<std::result::Result<(), AcpxError>>,
+    /// Held open so `prompt_rx.recv()` parks when no prompt is in flight.
+    _prompt_tx: mpsc::Sender<std::result::Result<(), AcpxError>>,
+
+    /// Client-side one-at-a-time turn queue.
+    queue: VecDeque<QueuedTurn>,
+    pending_turn: Option<PendingTurn>,
+    /// Maps abort semantics to the ACP stop reason for the running turn.
+    cancel_requested: bool,
+    /// True while pi's agent loop is running (`agent_start` .. `agent_end`).
+    in_agent_loop: bool,
+
+    /// Monotonic tool statuses (`tool_call_id` -> status).
+    current_tool_calls: HashMap<String, TrackedStatus>,
+    /// Tool call ids that mutate files (`edit` / `write`).
+    file_mutation_tool_call_ids: HashSet<String>,
+    file_snapshots: HashMap<String, FileSnapshot>,
+    bash_tool_call_ids: HashSet<String>,
+    bash_output_snapshots: HashMap<String, String>,
+}
+
+impl PiAcpSession {
+    /// Spawn `pi --mode rpc`, learn its session id, and start the pump task.
+    pub async fn spawn(params: SessionParams) -> Result<Arc<Self>> {
+        let extra: Vec<&str> = params.extra_args.iter().map(String::as_str).collect();
+        let mut proc =
+            PiProcess::spawn_with_args(&params.pi_command, &extra, None, params.timeout).await?;
+        let state = proc.get_state().await?;
+        let session_id: SessionId = state.session_id.into();
+        tracing::info!(session_id = %session_id.0, "pi session ready");
+        let event_rx = proc
+            .take_event_receiver()
+            .ok_or_else(|| AcpxError::RpcFailed {
+                command: "session".into(),
+                message: "pi event channel already taken".into(),
+            })?;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (prompt_tx, prompt_rx) = mpsc::channel(4);
+        let (extension_tx, extension_rx) = mpsc::channel(8);
+        let pump = Pump {
+            proc: Arc::new(Mutex::new(proc)),
+            outbound: params.outbound.clone(),
+            session_id: session_id.clone(),
+            cwd: params.cwd.clone(),
+            event_rx,
+            cmd_rx,
+            extension_rx,
+            extension_tx,
+            prompt_rx,
+            _prompt_tx: prompt_tx,
+            queue: VecDeque::new(),
+            pending_turn: None,
+            cancel_requested: false,
+            in_agent_loop: false,
+            current_tool_calls: HashMap::new(),
+            file_mutation_tool_call_ids: HashSet::new(),
+            file_snapshots: HashMap::new(),
+            bash_tool_call_ids: HashSet::new(),
+            bash_output_snapshots: HashMap::new(),
+        };
+        tokio::spawn(pump_loop(pump));
+
+        Ok(Arc::new(Self {
+            session_id,
+            cwd: params.cwd,
+            cmd_tx,
+        }))
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// Start a turn (or queue it behind the running one) and await its
+    /// completion — which happens at pi's `agent_settled`, **not** at the
+    /// early `prompt` response (S2 constraint 2).
+    ///
+    /// Returns [`StopReason::EndTurn`] for a normal settle, [`StopReason::Cancelled`]
+    /// when `cancel()` was requested, or `Err` when the turn failed (pi error /
+    /// process death) — surfaced explicitly per design D5.
+    pub async fn prompt(&self, message: String, images: Vec<ImageContent>) -> Result<StopReason> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::Prompt {
+                message,
+                images,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
+        rx.await
+            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+    }
+
+    /// Cancel the running turn and clear all queued turns (each resolves
+    /// `Cancelled`). Mirrors TS `PiAcpSession.cancel`: also sends `abort` to
+    /// pi, which then settles and resolves the in-flight turn as `Cancelled`.
+    pub async fn cancel(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::Cancel { respond: tx })
+            .await
+            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
+        rx.await
+            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+    }
+
+    /// Gracefully tear the session down: dispose the pi process (SIGTERM →
+    /// SIGKILL) and stop the pump. Pending/queued turns fail with
+    /// [`AcpxError::PiExited`].
+    pub async fn dispose(&self) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(SessionCommand::Shutdown { done: tx })
+            .await;
+        let _ = rx.await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pump task
+// ---------------------------------------------------------------------------
+
+async fn pump_loop(mut pump: Pump) {
+    let mut shutdown_done: Option<oneshot::Sender<()>> = None;
+
+    loop {
+        tokio::select! {
+            cmd = pump.cmd_rx.recv() => {
+                match cmd {
+                    Some(SessionCommand::Prompt { message, images, respond }) => {
+                        pump.on_prompt(message, images, respond).await;
+                    }
+                    Some(SessionCommand::Cancel { respond }) => {
+                        pump.on_cancel(respond).await;
+                    }
+                    Some(SessionCommand::Shutdown { done }) => {
+                        shutdown_done = Some(done);
+                        break;
+                    }
+                    // Every handle was dropped (session no longer referenced):
+                    // end the pump; the teardown below disposes pi.
+                    None => break,
+                }
+            }
+            ext = pump.extension_rx.recv() => {
+                if let Some(resp) = ext {
+                    pump.on_extension_ui_response(resp).await;
+                }
+            }
+            ev = pump.event_rx.recv() => {
+                match ev {
+                    Some(ev) => pump.on_event(ev).await,
+                    // pi's stdout ended (process exit) — fail the in-flight turn.
+                    None => {
+                        pump.on_stream_end().await;
+                        break;
+                    }
+                }
+            }
+            prompt_result = pump.prompt_rx.recv() => {
+                pump.on_prompt_result(prompt_result).await;
+            }
+        }
+    }
+
+    // Teardown: resolve anything still pending, dispose the process.
+    if let Some(pending) = pump.pending_turn.take() {
+        let _ = pending.resolve.send(Err(AcpxError::PiExited {
+            code: None,
+            signal: None,
+        }));
+    }
+    while let Some(t) = pump.queue.pop_front() {
+        let _ = t.resolve.send(Err(AcpxError::PiExited {
+            code: None,
+            signal: None,
+        }));
+    }
+    pump.proc.lock().await.dispose().await;
+    if let Some(done) = shutdown_done {
+        let _ = done.send(());
+    }
+}
+
+impl Pump {
+    // --- commands ---
+
+    async fn on_prompt(
+        &mut self,
+        message: String,
+        images: Vec<ImageContent>,
+        respond: oneshot::Sender<Result<StopReason>>,
+    ) {
+        let queued = QueuedTurn {
+            message,
+            images,
+            resolve: respond,
+        };
+        if self.pending_turn.is_some() {
+            // One-at-a-time: a turn is running, queue this one.
+            self.queue.push_back(queued);
+            self.emit_text(&format!("Queued message (position {}).", self.queue.len()))
+                .await;
+            self.emit_queue_depth(true).await;
+        } else {
+            self.start_turn(queued).await;
+        }
+    }
+
+    async fn on_cancel(&mut self, respond: oneshot::Sender<Result<()>>) {
+        self.cancel_requested = true;
+
+        // Clear the queue; each queued turn resolves as cancelled.
+        let had_queue = !self.queue.is_empty();
+        while let Some(t) = self.queue.pop_front() {
+            let _ = t.resolve.send(Ok(StopReason::Cancelled));
+        }
+        if had_queue {
+            self.emit_text("Cleared queued prompts.").await;
+            self.emit_queue_depth(self.pending_turn.is_some()).await;
+        }
+
+        // Abort the in-flight turn (no-op when none is running). Runs in a
+        // spawned task so the pump keeps consuming events — pi settles after
+        // an abort, and that settle resolves the pending turn as cancelled.
+        let proc = self.proc.clone();
+        tokio::spawn(async move {
+            let result = {
+                let mut p = proc.lock().await;
+                p.abort().await
+            };
+            let _ = respond.send(result);
+        });
+    }
+
+    async fn on_extension_ui_response(&mut self, resp: ExtensionUiResponse) {
+        let mut proc = self.proc.lock().await;
+        if let Err(e) = proc.send_extension_ui_response(resp).await {
+            tracing::warn!(error = %e, "failed to write extension_ui_response to pi");
+        }
+    }
+
+    /// The early `prompt` RPC response. `Ok` means pi accepted the turn (it
+    /// completes at `agent_settled`); `Err` means the prompt was rejected or
+    /// pi died — resolve the pending turn explicitly (TS parity), surfacing
+    /// the error per design D5, and do **not** auto-start queued turns (pi may
+    /// be unhealthy).
+    async fn on_prompt_result(&mut self, result: Option<std::result::Result<(), AcpxError>>) {
+        let result = match result {
+            Some(Ok(())) | None => return, // accepted; wait for agent_settled
+            Some(Err(e)) => e,
+        };
+        let Some(pending) = self.pending_turn.take() else {
+            return; // already settled (defensive)
+        };
+        if self.cancel_requested {
+            let _ = pending.resolve.send(Ok(StopReason::Cancelled));
+        } else {
+            let _ = pending.resolve.send(Err(result));
+        }
+        self.in_agent_loop = false;
+        self.emit_queue_depth(false).await;
+    }
+
+    async fn start_turn(&mut self, queued: QueuedTurn) {
+        self.cancel_requested = false;
+        self.in_agent_loop = false;
+        self.pending_turn = Some(PendingTurn {
+            resolve: queued.resolve,
+        });
+        self.emit_queue_depth(true).await;
+
+        // Send the prompt in a spawned task so the pump keeps servicing
+        // commands (cancel) and events while the early response is in flight.
+        let proc = self.proc.clone();
+        let tx = self._prompt_tx.clone();
+        tokio::spawn(async move {
+            let result = {
+                let mut p = proc.lock().await;
+                p.request(&RpcCommand::Prompt {
+                    message: queued.message,
+                    images: Some(queued.images),
+                    streaming_behavior: None,
+                })
+                .await
+            };
+            let _ = tx.send(result.map(|_| ())).await;
+        });
+    }
+
+    // --- outbound helpers ---
+
+    async fn emit(&mut self, update: SessionUpdate) {
+        let notif = SessionNotification::new(self.session_id.clone(), update);
+        if self
+            .outbound
+            .send(OutboundMessage::Notify(notif))
+            .await
+            .is_err()
+        {
+            tracing::debug!("outbound sink closed; dropping session update");
+        }
+    }
+
+    async fn emit_text(&mut self, text: &str) {
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
+        self.emit(SessionUpdate::AgentMessageChunk(chunk)).await;
+    }
+
+    /// Publish the client-side queue depth via `session_info_update._meta`
+    /// (the `piAcp.queueDepth` contract; invisible in Zed today, kept for
+    /// TS parity).
+    async fn emit_queue_depth(&mut self, running: bool) {
+        let meta = json!({
+            "piAcp": { "queueDepth": self.queue.len(), "running": running }
+        })
+        .as_object()
+        .expect("static queueDepth meta")
+        .clone();
+        let update = SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(meta));
+        self.emit(update).await;
+    }
+
+    // --- pi events ---
+
+    async fn on_event(&mut self, ev: RpcEvent) {
+        match ev {
+            RpcEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => self.on_message_update(&assistant_message_event).await,
+            RpcEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
+                self.on_tool_execution_start(&tool_call_id, &tool_name, &args)
+                    .await
+            }
+            RpcEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial_result,
+                ..
+            } => {
+                self.on_tool_execution_update(&tool_call_id, &partial_result)
+                    .await
+            }
+            RpcEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                is_error,
+                ..
+            } => {
+                self.on_tool_execution_end(&tool_call_id, &result, is_error)
+                    .await
+            }
+            RpcEvent::BashExecutionUpdate { id, delta } => {
+                self.on_bash_execution_update(id.as_deref(), &delta).await
+            }
+            RpcEvent::AgentStart => self.in_agent_loop = true,
+            // pi emits `agent_end` for every low-level run (retry, compaction,
+            // queued continuation) — the ACP turn stays open until `agent_settled`.
+            RpcEvent::AgentEnd { .. } => self.in_agent_loop = false,
+            // `turn_end` marks sub-steps (e.g. a tool_use turn). Never resolves
+            // the ACP prompt here.
+            RpcEvent::TurnEnd { .. } => {}
+            RpcEvent::AgentSettled => self.on_agent_settled().await,
+            RpcEvent::ExtensionUiRequest { inner } => self.spawn_extension_ui(inner),
+            RpcEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                ..
+            } => {
+                self.emit_text(&format_auto_retry_message(attempt, max_attempts, delay_ms))
+                    .await;
+            }
+            RpcEvent::AutoRetryEnd { .. } => {
+                self.emit_text("Retry finished, resuming.").await;
+            }
+            RpcEvent::CompactionStart { reason } => {
+                if matches!(
+                    reason,
+                    CompactionReason::Threshold | CompactionReason::Overflow
+                ) {
+                    self.emit_text("Context nearing limit, running automatic compaction...")
+                        .await;
+                }
+            }
+            RpcEvent::CompactionEnd {
+                reason, aborted, ..
+            } => {
+                if matches!(
+                    reason,
+                    CompactionReason::Threshold | CompactionReason::Overflow
+                ) && !aborted
+                {
+                    self.emit_text(
+                        "Automatic compaction finished; context was summarized to continue the session.",
+                    )
+                    .await;
+                }
+            }
+            // Not wired in S5 (logged): QueueUpdate / SessionInfoChanged /
+            // ThinkingLevelChanged / EntryAppended / UnmatchedResponse /
+            // ExtensionError / summarization retries / unknown future events.
+            other => {
+                tracing::trace!(?other, "unhandled pi event");
+            }
+        }
+    }
+
+    /// The turn is truly over. Resolve the pending ACP prompt, then either
+    /// start the next queued turn or publish the idle queue depth.
+    async fn on_agent_settled(&mut self) {
+        let Some(pending) = self.pending_turn.take() else {
+            tracing::debug!("agent_settled with no pending turn; ignoring");
+            return;
+        };
+        let reason = if self.cancel_requested {
+            StopReason::Cancelled
+        } else {
+            StopReason::EndTurn
+        };
+        let _ = pending.resolve.send(Ok(reason));
+        self.in_agent_loop = false;
+
+        if let Some(next) = self.queue.pop_front() {
+            self.emit_text(&format!(
+                "Starting queued message. ({} remaining)",
+                self.queue.len()
+            ))
+            .await;
+            self.start_turn(next).await;
+        } else {
+            self.emit_queue_depth(false).await;
+        }
+    }
+
+    /// pi's stdout ended without a settle: the process exited mid-turn. Fail
+    /// the pending turn and all queued turns with [`AcpxError::PiExited`]
+    /// (fixes #82 — a dead pi is never a silent empty `end_turn`).
+    async fn on_stream_end(&mut self) {
+        let (code, signal) = {
+            let proc = self.proc.lock().await;
+            proc.exit_status().unwrap_or((None, None))
+        };
+        let pending_err = AcpxError::PiExited { code, signal };
+        if let Some(p) = self.pending_turn.take() {
+            let _ = p.resolve.send(Err(pending_err));
+        }
+        while let Some(t) = self.queue.pop_front() {
+            let _ = t.resolve.send(Err(AcpxError::PiExited { code, signal }));
+        }
+        self.in_agent_loop = false;
+    }
+
+    // --- streaming assistant messages ---
+
+    async fn on_message_update(&mut self, ame: &AssistantMessageEvent) {
+        match ame {
+            AssistantMessageEvent::TextDelta { delta, .. } => {
+                self.emit_text(delta).await;
+            }
+            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(delta.clone())));
+                self.emit(SessionUpdate::AgentThoughtChunk(chunk)).await;
+            }
+            AssistantMessageEvent::ToolcallStart { id, tool_name, .. } => {
+                // Modern pi strips the partial message and injects id/toolName;
+                // args are not yet streamed, so rawInput/locations are absent.
+                self.surface_tool_call(id, tool_name, None).await;
+            }
+            AssistantMessageEvent::ToolcallEnd { tool_call, .. } => {
+                let id = tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = tool_call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let raw_input = raw_input_of_tool_call(tool_call);
+                self.surface_tool_call(&id, &name, raw_input).await;
+            }
+            // toolcall_delta carries no id on the modern wire form (partial is
+            // stripped) — no-op, matching TS. Other sub-events are not streamed.
+            _ => {}
+        }
+    }
+
+    /// Surface a tool call as early as possible (while the model is still
+    /// streaming args). Never downgrades an already-tracked status — if a
+    /// `tool_execution_start` already marked the tool `in_progress`, a later
+    /// streaming event keeps `in_progress` instead of going back to `pending`
+    /// (clients hide progress on downgrades).
+    async fn surface_tool_call(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        raw_input: Option<Value>,
+    ) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        let existing = self.current_tool_calls.get(tool_call_id).copied();
+        // Monotonic: keep the existing status, else `pending`.
+        let status = existing.unwrap_or(TrackedStatus::Pending);
+        let locations = raw_input
+            .as_ref()
+            .map(|ri| to_tool_call_locations(ri, &self.cwd, None))
+            .unwrap_or_default();
+
+        if is_bash_tool(tool_name) {
+            if existing.is_none() {
+                self.current_tool_calls
+                    .insert(tool_call_id.to_string(), TrackedStatus::Pending);
+            }
+            self.emit_bash_tool_call(
+                tool_call_id,
+                tool_name,
+                raw_input.as_ref(),
+                status,
+                locations,
+                existing.is_none(),
+            )
+            .await;
+        } else if existing.is_none() {
+            self.current_tool_calls
+                .insert(tool_call_id.to_string(), TrackedStatus::Pending);
+            let mut call = ToolCall::new(tool_call_id.to_string(), tool_name.to_string())
+                .kind(to_tool_kind(tool_name))
+                .status(acp_status(status))
+                .locations(locations);
+            if let Some(input) = raw_input {
+                call = call.raw_input(input);
+            }
+            self.emit(SessionUpdate::ToolCall(call)).await;
+        } else {
+            let fields = ToolCallUpdateFields::new()
+                .status(Some(acp_status(status)))
+                .locations(Some(locations))
+                .raw_input(raw_input);
+            self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id.to_string(),
+                fields,
+            )))
+            .await;
+        }
+    }
+
+    // --- tool execution ---
+
+    async fn on_tool_execution_start(&mut self, tool_call_id: &str, tool_name: &str, args: &Value) {
+        let existing = self.current_tool_calls.get(tool_call_id).copied();
+        self.current_tool_calls
+            .insert(tool_call_id.to_string(), TrackedStatus::InProgress);
+
+        if is_bash_tool(tool_name) {
+            let locations = to_tool_call_locations(args, &self.cwd, None);
+            self.emit_bash_tool_call(
+                tool_call_id,
+                tool_name,
+                Some(args),
+                TrackedStatus::InProgress,
+                locations,
+                existing.is_none(),
+            )
+            .await;
+            return;
+        }
+
+        // Capture pre-mutation file contents so we can emit a structured ACP
+        // diff on completion. For `edit`, resolve the 1-based line number of
+        // the first uniquely-located oldText (S4 helper) for the ACP location.
+        let mut line: Option<u32> = None;
+        if matches!(tool_name, "edit" | "write") {
+            self.file_mutation_tool_call_ids
+                .insert(tool_call_id.to_string());
+            if let Some(p) = tool_path(args) {
+                let abs = resolve_path(&self.cwd, &p);
+                let read = std::fs::read_to_string(&abs).ok();
+                if tool_name == "edit" {
+                    if let Some(text) = &read {
+                        for needle in edit_old_texts(args) {
+                            if let Some(n) = find_unique_line_number(text, &needle) {
+                                line = Some(n);
+                                break;
+                            }
+                        }
+                    }
+                }
+                self.file_snapshots.insert(
+                    tool_call_id.to_string(),
+                    FileSnapshot {
+                        path: p,
+                        old_text: read,
+                    },
+                );
+            }
+        }
+
+        let locations = to_tool_call_locations(args, &self.cwd, line);
+        if existing.is_none() {
+            let call = ToolCall::new(tool_call_id.to_string(), tool_name.to_string())
+                .status(ToolCallStatus::InProgress)
+                .locations(locations)
+                .raw_input(args.clone());
+            self.emit(SessionUpdate::ToolCall(call)).await;
+        } else {
+            let fields = ToolCallUpdateFields::new()
+                .status(Some(ToolCallStatus::InProgress))
+                .locations(Some(locations))
+                .raw_input(Some(args.clone()));
+            self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id.to_string(),
+                fields,
+            )))
+            .await;
+        }
+    }
+
+    async fn on_tool_execution_update(&mut self, tool_call_id: &str, partial_result: &Value) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        if self.bash_tool_call_ids.contains(tool_call_id) {
+            self.emit_bash_output_update(
+                tool_call_id,
+                ToolCallStatus::InProgress,
+                partial_result,
+                false,
+            )
+            .await;
+            return;
+        }
+        // File mutations suppress content/rawOutput while running (the diff is
+        // emitted at completion); other tools stream their partial text.
+        let is_file_mutation = self.file_mutation_tool_call_ids.contains(tool_call_id);
+        let text = if is_file_mutation {
+            String::new()
+        } else {
+            tool_result_to_text(partial_result)
+        };
+        let content = if text.is_empty() {
+            None
+        } else {
+            Some(vec![ToolCallContent::Content(
+                agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                    TextContent::new(text),
+                )),
+            )])
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(Some(ToolCallStatus::InProgress))
+            .content(content)
+            .raw_output(if is_file_mutation {
+                None
+            } else {
+                Some(partial_result.clone())
+            });
+        self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            fields,
+        )))
+        .await;
+    }
+
+    async fn on_tool_execution_end(&mut self, tool_call_id: &str, result: &Value, is_error: bool) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        if self.bash_tool_call_ids.contains(tool_call_id) {
+            self.emit_bash_output_update(
+                tool_call_id,
+                if is_error {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                },
+                result,
+                is_error,
+            )
+            .await;
+            self.cleanup_tool_call(tool_call_id);
+            return;
+        }
+
+        let text = tool_result_to_text(result);
+        let snapshot = self.file_snapshots.get(tool_call_id).cloned();
+        let mut content: Vec<ToolCallContent> = Vec::new();
+        let mut has_structured_diff = false;
+
+        if !is_error {
+            if let Some(snap) = &snapshot {
+                let abs = resolve_path(&self.cwd, &snap.path);
+                if let Ok(new_text) = std::fs::read_to_string(&abs) {
+                    if snap.old_text.is_none()
+                        || Some(new_text.as_str()) != snap.old_text.as_deref()
+                    {
+                        has_structured_diff = true;
+                        content = vec![ToolCallContent::Diff(
+                            Diff::new(snap.path.clone(), new_text).old_text(snap.old_text.clone()),
+                        )];
+                    }
+                }
+            }
+        }
+
+        if !has_structured_diff && !text.is_empty() {
+            content = vec![ToolCallContent::Content(
+                agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                    TextContent::new(text),
+                )),
+            )];
+        }
+
+        let fields = ToolCallUpdateFields::new()
+            .status(Some(if is_error {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            }))
+            .content(if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            })
+            .raw_output(if has_structured_diff {
+                None
+            } else {
+                Some(result.clone())
+            });
+        self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            fields,
+        )))
+        .await;
+
+        self.cleanup_tool_call(tool_call_id);
+    }
+
+    /// Newer pi streams bash output through `bash_execution_update` deltas;
+    /// append them to the tool's terminal.
+    async fn on_bash_execution_update(&mut self, tool_call_id: Option<&str>, delta: &str) {
+        let Some(id) = tool_call_id else { return };
+        if !self.bash_tool_call_ids.contains(id) || delta.is_empty() {
+            return;
+        }
+        let prev = self
+            .bash_output_snapshots
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        self.bash_output_snapshots
+            .insert(id.to_string(), prev + delta);
+        let fields = ToolCallUpdateFields::new().status(Some(ToolCallStatus::InProgress));
+        let update =
+            ToolCallUpdate::new(id.to_string(), fields).meta(bash_terminal_output_meta(id, delta));
+        self.emit(SessionUpdate::ToolCallUpdate(update)).await;
+    }
+
+    // --- bash terminal rendering ---
+
+    /// Emit (or update) a bash tool call as an ACP `execute` tool with an
+    /// embedded terminal. The terminal (content + `terminal_info` meta) is
+    /// attached on the *first* emission; later transitions only carry status.
+    async fn emit_bash_tool_call(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: Option<&Value>,
+        status: TrackedStatus,
+        locations: Vec<agent_client_protocol::schema::v1::ToolCallLocation>,
+        include_terminal: bool,
+    ) {
+        self.bash_tool_call_ids.insert(tool_call_id.to_string());
+        let title = args
+            .and_then(bash_command)
+            .unwrap_or_else(|| tool_name.to_string());
+        if include_terminal {
+            let call = ToolCall::new(tool_call_id.to_string(), title)
+                .kind(ToolKind::Execute)
+                .status(acp_status(status))
+                .locations(locations)
+                .content(bash_terminal_content(tool_call_id))
+                .meta(bash_terminal_info_meta(
+                    tool_call_id,
+                    &self.cwd.to_string_lossy(),
+                ));
+            self.emit(SessionUpdate::ToolCall(call)).await;
+        } else {
+            let fields = ToolCallUpdateFields::new()
+                .kind(Some(ToolKind::Execute))
+                .title(Some(title))
+                .status(Some(acp_status(status)))
+                .locations(Some(locations));
+            self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id.to_string(),
+                fields,
+            )))
+            .await;
+        }
+    }
+
+    /// Stream a delta of the accumulated bash output into the tool's terminal,
+    /// and close it with an exit code on completion/failure.
+    async fn emit_bash_output_update(
+        &mut self,
+        tool_call_id: &str,
+        status: ToolCallStatus,
+        result: &Value,
+        is_error: bool,
+    ) {
+        let text = bash_result_text(result);
+        let previous = self
+            .bash_output_snapshots
+            .get(tool_call_id)
+            .cloned()
+            .unwrap_or_default();
+        let delta = bash_output_delta(&previous, &text);
+        self.bash_output_snapshots
+            .insert(tool_call_id.to_string(), text);
+
+        let mut meta = serde_json::Map::new();
+        if !delta.is_empty() {
+            meta.extend(bash_terminal_output_meta(tool_call_id, &delta));
+        }
+        if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+            meta.extend(bash_terminal_exit_meta(
+                tool_call_id,
+                bash_exit_code(result, is_error),
+            ));
+        }
+        let fields = ToolCallUpdateFields::new().status(Some(status));
+        let update = if meta.is_empty() {
+            ToolCallUpdate::new(tool_call_id.to_string(), fields)
+        } else {
+            ToolCallUpdate::new(tool_call_id.to_string(), fields).meta(meta)
+        };
+        self.emit(SessionUpdate::ToolCallUpdate(update)).await;
+    }
+
+    fn cleanup_tool_call(&mut self, tool_call_id: &str) {
+        self.current_tool_calls.remove(tool_call_id);
+        self.file_snapshots.remove(tool_call_id);
+        self.file_mutation_tool_call_ids.remove(tool_call_id);
+        self.bash_tool_call_ids.remove(tool_call_id);
+        self.bash_output_snapshots.remove(tool_call_id);
+    }
+
+    // --- extension UI bridge ---
+
+    /// Bridge a pi extension UI request to the ACP client. `select`/`confirm`
+    /// become `session/request_permission` (answered in a spawned task — pi
+    /// blocks its turn on the answer, so the pump must not wait); the rest are
+    /// answered with a v1 `cancelled` (TS parity).
+    fn spawn_extension_ui(&self, req: ExtensionUiRequest) {
+        let outbound = self.outbound.clone();
+        let extension_tx = self.extension_tx.clone();
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            let response = handle_extension_ui_request(&session_id, &req, &outbound).await;
+            if let Some(resp) = response {
+                let _ = extension_tx.send(resp).await;
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound connector (S6 wiring)
+// ---------------------------------------------------------------------------
+
+/// Bridge a session's outbound channel to the ACP SDK connection: forwards
+/// `session/update` notifications in order and answers
+/// `session/request_permission` requests. Runs on a spawned task — outside the
+/// SDK dispatch loop, so `block_task()` is safe there.
+pub fn spawn_outbound_connector(
+    conn: ConnectionTo<Client>,
+    mut rx: mpsc::Receiver<OutboundMessage>,
+) -> std::result::Result<(), AcpxError> {
+    let _: tokio::task::JoinHandle<std::result::Result<(), AcpxError>> = tokio::spawn(async move {
+        let run: std::result::Result<(), agent_client_protocol::Error> = async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    OutboundMessage::Notify(notif) => {
+                        conn.send_notification(notif)?;
+                    }
+                    OutboundMessage::RequestPermission(request, respond) => {
+                        let response = conn.send_request(request).block_task().await.map_err(|e| {
+                            AcpxError::RpcFailed {
+                                command: "request_permission".into(),
+                                message: e.to_string(),
+                            }
+                        });
+                        let _ = respond.send(response);
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = run {
+            tracing::warn!(error = %e, "session outbound connector stopped");
+        }
+        Ok(())
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Extension UI helpers (pure, unit-tested)
+// ---------------------------------------------------------------------------
+
+const CHOICE_PREFIX: &str = "choice-";
+const CONFIRM_YES: &str = "yes";
+const CONFIRM_NO: &str = "no";
+
+impl ExtensionUiRequest {
+    /// The wire `method` of this request.
+    fn method_name(&self) -> &'static str {
+        match self {
+            ExtensionUiRequest::Select { .. } => "select",
+            ExtensionUiRequest::Confirm { .. } => "confirm",
+            ExtensionUiRequest::Input { .. } => "input",
+            ExtensionUiRequest::Editor { .. } => "editor",
+            ExtensionUiRequest::Notify { .. } => "notify",
+            ExtensionUiRequest::SetStatus { .. } => "setStatus",
+            ExtensionUiRequest::SetWidget { .. } => "setWidget",
+            ExtensionUiRequest::SetTitle { .. } => "setTitle",
+            ExtensionUiRequest::SetEditorText { .. } => "set_editor_text",
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            ExtensionUiRequest::Select { id, .. }
+            | ExtensionUiRequest::Confirm { id, .. }
+            | ExtensionUiRequest::Input { id, .. }
+            | ExtensionUiRequest::Editor { id, .. }
+            | ExtensionUiRequest::Notify { id, .. }
+            | ExtensionUiRequest::SetStatus { id, .. }
+            | ExtensionUiRequest::SetWidget { id, .. }
+            | ExtensionUiRequest::SetTitle { id, .. }
+            | ExtensionUiRequest::SetEditorText { id, .. } => id,
+        }
+    }
+
+    fn title(&self) -> Option<&str> {
+        match self {
+            ExtensionUiRequest::Select { title, .. }
+            | ExtensionUiRequest::Confirm { title, .. }
+            | ExtensionUiRequest::Input { title, .. }
+            | ExtensionUiRequest::Editor { title, .. } => Some(title),
+            _ => None,
+        }
+    }
+}
+
+/// Handle one extension UI request and return the answer to send back to pi
+/// (`None` when nothing should be sent). The permission round-trip goes
+/// through the outbound channel so tests can drive it.
+async fn handle_extension_ui_request(
+    session_id: &SessionId,
+    req: &ExtensionUiRequest,
+    outbound: &mpsc::Sender<OutboundMessage>,
+) -> Option<ExtensionUiResponse> {
+    match req {
+        ExtensionUiRequest::Select {
+            id, title, options, ..
+        } => handle_extension_select(session_id, id, title, options, req, outbound).await,
+        ExtensionUiRequest::Confirm { id, title, .. } => {
+            handle_extension_confirm(session_id, id, title, req, outbound).await
+        }
+        ExtensionUiRequest::Input { id, .. } | ExtensionUiRequest::Editor { id, .. } => {
+            let method = req.method_name();
+            send_extension_notice(
+                outbound,
+                session_id,
+                &format!("Pi {method} UI request is not supported in ACP yet; cancelling it."),
+                None,
+            )
+            .await;
+            Some(cancelled(id))
+        }
+        ExtensionUiRequest::Notify {
+            id,
+            message,
+            notify_type,
+            ..
+        } => {
+            let level = notify_type.clone().unwrap_or_else(|| "info".to_string());
+            let meta = json!({ "piAcp": { "notify": { "level": level } } })
+                .as_object()
+                .expect("static notify meta")
+                .clone();
+            send_extension_notice(outbound, session_id, message, Some(meta)).await;
+            Some(cancelled(id))
+        }
+        // setStatus / setWidget / setTitle / set_editor_text: display-only —
+        // answer cancelled (TS parity).
+        _ => Some(cancelled(req.id())),
+    }
+}
+
+/// `select` -> ACP `session/request_permission` with one `PermissionOption`
+/// per choice (`choice-<index>`); the chosen option's index maps back to the
+/// value pi receives.
+async fn handle_extension_select(
+    session_id: &SessionId,
+    id: &str,
+    title: &str,
+    raw_options: &[String],
+    req: &ExtensionUiRequest,
+    outbound: &mpsc::Sender<OutboundMessage>,
+) -> Option<ExtensionUiResponse> {
+    if raw_options.is_empty() {
+        return Some(cancelled(id));
+    }
+    let permission_options: Vec<PermissionOption> = raw_options
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            PermissionOption::new(
+                format!("{CHOICE_PREFIX}{i}"),
+                name.clone(),
+                PermissionOptionKind::AllowOnce,
+            )
+        })
+        .collect();
+
+    match request_permission(session_id, id, title, req, permission_options, outbound).await {
+        Ok(RequestPermissionOutcome::Selected(selected)) => {
+            let idx = option_index(selected.option_id.0.as_ref());
+            match idx.and_then(|i| raw_options.get(i)) {
+                Some(value) => Some(ExtensionUiResponse::Value {
+                    id: id.to_string(),
+                    value: value.clone(),
+                }),
+                None => Some(cancelled(id)),
+            }
+        }
+        _ => Some(cancelled(id)),
+    }
+}
+
+/// `confirm` -> ACP `session/request_permission` with the fixed Yes/No options.
+async fn handle_extension_confirm(
+    session_id: &SessionId,
+    id: &str,
+    title: &str,
+    req: &ExtensionUiRequest,
+    outbound: &mpsc::Sender<OutboundMessage>,
+) -> Option<ExtensionUiResponse> {
+    let permission_options = vec![
+        PermissionOption::new(CONFIRM_YES, "Yes", PermissionOptionKind::AllowOnce),
+        PermissionOption::new(CONFIRM_NO, "No", PermissionOptionKind::RejectOnce),
+    ];
+    match request_permission(session_id, id, title, req, permission_options, outbound).await {
+        Ok(RequestPermissionOutcome::Selected(selected)) => Some(ExtensionUiResponse::Confirmed {
+            id: id.to_string(),
+            confirmed: selected.option_id.0.as_ref() == CONFIRM_YES,
+        }),
+        _ => Some(cancelled(id)),
+    }
+}
+
+/// Send one `session/request_permission` over the outbound channel and await
+/// the client's decision.
+async fn request_permission(
+    session_id: &SessionId,
+    id: &str,
+    title: &str,
+    req: &ExtensionUiRequest,
+    options: Vec<PermissionOption>,
+    outbound: &mpsc::Sender<OutboundMessage>,
+) -> Result<RequestPermissionOutcome> {
+    let fields = ToolCallUpdateFields::new()
+        .kind(Some(ToolKind::Other))
+        .status(Some(ToolCallStatus::Pending))
+        .title(Some(title.to_string()))
+        .raw_input(Some(extension_ui_raw_input(req)));
+    let tool_call = ToolCallUpdate::new(ToolCallId::new(format!("pi-ui-{id}")), fields);
+    let request = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
+
+    let (tx, rx) = oneshot::channel();
+    outbound
+        .send(OutboundMessage::RequestPermission(request, tx))
+        .await
+        .map_err(|_| AcpxError::RpcFailed {
+            command: "request_permission".into(),
+            message: "outbound sink closed".into(),
+        })?;
+    let response = rx.await.map_err(|_| AcpxError::RpcFailed {
+        command: "request_permission".into(),
+        message: "permission responder dropped".into(),
+    })??;
+    Ok(response.outcome)
+}
+
+async fn send_extension_notice(
+    outbound: &mpsc::Sender<OutboundMessage>,
+    session_id: &SessionId,
+    text: &str,
+    meta: Option<agent_client_protocol::schema::v1::Meta>,
+) {
+    let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
+    if let Some(meta) = meta {
+        chunk = chunk.meta(meta);
+    }
+    let _ = outbound
+        .send(OutboundMessage::Notify(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(chunk),
+        )))
+        .await;
+}
+
+/// Build the `rawInput` carried by the permission tool call (the extension
+/// UI request's salient fields, TS `EXTENSION_UI_RAW_INPUT_KEYS`).
+fn extension_ui_raw_input(req: &ExtensionUiRequest) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "method".to_string(),
+        Value::String(req.method_name().to_string()),
+    );
+    if let Some(title) = req.title() {
+        m.insert("title".to_string(), Value::String(title.to_string()));
+    }
+    match req {
+        ExtensionUiRequest::Select { options, .. } => {
+            m.insert("options".to_string(), json!(options));
+        }
+        ExtensionUiRequest::Confirm { message, .. } => {
+            m.insert("message".to_string(), Value::String(message.clone()));
+        }
+        ExtensionUiRequest::Input {
+            placeholder: Some(p),
+            ..
+        } => {
+            m.insert("placeholder".to_string(), Value::String(p.clone()));
+        }
+        ExtensionUiRequest::Input { .. } => {}
+        ExtensionUiRequest::Editor {
+            prefill: Some(p), ..
+        } => {
+            m.insert("prefill".to_string(), Value::String(p.clone()));
+        }
+        ExtensionUiRequest::Editor { .. } => {}
+        _ => {}
+    }
+    Value::Object(m)
+}
+
+fn cancelled(id: &str) -> ExtensionUiResponse {
+    ExtensionUiResponse::Cancelled {
+        id: id.to_string(),
+        cancelled: true,
+    }
+}
+
+/// Map a `choice-<index>` permission option id back to its index (TS
+/// `optionIndex`: safe integer, canonical decimal form).
+fn option_index(option_id: &str) -> Option<usize> {
+    let raw = option_id.strip_prefix(CHOICE_PREFIX)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let index: usize = raw.parse().ok()?;
+    (index.to_string() == raw).then_some(index)
+}
+
+/// Streaming rawInput extraction from a `toolcall_end` tool call value: prefer
+/// `arguments` (object), else parse `partialArgs` (TS parity).
+fn raw_input_of_tool_call(tool_call: &Value) -> Option<Value> {
+    match tool_call.get("arguments") {
+        Some(a) if a.is_object() => Some(a.clone()),
+        _ => {
+            let s = tool_call
+                .get("partialArgs")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if s.is_empty() {
+                None
+            } else {
+                serde_json::from_str(s)
+                    .ok()
+                    .or_else(|| Some(json!({ "partialArgs": s })))
+            }
+        }
+    }
+}
+
+/// Auto-retry notice text (TS `formatAutoRetryMessage`).
+fn format_auto_retry_message(attempt: u32, max_attempts: u32, delay_ms: u64) -> String {
+    if attempt == 0 || max_attempts == 0 {
+        return "Retrying...".to_string();
+    }
+    let mut delay_seconds = delay_ms / 1000;
+    if delay_ms > 0 && delay_seconds == 0 {
+        delay_seconds = 1;
+    }
+    format!("Retrying (attempt {attempt}/{max_attempts}, waiting {delay_seconds}s)...")
+}
+
+fn acp_status(status: TrackedStatus) -> ToolCallStatus {
+    match status {
+        TrackedStatus::Pending => ToolCallStatus::Pending,
+        TrackedStatus::InProgress => ToolCallStatus::InProgress,
+    }
+}
+
+/// Resolve a tool-arg path against the session cwd (TS `toToolCallLocations`).
+fn resolve_path(cwd: &Path, p: &str) -> PathBuf {
+    let path = PathBuf::from(p);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn option_index_parses_choice_ids() {
+        assert_eq!(option_index("choice-0"), Some(0));
+        assert_eq!(option_index("choice-12"), Some(12));
+        assert_eq!(option_index("choice-"), None);
+        assert_eq!(option_index("choice"), None);
+        assert_eq!(option_index("choice-01"), None); // non-canonical decimal
+        assert_eq!(option_index("choice-1x"), None);
+        assert_eq!(option_index("other"), None);
+    }
+
+    #[test]
+    fn format_auto_retry_message_rounds_delays() {
+        assert_eq!(
+            format_auto_retry_message(1, 3, 5000),
+            "Retrying (attempt 1/3, waiting 5s)..."
+        );
+        // sub-second delays round up to 1s
+        assert_eq!(
+            format_auto_retry_message(2, 4, 300),
+            "Retrying (attempt 2/4, waiting 1s)..."
+        );
+        assert_eq!(
+            format_auto_retry_message(1, 2, 0),
+            "Retrying (attempt 1/2, waiting 0s)..."
+        );
+        // missing/zero fields fall back
+        assert_eq!(format_auto_retry_message(0, 3, 1000), "Retrying...");
+        assert_eq!(format_auto_retry_message(1, 0, 1000), "Retrying...");
+    }
+
+    #[test]
+    fn raw_input_prefers_arguments_object() {
+        let tc = json!({ "id": "t1", "name": "read", "arguments": { "path": "a.txt" } });
+        assert_eq!(
+            raw_input_of_tool_call(&tc),
+            Some(json!({ "path": "a.txt" }))
+        );
+    }
+
+    #[test]
+    fn raw_input_parses_partial_args() {
+        let tc = json!({ "id": "t1", "name": "read", "partialArgs": "{\"path\":\"x\"}" });
+        assert_eq!(raw_input_of_tool_call(&tc), Some(json!({ "path": "x" })));
+        // unparseable partial args are kept verbatim
+        let tc = json!({ "id": "t1", "partialArgs": "not json {" });
+        assert_eq!(
+            raw_input_of_tool_call(&tc),
+            Some(json!({ "partialArgs": "not json {" }))
+        );
+        // empty/missing -> None
+        assert_eq!(raw_input_of_tool_call(&json!({ "id": "t1" })), None);
+    }
+
+    #[test]
+    fn extension_ui_raw_input_carries_salient_fields() {
+        let req: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-1", "method": "select", "title": "Pick", "options": ["a", "b"]
+        }))
+        .unwrap();
+        let input = extension_ui_raw_input(&req);
+        assert_eq!(input["method"], "select");
+        assert_eq!(input["title"], "Pick");
+        assert_eq!(input["options"], json!(["a", "b"]));
+
+        let req: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-2", "method": "input", "title": "Type", "placeholder": "hint"
+        }))
+        .unwrap();
+        let input = extension_ui_raw_input(&req);
+        assert_eq!(input["method"], "input");
+        assert_eq!(input["placeholder"], "hint");
+        assert!(input.get("options").is_none());
+    }
+
+    #[test]
+    fn resolve_path_handles_relative_and_absolute() {
+        let cwd = Path::new("/work");
+        assert_eq!(resolve_path(cwd, "a.txt"), PathBuf::from("/work/a.txt"));
+        assert_eq!(resolve_path(cwd, "/abs/x"), PathBuf::from("/abs/x"));
+    }
+}

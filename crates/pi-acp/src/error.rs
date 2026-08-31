@@ -45,6 +45,11 @@ pub enum AcpxError {
     #[error("unknown session: {0}")]
     UnknownSession(String),
 
+    /// A session's pump task is no longer running (session closed / pi exited),
+    /// so commands targeted at it cannot be serviced.
+    #[error("session {0} is closed")]
+    SessionClosed(String),
+
     /// Standard I/O failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

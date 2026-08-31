@@ -11,10 +11,13 @@ authors = ["PuQing <me@puqing.work>"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-# --- ACP (Agent Client Protocol) — first-party SDK (added in S2 spike, W-449) ---
-# agent-client-protocol = "2.0"
-# agent-client-protocol-schema = "1.7"
-# --- async runtime (added in S2 spike, W-449; runtime locked by spike) ---
+# --- ACP (Agent Client Protocol) — first-party SDK (S2 spike, W-449) ---
+# SDK locked to 2.0.x; schema pinned to the exact version the SDK requires so
+# there is a single schema copy in the dependency tree (type identity matters
+# between the re-exported `agent_client_protocol::schema` and a direct dep).
+agent-client-protocol = "2.0.0"
+agent-client-protocol-schema = "=1.5.0"
+# --- async runtime (S2 spike validated + locked tokio, W-449 / decision D9) ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 # --- serialization ---
 serde = { version = "1", features = ["derive"] }

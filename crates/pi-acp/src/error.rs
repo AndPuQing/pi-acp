@@ -56,3 +56,23 @@ pub enum AcpxError {
 
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, AcpxError>;
+
+/// JSON-RPC error code for an internal server error (JSON-RPC 2.0).
+const ACP_INTERNAL_ERROR: i32 = -32603;
+/// JSON-RPC error code for ACP `authRequired` (reserved range).
+const ACP_AUTH_REQUIRED: i32 = -32000;
+
+/// Map an [`AcpxError`] onto the ACP `RequestError` the client should receive.
+///
+/// `AuthRequired` is surfaced with the ACP `authRequired` code so clients can
+/// offer Terminal Auth; everything else is an internal error carrying the
+/// diagnostic as the message (design D5 / §8.2).
+impl From<AcpxError> for agent_client_protocol::Error {
+    fn from(e: AcpxError) -> Self {
+        use agent_client_protocol::Error as AcpError;
+        match e {
+            AcpxError::AuthRequired(msg) => AcpError::new(ACP_AUTH_REQUIRED, msg),
+            other => AcpError::new(ACP_INTERNAL_ERROR, other.to_string()),
+        }
+    }
+}

@@ -4,13 +4,19 @@
 //! - `--terminal-login`: launch `pi` interactively (inherited stdio) so the user
 //!   can configure API keys / OAuth login. Mirrors the TS pi-acp behavior and is
 //!   what ACP "Terminal Auth" invokes.
-//! - default: run the ACP agent over stdio. The ACP wiring lands in the S2 spike
-//!   (issue W-449); this scaffold prints a notice until then.
+//! - default: run the ACP agent over stdio, bridging to a `pi --mode rpc`
+//!   subprocess (see [`pi_acp::agent::run`]).
+//!
+//! The whole thing runs on a `tokio` multi-thread runtime — the S2 spike
+//! (W-449) validates that the ACP SDK's `Stdio` transport is driven correctly
+//! under tokio (design D9 / §5.3).
 
 use anyhow::Result;
+use pi_acp::agent;
 use pi_acp::config::Config;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Structured logging (env-filter driven, e.g. RUST_LOG=pi_acp=debug).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -23,14 +29,11 @@ fn main() -> Result<()> {
         return terminal_login();
     }
 
-    let _cfg = Config::from_env();
-
-    tracing::info!("pi-acp (Rust) scaffold starting");
-    // S2 spike (W-449) brings up:
-    //   agent_client_protocol::Agent::builder()
-    //       .on_receive_request(..., on_receive_request!())
-    //       .connect_to(agent_client_protocol::Stdio::new())
-    eprintln!("pi-acp (Rust) scaffold — ACP server not yet wired (pending W-449 / S2 spike).");
+    let cfg = Config::from_env();
+    tracing::info!(pi_command = %cfg.pi_command, "pi-acp (Rust) starting");
+    agent::run()
+        .await
+        .map_err(|e| anyhow::anyhow!("ACP error: {e:?}"))?;
     Ok(())
 }
 

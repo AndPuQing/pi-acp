@@ -35,11 +35,27 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The in-process mock is deliberately single-threaded. ACP integration
+    // tests nest a mock pi inside the adapter, and the mock only performs
+    // sequential stdin/stdout work; an extra worker pool needlessly raises
+    // the process/thread peak on Unix runners.
+    if is_mock_mode(&args) {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_mock_rpc());
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?
         .block_on(async_main())
+}
+
+fn is_mock_mode(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--mock-rpc")
+        || (std::env::var_os("PI_ACP_MOCK").is_some() && args.iter().any(|a| a == "--mode"))
 }
 
 async fn async_main() -> Result<()> {
@@ -50,19 +66,6 @@ async fn async_main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .try_init();
-
-    // Hidden test fixture (see tests/pi_process.rs): a mock `pi --mode rpc`
-    // server so the RPC client can be tested without a real pi + LLM backend.
-    // Also triggered by `PI_ACP_MOCK=1` **when spawned with `--mode rpc`**
-    // (the ACP e2e drives the mock through `PI_ACP_PI_COMMAND` without argv —
-    // see tests/acp_agent.rs). The agent process itself must never take this
-    // branch, so the env trigger requires the `--mode` argv marker.
-    let is_mock = std::env::args().skip(1).any(|a| a == "--mock-rpc")
-        || (std::env::var_os("PI_ACP_MOCK").is_some()
-            && std::env::args().skip(1).any(|a| a == "--mode"));
-    if is_mock {
-        return run_mock_rpc().await;
-    }
 
     let cfg = Config::from_env();
     tracing::info!(pi_command = %cfg.pi_command, "pi-acp (Rust) starting");

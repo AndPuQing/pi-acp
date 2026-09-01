@@ -105,7 +105,7 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, &[], session_path, timeout).await
+        Self::spawn_inner(pi_command, &[], session_path, None, timeout).await
     }
 
     /// [`PiProcess::spawn_with_session`] with extra pi CLI flags appended after
@@ -116,13 +116,27 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, extra_args, session_path, timeout).await
+        Self::spawn_inner(pi_command, extra_args, session_path, None, timeout).await
+    }
+
+    /// [`PiProcess::spawn_with_args`] with an explicit working directory for
+    /// the child process. Session tools and pi's session header must observe
+    /// the same cwd that the ACP client supplied to `session/new`/`session/load`.
+    pub async fn spawn_with_args_in_dir(
+        pi_command: &str,
+        extra_args: &[&str],
+        session_path: Option<&Path>,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::spawn_inner(pi_command, extra_args, session_path, Some(cwd), timeout).await
     }
 
     async fn spawn_inner(
         pi_command: &str,
         extra_args: &[&str],
         session_path: Option<&Path>,
+        cwd: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
         // Resolve the configured command to a launchable program. On Windows
@@ -141,6 +155,9 @@ impl PiProcess {
             .stdout(Stdio::piped())
             // pi writes diagnostics to stderr; keep it out of the JSONL stream.
             .stderr(Stdio::null());
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         // Put pi in its own process group so teardown can signal the whole tree
         // (wrapper launchers like pi.cmd may spawn grandchildren).
         #[cfg(unix)]

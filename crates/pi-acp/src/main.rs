@@ -156,6 +156,7 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-event-delay-ms <n>` sleep `n` ms before each scenario event
 /// - `--mock-command-log <path>`  append each received command type
 /// - `--mock-extension-log <path>` append each received `extension_ui_response`
+/// - `--mock-cwd-log <path>`      write the mock's startup cwd
 /// - `--mock-prompt-error <text>`   answer `prompt` with `success:false` and this
 ///   error text (auth/error-surfacing tests)
 /// - `--mock-models-error <text>`   answer `get_available_models` with
@@ -181,6 +182,7 @@ async fn run_mock_rpc() -> Result<()> {
     let mut event_delay_ms: u64 = 0;
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
+    let mut cwd_log: Option<PathBuf> = None;
     let mut prompt_error: Option<String> = None;
     let mut models_error: Option<String> = None;
     let mut prompt_count: usize = 0;
@@ -209,6 +211,7 @@ async fn run_mock_rpc() -> Result<()> {
             }
             "--mock-command-log" => command_log = args.next().map(PathBuf::from),
             "--mock-extension-log" => extension_log = args.next().map(PathBuf::from),
+            "--mock-cwd-log" => cwd_log = args.next().map(PathBuf::from),
             "--mock-prompt-error" => prompt_error = args.next(),
             "--mock-models-error" => models_error = args.next(),
             _ => {}
@@ -230,6 +233,12 @@ async fn run_mock_rpc() -> Result<()> {
         exit_after = std::env::var("PI_ACP_MOCK_EXIT_AFTER")
             .ok()
             .and_then(|v| v.parse().ok());
+    }
+
+    if let Some(log) = &cwd_log {
+        if let Ok(cwd) = std::env::current_dir() {
+            append_log(log, &cwd.to_string_lossy());
+        }
     }
 
     let mut stdout = tokio::io::stdout();

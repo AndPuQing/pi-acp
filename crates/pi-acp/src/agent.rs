@@ -139,6 +139,9 @@ pub struct AcpAgent {
     cfg: Config,
     sessions: SessionManager,
     store: SessionStore,
+    /// Serializes session replacement policies (`new`/`load`) so concurrent
+    /// requests cannot close each other's freshly-created subprocess.
+    session_lifecycle: Mutex<()>,
     /// Most recent session cwd, used as the default `session/list` filter
     /// (TS parity: Zed sends `{}` and expects the project-scoped picker).
     last_session_cwd: Mutex<Option<PathBuf>>,
@@ -152,6 +155,7 @@ impl AcpAgent {
             cfg,
             sessions: SessionManager::new(),
             store: SessionStore::new(),
+            session_lifecycle: Mutex::new(()),
             last_session_cwd: Mutex::new(None),
             version_check: Mutex::new(VersionCheck::Pending),
         }
@@ -385,6 +389,7 @@ impl AcpAgent {
                 req.cwd.display()
             )));
         }
+        let _lifecycle = self.session_lifecycle.lock().await;
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
         // Kick off the npm update check as early as possible so it overlaps the
@@ -457,6 +462,15 @@ impl AcpAgent {
 
         let (config_options, _models, modes) =
             get_session_configuration(&session, state.as_ref(), available_models.as_ref()).await;
+
+        if let Some(session_file) = state
+            .as_ref()
+            .and_then(|s| s.session_file.as_deref())
+            .filter(|path| !path.trim().is_empty())
+        {
+            self.store
+                .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
+        }
 
         let update_notice = if let Some(task) = notice_task {
             // The check has been running in parallel with the handshake; await
@@ -611,6 +625,8 @@ impl AcpAgent {
                 req.cwd.display()
             )));
         }
+
+        let _lifecycle = self.session_lifecycle.lock().await;
 
         // Re-loading an active session: tear down the existing pi subprocess
         // so we start fresh and re-advertise commands reliably.

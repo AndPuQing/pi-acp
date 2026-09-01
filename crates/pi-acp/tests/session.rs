@@ -51,6 +51,10 @@ struct Fixture {
 
 /// Spawn a session against the mock pi with a recording outbound sink.
 async fn fixture(extra_args: &[&str]) -> Fixture {
+    fixture_with_settle_timeout(extra_args, Duration::ZERO).await
+}
+
+async fn fixture_with_settle_timeout(extra_args: &[&str], settle_timeout: Duration) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let scenarios = tmp.path().join("scenarios");
     let command_log = tmp.path().join("commands.log");
@@ -78,8 +82,7 @@ async fn fixture(extra_args: &[&str]) -> Fixture {
         pi_command: BIN.to_string(),
         extra_args: args,
         timeout: TIMEOUT,
-        // The mock settles every turn; the settle fallback is not needed.
-        settle_timeout: Duration::ZERO,
+        settle_timeout,
         cwd: tmp.path().to_path_buf(),
         outbound: outbound_tx,
         session_path: None,
@@ -150,6 +153,23 @@ async fn wait_until<F: Fn(&[Recorded]) -> bool>(fx: &Fixture, predicate: F) {
             "timed out waiting for recorded messages; got: {recorded:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_command(fx: &Fixture, expected: &str) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if read_log(&fx.command_log)
+            .iter()
+            .any(|command| command == expected)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for command {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -278,6 +298,47 @@ async fn prompts_queue_and_drain_serially() {
     // Queue depth: turn1 starts -> prompt2 queued -> turn2 starts -> idle.
     let depths = queue_depths(&recorded);
     assert_eq!(depths, vec![(0, true), (1, true), (0, true), (0, false)]);
+}
+
+/// A rejected prompt must fail the queued turns too, and a later prompt must
+/// not reuse an unhealthy pi session.
+#[tokio::test]
+async fn prompt_failure_fails_queue_and_poison_session() {
+    let fx = fixture(&[
+        "--mock-delay-ms",
+        "100",
+        "--mock-prompt-error",
+        "prompt rejected",
+    ])
+    .await;
+
+    let s = fx.session.clone();
+    let first = tokio::spawn(async move { s.prompt("first".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    let s = fx.session.clone();
+    let second = tokio::spawn(async move { s.prompt("second".into(), vec![]).await });
+    wait_until(&fx, |recorded| {
+        text_chunks(recorded).contains(&"Queued message (position 1).".to_string())
+    })
+    .await;
+
+    let first_result = tokio::time::timeout(TIMEOUT, first)
+        .await
+        .expect("rejected prompt must resolve")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(first_result, AcpxError::RpcFailed { .. }));
+
+    let second_result = tokio::time::timeout(TIMEOUT, second)
+        .await
+        .expect("queued prompt must resolve after rejection")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(second_result, AcpxError::SessionClosed(_)));
+
+    let later = fx.session.prompt("later".into(), vec![]).await.unwrap_err();
+    assert!(matches!(later, AcpxError::SessionClosed(_)));
 }
 
 // ---------------------------------------------------------------------------
@@ -927,6 +988,42 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
 
     // The session is still alive and disposable after the fallback fired.
     session.dispose().await;
+}
+
+/// A settle timeout must resolve and discard prompts queued behind the stuck
+/// turn; later prompts are rejected until the session is recreated.
+#[tokio::test]
+async fn settle_timeout_fails_queue_and_poison_session() {
+    let fx = fixture_with_settle_timeout(&["--mock-no-settle"], Duration::from_millis(200)).await;
+
+    let s = fx.session.clone();
+    let first = tokio::spawn(async move { s.prompt("first".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    let s = fx.session.clone();
+    let second = tokio::spawn(async move { s.prompt("second".into(), vec![]).await });
+    wait_until(&fx, |recorded| {
+        text_chunks(recorded).contains(&"Queued message (position 1).".to_string())
+    })
+    .await;
+
+    let first_result = tokio::time::timeout(TIMEOUT, first)
+        .await
+        .expect("stuck prompt must resolve")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(first_result, AcpxError::SettleTimeout { .. }));
+
+    let second_result = tokio::time::timeout(TIMEOUT, second)
+        .await
+        .expect("queued prompt must resolve after settle timeout")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(second_result, AcpxError::SessionClosed(_)));
+
+    let later = fx.session.prompt("later".into(), vec![]).await.unwrap_err();
+    assert!(matches!(later, AcpxError::SessionClosed(_)));
+    fx.session.dispose().await;
 }
 
 // ---------------------------------------------------------------------------

@@ -210,6 +210,14 @@ async fn full_method_set_against_mock_pi() {
             let sid = new_session.session_id.clone();
             assert!(!sid.0.is_empty());
 
+            let session_map = fs::read_to_string(agent_dir.join("pi-acp/session-map.json"))
+                .expect("session/new must persist its session mapping");
+            assert!(session_map.contains("mock-session-id"), "{session_map}");
+            assert!(
+                session_map.contains(cwd.to_string_lossy().as_ref()),
+                "{session_map}"
+            );
+
             // configOptions: model select first, then thought_level select.
             let options = new_session.config_options.as_ref().expect("configOptions");
             let model_opt = find_config_option(options, "model").expect("model option");

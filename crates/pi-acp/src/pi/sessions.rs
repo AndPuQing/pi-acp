@@ -254,8 +254,10 @@ fn pick_fallback_title_from_head(path: &Path) -> Option<String> {
 fn normalize_timestamp(ts: &str) -> Option<String> {
     let s = ts.trim();
     let bytes = s.as_bytes();
-    if bytes.len() < 19
-        || bytes[4] != b'-'
+    if bytes.len() < 19 {
+        return None;
+    }
+    if bytes[4] != b'-'
         || bytes[7] != b'-'
         || bytes[10] != b'T'
         || bytes[13] != b':'
@@ -263,27 +265,143 @@ fn normalize_timestamp(ts: &str) -> Option<String> {
     {
         return None;
     }
-    if !bytes[..19]
-        .iter()
-        .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'T' | b':'))
+
+    let year = parse_digits(bytes, 0, 4)? as i64;
+    let month = parse_digits(bytes, 5, 2)?;
+    let day = parse_digits(bytes, 8, 2)?;
+    let hour = parse_digits(bytes, 11, 2)?;
+    let minute = parse_digits(bytes, 14, 2)?;
+    let second = parse_digits(bytes, 17, 2)?;
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
     {
         return None;
     }
-    // Datetime part up to the offset/Z marker (offsets only appear after the
-    // seconds, i.e. index >= 19).
-    let datetime = if s.ends_with('Z') || s.ends_with('z') {
-        &s[..s.len() - 1]
-    } else if let Some(off) = s[19..].find(['+', '-']) {
-        &s[..19 + off]
+
+    let mut index = 19;
+    let milliseconds = if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if start == index {
+            return None;
+        }
+        let mut value = 0u32;
+        let mut digits = 0;
+        for byte in &bytes[start..index] {
+            if digits == 3 {
+                break;
+            }
+            value = value * 10 + u32::from(byte - b'0');
+            digits += 1;
+        }
+        while digits < 3 {
+            value *= 10;
+            digits += 1;
+        }
+        value
     } else {
-        s
+        0
     };
-    let datetime = if datetime.contains('.') {
-        datetime.to_string()
+
+    let offset_minutes = match bytes.get(index).copied() {
+        None => 0i64,
+        Some(b'Z' | b'z') if index + 1 == bytes.len() => 0,
+        Some(b'+' | b'-') => {
+            let sign = if bytes[index] == b'+' { 1i64 } else { -1i64 };
+            index += 1;
+            let offset_hours = parse_digits(bytes, index, 2)?;
+            index += 2;
+            if bytes.get(index) == Some(&b':') {
+                index += 1;
+            }
+            let offset_minutes = parse_digits(bytes, index, 2)?;
+            index += 2;
+            if index != bytes.len() || offset_hours > 23 || offset_minutes > 59 {
+                return None;
+            }
+            sign * (i64::from(offset_hours) * 60 + i64::from(offset_minutes))
+        }
+        Some(_) => return None,
+    };
+
+    let local_days = days_from_civil(year, month, day);
+    let local_seconds =
+        local_days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second);
+    let utc_seconds = local_seconds - offset_minutes * 60;
+    let utc_days = utc_seconds.div_euclid(86_400);
+    let seconds_of_day = utc_seconds.rem_euclid(86_400);
+    let (utc_year, utc_month, utc_day) = civil_from_days(utc_days);
+    if !(0..=9999).contains(&utc_year) {
+        return None;
+    }
+    let utc_hour = seconds_of_day / 3_600;
+    let utc_minute = (seconds_of_day % 3_600) / 60;
+    let utc_second = seconds_of_day % 60;
+    Some(format!(
+        "{utc_year:04}-{utc_month:02}-{utc_day:02}T{utc_hour:02}:{utc_minute:02}:{utc_second:02}.{milliseconds:03}Z"
+    ))
+}
+
+fn parse_digits(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
+    let end = start.checked_add(len)?;
+    let digits = bytes.get(start..end)?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(
+        digits
+            .iter()
+            .fold(0u32, |value, digit| value * 10 + u32::from(digit - b'0')),
+    )
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+// Proleptic Gregorian calendar conversion without adding a date dependency.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year / 400
     } else {
-        format!("{datetime}.000")
+        (adjusted_year - 399) / 400
     };
-    Some(format!("{datetime}Z"))
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let adjusted_days = days + 719_468;
+    let era = if adjusted_days >= 0 {
+        adjusted_days / 146_097
+    } else {
+        (adjusted_days - 146_096) / 146_097
+    };
+    let day_of_era = adjusted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// List all pi sessions, most recently active first (mirrors TS `listPiSessions`).
@@ -430,6 +548,18 @@ mod tests {
             Some("2026-08-02T11:00:00.000Z".to_string())
         );
         assert_eq!(pick_updated_at_from_tail("no timestamps here"), None);
+    }
+
+    #[test]
+    fn updated_at_converts_offsets_to_utc() {
+        assert_eq!(
+            normalize_timestamp("2026-08-02T00:30:00.1+08:00"),
+            Some("2026-08-01T16:30:00.100Z".to_string())
+        );
+        assert_eq!(
+            normalize_timestamp("2026-08-01T23:30:00-0200"),
+            Some("2026-08-02T01:30:00.000Z".to_string())
+        );
     }
 
     #[test]

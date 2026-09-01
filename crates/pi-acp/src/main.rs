@@ -46,6 +46,17 @@ fn main() -> Result<()> {
             .block_on(run_mock_rpc());
     }
 
+    // The adapter-side ACP fixture also sets `PI_ACP_MOCK`, even though it
+    // does not carry the `--mode` marker. Keep those short-lived test
+    // processes single-threaded too, so adjacent fixtures can be torn down
+    // without exhausting Unix runner process resources.
+    if std::env::var_os("PI_ACP_MOCK").is_some() {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async_main());
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

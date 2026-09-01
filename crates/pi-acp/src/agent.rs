@@ -628,9 +628,12 @@ impl AcpAgent {
 
         let _lifecycle = self.session_lifecycle.lock().await;
 
-        // Re-loading an active session: tear down the existing pi subprocess
-        // so we start fresh and re-advertise commands reliably.
+        // Tear down every live pi before spawning the replacement. Besides
+        // making the one-live-session policy explicit, this keeps session
+        // replacement below the runner's process limit when nested ACP
+        // fixtures are used.
         self.sessions.close(&req.session_id).await;
+        self.sessions.close_all_except(&req.session_id).await;
 
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
@@ -646,7 +649,6 @@ impl AcpAgent {
             .restore_session(&req.session_id, Some(&req.cwd), cx)
             .await?;
 
-        self.sessions.close_all_except(&req.session_id).await;
         self.store
             .upsert(&req.session_id.0, &stored_cwd, &stored_file);
 

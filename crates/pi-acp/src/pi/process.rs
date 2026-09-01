@@ -50,8 +50,6 @@ pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
 /// How long [`PiProcess::dispose`] waits after SIGTERM before escalating to
 /// SIGKILL (pi runs a graceful shutdown handler on SIGTERM).
 const SIGTERM_GRACE: Duration = Duration::from_secs(3);
-/// How long [`PiProcess::Drop`]'s off-thread SIGTERM→SIGKILL escalation waits.
-const DROP_ESCALATION_DELAY: Duration = Duration::from_millis(250);
 /// Bounded event channel capacity. The reader task awaits sends (backpressure),
 /// so a slow event pump stalls the stream rather than unboundedly buffering.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -532,16 +530,13 @@ impl PiProcess {
 impl Drop for PiProcess {
     /// Sync emergency teardown (used when `dispose()` was not called, e.g.
     /// panic unwinding or session-map eviction without an async context).
-    /// SIGTERM immediately, then an off-thread SIGKILL escalation — `Drop`
-    /// cannot await, so the grace period happens on a detached thread. The
-    /// watcher task still owns the `Child` and reaps it.
+    /// `Drop` cannot await a graceful shutdown, so terminate the whole process
+    /// group immediately. The watcher task still owns the `Child` and reaps it
+    /// while the runtime is alive. A detached delayed killer would both leave
+    /// a resource window and risk signaling a reused PID.
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            signal_pi(pid, /* term */ true);
-            std::thread::spawn(move || {
-                std::thread::sleep(DROP_ESCALATION_DELAY);
-                signal_pi(pid, /* term */ false);
-            });
+        if let Some(pid) = self.pid.take() {
+            signal_pi(pid, /* term */ false);
         }
     }
 }
@@ -555,13 +550,19 @@ impl Drop for PiProcess {
 /// Windows: no SIGTERM exists; `taskkill /T /F` force-terminates the tree.
 #[cfg(unix)]
 fn signal_pi(pid: u32, term: bool) {
-    let sig = if term { "TERM" } else { "KILL" };
-    for target in [format!("-{pid}"), pid.to_string()] {
-        let _ = std::process::Command::new("kill")
-            .arg(format!("-{sig}"))
-            .arg(&target)
-            .output();
-    }
+    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+        return;
+    };
+    let signal = if term {
+        rustix::process::Signal::TERM
+    } else {
+        rustix::process::Signal::KILL
+    };
+
+    // Use direct syscalls so cleanup still works when the process limit is
+    // the very resource that prevented another `kill` helper from spawning.
+    let _ = rustix::process::kill_process_group(pid, signal);
+    let _ = rustix::process::kill_process(pid, signal);
 }
 
 #[cfg(windows)]

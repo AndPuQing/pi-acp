@@ -25,6 +25,9 @@ tokio.workspace = true
 # home-dir / agent-dir resolution (settings.rs, commands.rs)
 dirs.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+
 [dev-dependencies]
 # Integration tests (the S2 e2e spike client) drive the `pi-acp` binary as an
 # ACP client; they need the same crates at the same versions as the lib.

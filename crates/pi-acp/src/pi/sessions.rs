@@ -351,6 +351,25 @@ pub fn find_pi_session(session_id: &str) -> Option<PiSessionListItem> {
         .find(|s| s.session_id == session_id)
 }
 
+/// Extract the display title from one session file — the same per-file title
+/// chain `session/list` uses (tail `session_info.name`, full-file scan
+/// fallback, first-user-message fallback). Used by `session/load` so the
+/// restored thread's title matches the list (fixes #102/#24: Zed's sidebar
+/// shows "New Agent Thread" until a title arrives).
+pub fn title_from_session_file(path: &Path) -> Option<String> {
+    let mut title = None;
+    if let Some(tail) = read_tail(path) {
+        title = pick_title_from_tail(&tail);
+    }
+    if title.is_none() {
+        title = scan_session_info_name_from_file(path);
+    }
+    if title.is_none() {
+        title = pick_fallback_title_from_head(path);
+    }
+    title
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +488,45 @@ mod tests {
         assert_eq!(items[0].title.as_deref(), Some("Recent Session"));
         assert_eq!(items[1].session_id, "old");
         assert!(items[0].updated_at.as_deref().unwrap() > items[1].updated_at.as_deref().unwrap());
+    }
+
+    #[test]
+    fn title_from_file_uses_chain() {
+        let dir = TempDir::new().unwrap();
+        // session_info.name wins.
+        let named = dir.path().join("named.jsonl");
+        fs::write(
+            &named,
+            format!(
+                "{}\n{}",
+                header("s1", "/work"),
+                session_info_line("Named Session", "2026-08-02T11:00:00.000Z")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            title_from_session_file(&named),
+            Some("Named Session".to_string())
+        );
+
+        // No session_info: falls back to the first user message (≤80 chars).
+        let headless = dir.path().join("headless.jsonl");
+        fs::write(
+            &headless,
+            format!(
+                "{}\n{}",
+                header("s2", "/work"),
+                message_line("user", "2026-08-01T10:00:00.000Z")
+            ),
+        )
+        .unwrap();
+        assert_eq!(title_from_session_file(&headless), Some("hi".to_string()));
+
+        // Missing file: None.
+        assert_eq!(
+            title_from_session_file(&dir.path().join("nope.jsonl")),
+            None
+        );
     }
 
     #[test]

@@ -64,7 +64,7 @@ use crate::commands::{self, FileSlashCommand};
 use crate::config::Config;
 use crate::error::{AcpxError, Result};
 use crate::pi::rpc::{ImageContent, Model, QueueMode, RpcSessionState, ThinkingLevel};
-use crate::pi::sessions::{find_pi_session, list_pi_sessions};
+use crate::pi::sessions::{find_pi_session, list_pi_sessions, title_from_session_file};
 use crate::session::{
     spawn_outbound_connector, PiAcpSession, SessionManager, SessionParams,
     StopReason as SessionStopReason,
@@ -498,6 +498,22 @@ impl AcpAgent {
             }
         }
 
+        // The first real prompt names the thread (fixes #102/#24: without a
+        // title, Zed's sidebar keeps "New Agent Thread"). Slash commands don't
+        // title the session; the title is provisional — `/name` and pi's own
+        // `session_info` entries override it later.
+        if !pi_prompt.message.trim_start().starts_with('/') && session.mark_first_prompt() {
+            if let Some(title) = provisional_title_from_prompt(&pi_prompt.message) {
+                let update = SessionInfoUpdate::new()
+                    .title(title)
+                    .updated_at(utc_now_iso8601());
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::SessionInfoUpdate(update),
+                ));
+            }
+        }
+
         let reason = session
             .prompt(pi_prompt.message, to_pi_images(pi_prompt.images))
             .await
@@ -553,8 +569,19 @@ impl AcpAgent {
         self.store
             .upsert(&req.session_id.0, &stored_cwd, &stored_file);
 
-        // Replay full conversation history.
+        // Replay full conversation history. Publish the thread title first —
+        // the same title `session/list` computed for this file (fixes #102/#24:
+        // the restored thread shows a real title instead of "New Agent Thread").
         if let Ok(data) = session.get_messages().await {
+            if let Some(title) = title_from_session_file(std::path::Path::new(&stored_file)) {
+                let update = SessionInfoUpdate::new()
+                    .title(title)
+                    .updated_at(utc_now_iso8601());
+                let _ = cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    SessionUpdate::SessionInfoUpdate(update),
+                ));
+            }
             replay_history(cx, &session, &data).await;
         }
 
@@ -1645,4 +1672,67 @@ async fn find_changelog() -> Option<PathBuf> {
         .join("pi-coding-agent")
         .join("CHANGELOG.md");
     p.exists().then_some(p)
+}
+
+/// Derive a provisional thread title from the first user prompt (fixes
+/// #102/#24: without a title, Zed's sidebar keeps "New Agent Thread").
+/// Whitespace runs collapse to a single space and the result is truncated to
+/// 80 chars (the TS `pickFallbackTitleFromHead` limit). `None` for
+/// empty/whitespace-only prompts.
+fn provisional_title_from_prompt(message: &str) -> Option<String> {
+    let mut out = String::with_capacity(message.len());
+    let mut pending_space = false;
+    for ch in message.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else if pending_space {
+            out.push(' ');
+            out.push(ch);
+            pending_space = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.chars().count() > 80 {
+        out = out.chars().take(80).collect();
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provisional_title_from_prompt;
+
+    #[test]
+    fn provisional_title_plain_message() {
+        assert_eq!(
+            provisional_title_from_prompt("fix the login bug"),
+            Some("fix the login bug".to_string())
+        );
+    }
+
+    #[test]
+    fn provisional_title_collapses_whitespace() {
+        assert_eq!(
+            provisional_title_from_prompt("  fix  the\nlogin\tbug  "),
+            Some("fix the login bug".to_string())
+        );
+    }
+
+    #[test]
+    fn provisional_title_truncates_at_80_chars() {
+        let long = "x".repeat(200);
+        let title = provisional_title_from_prompt(&long).unwrap();
+        assert_eq!(title.chars().count(), 80);
+        assert!(title.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn provisional_title_empty_and_whitespace_only() {
+        assert_eq!(provisional_title_from_prompt(""), None);
+        assert_eq!(provisional_title_from_prompt("   \n\t "), None);
+    }
 }

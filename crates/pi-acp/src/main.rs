@@ -142,6 +142,7 @@ async fn run_mock_rpc() -> Result<()> {
     let mut mock_auto_compaction = false;
     let mut mock_steering_mode = "one-at-a-time".to_string();
     let mut mock_follow_up_mode = "one-at-a-time".to_string();
+    let mut mock_session_name = "Mock Session".to_string();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -254,7 +255,7 @@ async fn run_mock_rpc() -> Result<()> {
                 "followUpMode": mock_follow_up_mode,
                 "sessionFile": "/tmp/mock-session.jsonl",
                 "sessionId": "mock-session-id",
-                "sessionName": "Mock Session",
+                "sessionName": mock_session_name,
                 "autoCompactionEnabled": mock_auto_compaction,
                 "messageCount": 3,
                 "pendingMessageCount": 0
@@ -327,6 +328,11 @@ async fn run_mock_rpc() -> Result<()> {
                     mock_follow_up_mode = m.to_string();
                 }
             }
+            "set_session_name" => {
+                if let Some(n) = command.get("name").and_then(serde_json::Value::as_str) {
+                    mock_session_name = n.to_string();
+                }
+            }
             _ => {}
         }
 
@@ -341,6 +347,15 @@ async fn run_mock_rpc() -> Result<()> {
         }
         mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
         handled += 1;
+
+        // Mirror pi: `setSessionName` emits `session_info_changed` on the event
+        // stream (pi-agent-core `AgentSessionEvent`), which the adapter
+        // forwards as ACP `session_info_update` (live thread title, #102/#24).
+        if ty == "set_session_name" {
+            let event =
+                serde_json::json!({ "type": "session_info_changed", "name": mock_session_name });
+            mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
+        }
 
         // Mirror pi: the prompt response arrives early; the streaming events
         // and the real turn-completion signal (`agent_settled`) follow after.

@@ -36,6 +36,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,6 +56,7 @@ use crate::pi::rpc::{
     AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
     RpcCommand, RpcEvent, Usage,
 };
+use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
     bash_command, bash_exit_code, bash_output_delta, bash_result_text, bash_terminal_content,
     bash_terminal_exit_meta, bash_terminal_info_meta, bash_terminal_output_meta, is_bash_tool,
@@ -125,6 +127,9 @@ pub struct PiAcpSession {
     session_id: SessionId,
     cwd: PathBuf,
     cmd_tx: mpsc::Sender<SessionCommand>,
+    /// Whether a real (non-slash) prompt has already been sent; the first one
+    /// derives the thread's provisional title (fixes #102/#24).
+    first_prompt: AtomicBool,
     /// File-based slash commands for this session's cwd (expanded in
     /// [`PiAcpSession::prompt`]; pi RPC mode disables its own expansion).
     file_commands: Vec<crate::commands::FileSlashCommand>,
@@ -284,6 +289,7 @@ impl PiAcpSession {
             session_id,
             cwd: params.cwd,
             cmd_tx,
+            first_prompt: AtomicBool::new(false),
             file_commands: params.file_commands,
         }))
     }
@@ -294,6 +300,13 @@ impl PiAcpSession {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Atomically claim the first-prompt slot. Returns `true` on the first
+    /// call and `false` forever after; drives the provisional-title emission
+    /// in the agent's `session/prompt` handler (fixes #102/#24).
+    pub fn mark_first_prompt(&self) -> bool {
+        !self.first_prompt.swap(true, Ordering::SeqCst)
     }
 
     /// Start a turn (or queue it behind the running one) and await its
@@ -813,9 +826,20 @@ impl Pump {
                     .await;
                 }
             }
-            // Not wired in S5 (logged): QueueUpdate / SessionInfoChanged /
-            // ThinkingLevelChanged / EntryAppended / UnmatchedResponse /
-            // ExtensionError / summarization retries / unknown future events.
+            // pi-initiated renames (e.g. an extension calling `setSessionName`)
+            // are forwarded as `session_info_update` so the client's thread
+            // title stays live (fixes #102/#24).
+            RpcEvent::SessionInfoChanged { name } => {
+                if let Some(name) = name {
+                    let update = SessionInfoUpdate::new()
+                        .title(name)
+                        .updated_at(utc_now_iso8601());
+                    self.emit(SessionUpdate::SessionInfoUpdate(update)).await;
+                }
+            }
+            // Not wired (logged): QueueUpdate / ThinkingLevelChanged /
+            // EntryAppended / UnmatchedResponse / ExtensionError /
+            // summarization retries / unknown future events.
             other => {
                 tracing::trace!(?other, "unhandled pi event");
             }

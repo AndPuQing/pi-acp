@@ -61,6 +61,33 @@ where
     }
 }
 
+/// Wait until at least `min` notifications match `pred`, then return them all.
+async fn wait_for_count<F>(log: &NotifLog, pred: F, min: usize) -> Vec<SessionUpdate>
+where
+    F: Fn(&SessionUpdate) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        {
+            let entries = log.lock().await;
+            let matched: Vec<SessionUpdate> = entries
+                .iter()
+                .filter(|(_, u)| pred(u))
+                .map(|(_, u)| u.clone())
+                .collect();
+            if matched.len() >= min {
+                return matched;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {min} matching notifications; log: {:?}",
+            *log.lock().await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// All streamed text chunks across sessions, concatenated.
 fn all_text(log: &[(String, SessionUpdate)]) -> String {
     let mut out = String::new();
@@ -255,6 +282,15 @@ async fn full_method_set_against_mock_pi() {
             let slow_result = slow_prompt.await.expect("slow prompt task panicked")?;
             assert_eq!(slow_result.stop_reason, StopReason::Cancelled);
 
+            // First real prompt names the thread (fixes #102/#24: without a
+            // title Zed's sidebar keeps "New Agent Thread"). The cancelled
+            // "slow" prompt is the session's first, so it carries the title.
+            wait_for(&log, |u| {
+                matches!(u, SessionUpdate::SessionInfoUpdate(i)
+                    if i.title.as_opt_deref() == Some(Some("slow")))
+            })
+            .await;
+
 
             // ---------------------------------------------------------------
             // 3. plain prompt: streaming + usage_update
@@ -313,6 +349,19 @@ async fn full_method_set_against_mock_pi() {
                     if i.title.as_opt_deref() == Some(Some("My Session")))
             })
             .await;
+            // pi also emits `session_info_changed` on set_session_name; the
+            // adapter forwards it as a second `session_info_update`, keeping
+            // the title live for pi/extension-driven renames.
+            let named_updates = wait_for_count(
+                &log,
+                |u| {
+                    matches!(u, SessionUpdate::SessionInfoUpdate(i)
+                        if i.title.as_opt_deref() == Some(Some("My Session")))
+                },
+                2,
+            )
+            .await;
+            assert_eq!(named_updates.len(), 2);
 
             let steer_show = cx.send_request(prompt_for(&sid, "/steering")).block_task().await?;
             assert_eq!(steer_show.stop_reason, StopReason::EndTurn);
@@ -423,6 +472,13 @@ async fn full_method_set_against_mock_pi() {
                 .block_task()
                 .await?;
             assert!(loaded.config_options.is_some());
+            // session/load publishes the thread title from the session file
+            // (fixes #102/#24: restored threads show their real title).
+            wait_for(&log, |u| {
+                matches!(u, SessionUpdate::SessionInfoUpdate(i)
+                    if i.title.as_opt_deref() == Some(Some("Old Session")))
+            })
+            .await;
             // History replay notifications.
             wait_for(&log, |u| {
                 matches!(u, SessionUpdate::UserMessageChunk(c)

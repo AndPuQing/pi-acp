@@ -74,13 +74,18 @@ fn terminal_login() -> Result<()> {
     let pi_command = cfg.pi_command.clone();
     tracing::info!(pi_command, "launching pi for terminal login");
 
-    let status = std::process::Command::new(&pi_command)
+    // Resolve for the Windows `pi.cmd` wrapper (fixes pi-acp #27): a bare `pi`
+    // expands to the npm global and is launched via `cmd.exe /d /s /c`.
+    let resolved = pi_acp::pi::resolve::resolve_current_env(&pi_command);
+    let status = std::process::Command::new(&resolved.program)
+        .args(&resolved.cmd_args)
         .status()
         .map_err(|e| {
             anyhow::anyhow!(
-                "failed to launch `{pi_command}` for terminal login: {e}. \
-                 Is pi installed? Install it with `npm i -g @earendil-works/pi-coding-agent` \
-                 or set PI_ACP_PI_COMMAND."
+                "failed to launch `{pi_command}` (resolved to {}) for terminal login: {e}. \n\
+                 Is pi installed? Install it with `npm i -g @earendil-works/pi-coding-agent` \n\
+                 or set PI_ACP_PI_COMMAND (on Windows this is the npm global `pi.cmd`).",
+                resolved.program
             )
         })?;
     std::process::exit(status.code().unwrap_or(1));

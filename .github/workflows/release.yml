@@ -1,0 +1,138 @@
+name: Release
+
+# Publishes the three-platform `pi-acp` binary matrix as a GitHub Release.
+#
+# Trigger:
+#   - pushing a `vX.Y.Z` tag, or
+#   - manually from the Actions tab (workflow_dispatch) — the release is
+#     created/updated for the current git describe tag.
+#
+# Matrix (design S9: Linux x64/arm64, macOS x64/arm64, Windows x64):
+#   Linux   x86_64-unknown-linux-musl   (static, no glibc dep)
+#   Linux   aarch64-unknown-linux-musl  (static; cross via `cross`)
+#   macOS   x86_64-apple-darwin
+#   macOS   aarch64-apple-darwin
+#   Windows x86_64-pc-windows-msvc
+#
+# Linux uses **musl** so the binaries are fully static (`ldd` → "statically
+# linked") and drop straight onto any glibc/musl Linux host — no shared-lib
+# surprises. This crate has no C dependencies on any of the three platforms, so
+# the musl static link is clean.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            name: pi-acp-linux-x64
+            bin: pi-acp
+            use_cross: false
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            name: pi-acp-linux-arm64
+            bin: pi-acp
+            use_cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: pi-acp-macos-x64
+            bin: pi-acp
+            use_cross: false
+          - os: macos-14
+            target: aarch64-apple-darwin
+            name: pi-acp-macos-arm64
+            bin: pi-acp
+            use_cross: false
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            name: pi-acp-windows-x64.exe
+            bin: pi-acp.exe
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross (Linux arm64)
+        if: matrix.use_cross
+        run: |
+          curl -sSL https://github.com/cross-rs/cross/releases/latest/download/cross-init \
+            | CROSS_INIT_TARGET=aarch64-unknown-linux-musl sh
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.name }}"
+          chmod +x "dist/${{ matrix.name }}" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # download-artifact places each artifact in its own subdir; flatten so
+      # the release step sees the binaries directly.
+      - name: Flatten
+        shell: bash
+        run: find dist -type f -exec mv -f {} dist/ \;
+
+      - name: Checksums
+        shell: bash
+        working-directory: dist
+        run: |
+          sha256sum pi-acp-* | tee CHECKSUMS.txt
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/pi-acp-*
+            dist/CHECKSUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false

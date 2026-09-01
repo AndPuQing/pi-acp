@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::{AcpxError, Result};
+use crate::pi::resolve::resolve_current_env;
 use crate::pi::rpc::{
     ExtensionUiResponse, Model, QueueMode, RpcCommand, RpcEvent, RpcResponse, RpcSessionState,
     ThinkingLevel,
@@ -124,7 +125,13 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        let mut cmd = Command::new(pi_command);
+        // Resolve the configured command to a launchable program. On Windows
+        // this expands a bare `pi` to the npm `pi.cmd` wrapper and routes it
+        // through `cmd.exe /d /s /c` (fixes pi-acp #27); on unix it is a no-op
+        // for the common `pi` name. `cmd_args` carry any shell prefix.
+        let resolved = resolve_current_env(pi_command);
+        let mut cmd = Command::new(&resolved.program);
+        cmd.args(&resolved.cmd_args);
         cmd.args(["--mode", "rpc", "--no-themes"]);
         if let Some(path) = session_path {
             cmd.arg("--session").arg(path);
@@ -141,7 +148,7 @@ impl PiProcess {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| AcpxError::PiSpawn(format!("{pi_command}: {e}")))?;
+            .map_err(|e| AcpxError::PiSpawn(spawn_error(pi_command, &resolved, e)))?;
 
         let stdin = child
             .stdin
@@ -545,6 +552,23 @@ fn signal_pi(pid: u32, _term: bool) {
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output();
+}
+
+/// Build an actionable spawn-failure message. A `NotFound` (ENOENT) gets an
+/// explicit install hint; other failures carry the raw error so the cause
+/// (EACCES, bad path, ...) is not lost.
+fn spawn_error(
+    pi_command: &str,
+    resolved: &crate::pi::resolve::ResolvedPi,
+    e: std::io::Error,
+) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "`{pi_command}` not found on PATH (resolved to {})",
+            resolved.program
+        ),
+        _ => format!("{pi_command}: {e}"),
+    }
 }
 
 /// Background task: read pi's stdout line by line until EOF, routing responses

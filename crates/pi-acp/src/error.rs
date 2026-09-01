@@ -19,9 +19,14 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum AcpxError {
     /// Could not spawn the `pi` subprocess (ENOENT / EACCES / ...).
+    ///
+    /// The message carries an actionable, cross-platform install hint: the
+    /// npm package, the `PI_ACP_PI_COMMAND` override, and the Windows note
+    /// that pi's entry point is the npm global `pi.cmd` (fixes pi-acp #27).
     #[error(
-        "failed to spawn pi: {0}. Is pi installed? Install it with \
-         `npm i -g @earendil-works/pi-coding-agent` or set PI_ACP_PI_COMMAND."
+        "failed to spawn pi: {0}. Install pi with `npm i -g \
+         @earendil-works/pi-coding-agent` (on Windows the entry point is the npm \
+         global `pi.cmd`), or set PI_ACP_PI_COMMAND to the full path."
     )]
     PiSpawn(String),
 

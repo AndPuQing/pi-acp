@@ -247,8 +247,12 @@ fn add_section(md: &mut Vec<String>, section: &Section) {
 /// dispatch loop (design D6). Requires a semver-shaped answer (real pi prints
 /// `vX.Y.Z`; anything else — e.g. an error banner — is dropped).
 pub async fn fetch_pi_version(pi_command: &str) -> Option<String> {
+    // Resolve the command the same way the main spawn does (Windows `pi.cmd`
+    // wrapper → `cmd.exe /d /s /c`), so `pi --version` works for the npm global.
+    let resolved = crate::pi::resolve::resolve_current_env(pi_command);
     tokio::time::timeout(std::time::Duration::from_millis(1500), async {
-        let output = tokio::process::Command::new(pi_command)
+        let output = tokio::process::Command::new(&resolved.program)
+            .args(&resolved.cmd_args)
             .arg("--version")
             .output()
             .await

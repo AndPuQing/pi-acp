@@ -35,17 +35,28 @@ jobs:
       - name: test
         run: cargo test --all --all-features
 
-  # Cross-compile smoke check (no execution, just `cargo check` for the targets).
+  # Cross-compile smoke check (no execution, no C linker — `cargo check` for
+  # every target in the release matrix: Linux x64/arm64 (musl), macOS x64/arm64,
+  # Windows x64). Catches target-specific `cfg`/platform breakage fast.
   cross-compile:
-    name: cross-compile check
+    name: cross-compile check (${{ matrix.target }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: add targets
-        run: rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin x86_64-unknown-linux-gnu
-      - name: check windows-gnu
-        run: cargo check --target x86_64-pc-windows-gnu
-      - name: check aarch64-apple-darwin
-        run: cargo check --target aarch64-apple-darwin
+        with:
+          key: cross-${{ matrix.target }}
+      - name: check ${{ matrix.target }}
+        run: cargo check --target ${{ matrix.target }}

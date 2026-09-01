@@ -650,7 +650,7 @@ async fn unknown_config_option_errors() {
             let sid = new_session.session_id;
             let err = cx
                 .send_request(SetSessionConfigOptionRequest::new(
-                    sid,
+                    sid.clone(),
                     "not-a-real-option",
                     "x",
                 ))
@@ -658,6 +658,13 @@ async fn unknown_config_option_errors() {
                 .await
                 .expect_err("unknown config option must error");
             assert!(err.to_string().contains("Unknown config option"), "{err}");
+
+            // Close the live subprocess before the SDK tears down the outer
+            // adapter. This keeps the nested mock reaped on resource-limited
+            // CI runners instead of relying on forced process-group cleanup.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -725,7 +732,7 @@ async fn prompt_after_pi_death_returns_explicit_error() {
             // session remembers the exit and never hangs or goes quiet.
             let err2 = cx
                 .send_request(PromptRequest::new(
-                    sid,
+                    sid.clone(),
                     vec![ContentBlock::Text(TextContent::new("again".to_string()))],
                 ))
                 .block_task()
@@ -744,6 +751,10 @@ async fn prompt_after_pi_death_returns_explicit_error() {
                 err2.data.as_ref().expect("error data")["errorType"],
                 "piExited"
             );
+
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -779,7 +790,7 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
                 .expect("session/new succeeds; the error comes from the prompt");
             let err = cx
                 .send_request(PromptRequest::new(
-                    new_session.session_id,
+                    new_session.session_id.clone(),
                     vec![ContentBlock::Text(TextContent::new("hi".to_string()))],
                 ))
                 .block_task()
@@ -799,6 +810,10 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
             assert_eq!(methods.len(), 1);
             assert_eq!(methods[0]["id"], "pi_terminal_login");
             assert_eq!(methods[0]["type"], "terminal");
+
+            cx.send_request(DeleteSessionRequest::new(new_session.session_id))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -884,6 +899,10 @@ async fn load_session_surfaces_get_messages_failure() {
                 err.data.as_ref().expect("error data")["errorType"],
                 "piExited"
             );
+
+            cx.send_request(DeleteSessionRequest::new("stored-session"))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;

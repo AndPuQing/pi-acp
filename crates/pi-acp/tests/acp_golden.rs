@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionNotification,
-    TextContent,
+    ContentBlock, DeleteSessionRequest, InitializeRequest, NewSessionRequest, PromptRequest,
+    SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -162,11 +162,16 @@ async fn capture_frames() -> (Vec<String>, String) {
                 .await?;
             let sid = new_session.session_id;
             cx.send_request(PromptRequest::new(
-                sid,
+                sid.clone(),
                 vec![ContentBlock::Text(TextContent::new("hello".to_string()))],
             ))
             .block_task()
             .await?;
+            // Dispose the nested pi before the ACP SDK tears down the outer
+            // adapter, keeping this process-backed fixture reaped on CI.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -202,7 +207,7 @@ async fn acp_frame_sequence_matches_golden() {
 
     // The ordering property the golden guards, stated explicitly: the startup
     // prelude (with the version-check notice) precedes the session/new
-    // response, and the prompt response is last.
+    // response, and the prompt response precedes the cleanup response.
     let lines: Vec<&str> = body.lines().collect();
     let find = |needle: &str| lines.iter().position(|l| l.contains(needle));
     let startup = find("pi v<VER>").expect("startup prelude frame");

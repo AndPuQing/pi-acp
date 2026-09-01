@@ -114,6 +114,11 @@ pub struct SessionParams {
     pub extra_args: Vec<String>,
     /// Per-request pi RPC deadline.
     pub timeout: Duration,
+    /// Deadline for a turn's `agent_settled` after pi accepts the prompt
+    /// (design §11 risk #84 mitigation). When it elapses the pending turn is
+    /// resolved with [`AcpxError::SettleTimeout`] instead of hanging
+    /// `session/prompt` forever. `Duration::ZERO` disables the fallback.
+    pub settle_timeout: Duration,
     /// Working directory of the session (resolves relative tool paths).
     pub cwd: PathBuf,
     /// Outbound ACP message sink (see [`OutboundMessage`]).
@@ -245,6 +250,14 @@ struct Pump {
     cancel_requested: bool,
     /// True while pi's agent loop is running (`agent_start` .. `agent_end`).
     in_agent_loop: bool,
+    /// Deadline by which the in-flight turn's `agent_settled` must arrive
+    /// (design §11 risk #84 mitigation: a pi that accepts a prompt but never
+    /// settles must not hang `session/prompt` forever). Armed when the prompt
+    /// is accepted; cleared at resolution. `None` = no deadline (disabled or
+    /// no turn in flight).
+    settle_deadline: Option<tokio::time::Instant>,
+    /// The settle deadline duration (from [`SessionParams::settle_timeout`]).
+    settle_timeout: Duration,
 
     /// Monotonic tool statuses (`tool_call_id` -> status).
     current_tool_calls: HashMap<String, TrackedStatus>,
@@ -299,6 +312,8 @@ impl PiAcpSession {
             pending_turn: None,
             cancel_requested: false,
             in_agent_loop: false,
+            settle_deadline: None,
+            settle_timeout: params.settle_timeout,
             current_tool_calls: HashMap::new(),
             file_mutation_tool_call_ids: HashSet::new(),
             file_snapshots: HashMap::new(),
@@ -579,6 +594,22 @@ async fn pump_loop(mut pump: Pump) {
             prompt_result = pump.prompt_rx.recv() => {
                 pump.on_prompt_result(prompt_result).await;
             }
+            // Settle deadline (design §11 risk #84): pi accepted the prompt
+            // but never emitted `agent_settled` — resolve the turn with an
+            // explicit error instead of hanging `session/prompt` forever. The
+            // deadline is copied out of the pump so the async block only
+            // borrows the copy, not the pump (the other arms mutate it).
+            _settle_deadline = {
+                let deadline = pump.settle_deadline;
+                async move {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                }
+            } => {
+                pump.on_settle_timeout().await;
+            }
         }
     }
 
@@ -686,9 +717,20 @@ impl Pump {
     /// be unhealthy).
     async fn on_prompt_result(&mut self, result: Option<std::result::Result<(), AcpxError>>) {
         let result = match result {
-            Some(Ok(())) | None => return, // accepted; wait for agent_settled
+            Some(Ok(())) | None => {
+                // Accepted: arm the settle fallback (design §11 risk #84). The
+                // turn completes at `agent_settled`; without a deadline a pi
+                // that accepts a prompt but never settles would hang
+                // `session/prompt` forever — the per-request RPC timeout only
+                // bounds the early response, not the settle wait.
+                if self.settle_timeout > Duration::ZERO {
+                    self.settle_deadline = Some(tokio::time::Instant::now() + self.settle_timeout);
+                }
+                return;
+            }
             Some(Err(e)) => e,
         };
+        self.settle_deadline = None;
         let Some(pending) = self.pending_turn.take() else {
             return; // already settled (defensive)
         };
@@ -913,6 +955,7 @@ impl Pump {
     /// The turn is truly over. Resolve the pending ACP prompt, then either
     /// start the next queued turn or publish the idle queue depth.
     async fn on_agent_settled(&mut self) {
+        self.settle_deadline = None;
         let Some(pending) = self.pending_turn.take() else {
             tracing::debug!("agent_settled with no pending turn; ignoring");
             return;
@@ -944,6 +987,7 @@ impl Pump {
     /// the pending turn and all queued turns with [`AcpxError::PiExited`]
     /// (fixes #82 — a dead pi is never a silent empty `end_turn`).
     async fn on_stream_end(&mut self) {
+        self.settle_deadline = None;
         let (code, signal) = {
             let proc = self.proc.lock().await;
             proc.exit_status().unwrap_or((None, None))
@@ -957,6 +1001,35 @@ impl Pump {
             let _ = t.resolve.send(Err(AcpxError::PiExited { code, signal }));
         }
         self.in_agent_loop = false;
+    }
+
+    /// The settle deadline fired: pi accepted the prompt but never emitted
+    /// `agent_settled` (design §11 risk #84). Resolve the pending turn with an
+    /// explicit [`AcpxError::SettleTimeout`] so `session/prompt` can never
+    /// hang forever, and fire a best-effort `abort` to unstick pi. Queued
+    /// turns are not auto-started (pi may be unhealthy — same policy as the
+    /// prompt-rejection path).
+    async fn on_settle_timeout(&mut self) {
+        self.settle_deadline = None;
+        let Some(pending) = self.pending_turn.take() else {
+            tracing::debug!("settle deadline fired with no pending turn; ignoring");
+            return;
+        };
+        self.flush_outbound().await;
+        let secs = self.settle_timeout.as_secs();
+        let _ = pending.resolve.send(Err(AcpxError::SettleTimeout { secs }));
+        self.in_agent_loop = false;
+        self.emit_queue_depth(false).await;
+
+        // Best-effort: tell pi to stop whatever it accepted (it may still be
+        // inside an agent loop; the resulting late `agent_settled` is ignored
+        // — the pending turn is already resolved).
+        let proc = self.proc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = proc.lock().await.abort().await {
+                tracing::warn!(error = %e, "abort after settle timeout failed");
+            }
+        });
     }
 
     // --- streaming assistant messages ---

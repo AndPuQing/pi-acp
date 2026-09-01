@@ -857,3 +857,91 @@ async fn load_session_surfaces_get_messages_failure() {
         .await;
     result.expect("connection should complete");
 }
+
+// ---------------------------------------------------------------------------
+// Signal handling (design §8.3)
+// ---------------------------------------------------------------------------
+
+/// SIGTERM triggers the graceful-shutdown path: with a live session (and its
+/// mock pi subprocess) up, the agent must dispose everything and exit cleanly
+/// (code 0) instead of dying on the raw signal and orphaning pi. Drives the
+/// binary as a raw JSON-RPC client so the child pid is ours to signal.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_triggers_graceful_shutdown() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command as TokioCommand;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let mut child = TokioCommand::new(BIN)
+        .env("PI_ACP_MOCK", "1")
+        .env("PI_ACP_PI_COMMAND", BIN)
+        .env("RUST_LOG", "warn") // keep the stdout protocol stream clean
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Pipeline initialize + session/new (ACP JSON-RPC over line-delimited
+    // JSON; the agent processes them in order). session/new spawns the mock
+    // pi subprocess, so the session is live once it responds.
+    let requests = [
+        json!({"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":1}}),
+        json!({"jsonrpc":"2.0","id":"2","method":"session/new","params":{"cwd": cwd.to_str().unwrap()}}),
+    ];
+    for req in requests {
+        let mut line = req.to_string();
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await.unwrap();
+    }
+    stdin.flush().await.unwrap();
+
+    // Wait for the session/new response frame (id "2"); notifications and any
+    // log lines are skipped.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut raw = String::new();
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "agent never answered session/new"
+        );
+        raw.clear();
+        let n = tokio::time::timeout(
+            deadline - tokio::time::Instant::now(),
+            stdout.read_line(&mut raw),
+        )
+        .await
+        .expect("read timed out")
+        .unwrap();
+        assert!(n > 0, "agent stdout closed before session/new responded");
+        if raw.contains("\"id\":\"2\"") {
+            break;
+        }
+    }
+
+    // SIGTERM the agent; it must dispose the session and exit code 0 within a
+    // bounded window (a missing handler would die on the raw signal instead).
+    let pid = child.id().expect("agent pid");
+    let kill_status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("kill -TERM");
+    assert!(kill_status.success(), "kill -TERM failed");
+
+    let status = tokio::time::timeout(Duration::from_secs(15), child.wait())
+        .await
+        .expect("agent did not exit after SIGTERM (graceful shutdown hung)")
+        .expect("wait failed");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "agent must exit code 0 after SIGTERM (graceful shutdown), got {status:?}"
+    );
+}

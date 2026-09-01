@@ -21,7 +21,7 @@ agent-client-protocol = "2.0.0"
 # (AuthMethod::Terminal) the ACP `authMethods` registry shape needs (S6).
 agent-client-protocol-schema = { version = "=1.5.0", features = ["unstable_auth_methods"] }
 # --- async runtime (S2 spike validated + locked tokio, W-449 / decision D9) ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "signal"] }
 # --- serialization ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -15,6 +15,7 @@ use anyhow::Result;
 use pi_acp::agent::AcpAgent;
 use pi_acp::config::Config;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::signal;
 
 use std::io::Write;
 use std::path::Path;
@@ -58,11 +59,48 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env();
     tracing::info!(pi_command = %cfg.pi_command, "pi-acp (Rust) starting");
     let agent = Arc::new(AcpAgent::new(cfg));
-    agent
-        .run()
-        .await
-        .map_err(|e| anyhow::anyhow!("ACP error: {e:?}"))?;
+    tokio::select! {
+        result = agent.run() => {
+            result.map_err(|e| anyhow::anyhow!("ACP error: {e:?}"))?;
+        }
+        // Graceful shutdown on SIGINT/SIGTERM (design §8.3): the pi subprocess
+        // runs in its own process group, so a terminal Ctrl+C / `kill` on
+        // pi-acp never reaches it — dispose every session explicitly so no pi
+        // is orphaned. Without this branch the default signal disposition
+        // would kill the process mid-session.
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; disposing pi sessions");
+            let shutdown = agent.shutdown();
+            // Bound the graceful teardown: a pi that ignores SIGTERM must not
+            // block exit forever (PiProcess::dispose escalates to SIGKILL, but
+            // only after its own grace window).
+            tokio::select! {
+                _ = shutdown => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    tracing::warn!("graceful shutdown exceeded 10s; exiting anyway");
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// Wait for SIGINT (Ctrl+C) or SIGTERM — the graceful-shutdown trigger
+/// (design §8.3). Unix handles both; other platforms get Ctrl+C only.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
 }
 
 /// Launch `pi` with inherited stdio for interactive login/setup (ACP Terminal

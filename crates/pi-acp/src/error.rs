@@ -56,6 +56,17 @@ pub enum AcpxError {
     #[error("pi RPC command '{command}' failed: {message}")]
     RpcFailed { command: String, message: String },
 
+    /// pi accepted a prompt (early response `Ok`) but never emitted
+    /// `agent_settled` before the settle deadline (design §11 risk #84
+    /// mitigation). The turn is resolved with this error so `session/prompt`
+    /// can never hang forever; the per-request RPC timeout only bounds the
+    /// early response, not the settle wait.
+    #[error(
+        "pi accepted the prompt but never signaled turn completion \
+         (no agent_settled) within {secs}s — cancel and retry, or start a new session"
+    )]
+    SettleTimeout { secs: u64 },
+
     /// Missing/invalid credentials; surfaced as ACP `AuthRequired` so clients
     /// can offer terminal login.
     #[error("authentication required: {0}")]
@@ -96,6 +107,7 @@ impl AcpxError {
             AcpxError::RpcTimeout { .. } => "rpcTimeout",
             AcpxError::PiExited { .. } => "piExited",
             AcpxError::RpcFailed { .. } => "rpcFailed",
+            AcpxError::SettleTimeout { .. } => "settleTimeout",
             AcpxError::AuthRequired(_) => "authRequired",
             AcpxError::UnknownSession(_) => "unknownSession",
             AcpxError::SessionClosed(_) => "sessionClosed",
@@ -132,6 +144,13 @@ impl AcpxError {
             AcpxError::RpcFailed { command, message } => {
                 obj.insert("command".to_string(), json!(command));
                 obj.insert("message".to_string(), json!(message));
+            }
+            AcpxError::SettleTimeout { secs } => {
+                obj.insert("secs".to_string(), json!(secs));
+                obj.insert(
+                    "hint".to_string(),
+                    json!("pi accepted the prompt but never settled; cancel and retry, or start a new session"),
+                );
             }
             AcpxError::AuthRequired(msg) => {
                 obj.insert("message".to_string(), json!(msg));

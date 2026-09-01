@@ -96,6 +96,7 @@ here too.
 | `PI_ACP_VERSION_CHECK`       | `false` | Enable the startup "update available" notice (decision 2: **off by default** to keep startup fast). |
 | `PI_ACP_ENABLE_EMBEDDED_CONTEXT` | `false` | Advertise ACP `promptCapabilities.embeddedContext`. |
 | `PI_ACP_RPC_TIMEOUT_SECS`    | `30`    | Per-request `pi` RPC deadline in seconds (fixes the "first prompt hangs forever" class of bugs). |
+| `PI_ACP_SETTLE_TIMEOUT_SECS` | `600`   | Deadline for a turn's `agent_settled` after `pi` accepts the prompt (design §11 risk #84 mitigation: a `pi` that accepts but never settles must not hang `session/prompt` forever). `0` disables the fallback. |
 | `RUST_LOG`                   | `warn`  | Structured log level (e.g. `RUST_LOG=pi_acp=debug`). Logs go to **stderr**, never stdout (stdout is the ACP protocol channel). |
 
 ## Platform notes

@@ -78,6 +78,8 @@ async fn fixture(extra_args: &[&str]) -> Fixture {
         pi_command: BIN.to_string(),
         extra_args: args,
         timeout: TIMEOUT,
+        // The mock settles every turn; the settle fallback is not needed.
+        settle_timeout: Duration::ZERO,
         cwd: tmp.path().to_path_buf(),
         outbound: outbound_tx,
         session_path: None,
@@ -875,6 +877,59 @@ async fn dead_session_reports_pi_exit_on_subsequent_prompts() {
 }
 
 // ---------------------------------------------------------------------------
+// Settle fallback (design §11 risk #84)
+// ---------------------------------------------------------------------------
+
+/// pi accepts the prompt but never emits `agent_settled` (the mock's
+/// `--mock-no-settle`): the settle deadline must resolve the turn with an
+/// explicit `SettleTimeout` instead of hanging `session/prompt` forever — the
+/// per-request RPC timeout only bounds the early response, not the settle
+/// wait.
+#[tokio::test]
+async fn missing_agent_settled_resolves_with_settle_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scenarios = tmp.path().join("scenarios");
+    fs::create_dir_all(&scenarios).unwrap();
+    let (outbound_tx, outbound_rx) = mpsc::channel(512);
+    let (answer_tx, answer_rx) = mpsc::channel(16);
+    let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+    let rec = recorded.clone();
+    tokio::spawn(run_recorder(outbound_rx, rec, answer_rx));
+    let _ = answer_tx;
+
+    let session = PiAcpSession::spawn(SessionParams {
+        pi_command: BIN.to_string(),
+        extra_args: vec!["--mock-rpc".to_string(), "--mock-no-settle".to_string()],
+        timeout: TIMEOUT,
+        // Short deadline so the test runs fast; 0 would disable the fallback.
+        settle_timeout: Duration::from_millis(500),
+        cwd: tmp.path().to_path_buf(),
+        outbound: outbound_tx,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
+    })
+    .await
+    .expect("session spawn");
+
+    // The early prompt response is accepted (Ok) but no settle follows; the
+    // fallback must resolve the turn rather than hang.
+    let result = tokio::time::timeout(
+        TIMEOUT,
+        session.prompt("hello".to_string(), Vec::<ImageContent>::new()),
+    )
+    .await
+    .expect("prompt must resolve (settle fallback)");
+    match result {
+        Err(AcpxError::SettleTimeout { .. }) => {}
+        other => panic!("expected SettleTimeout, got {other:?}"),
+    }
+
+    // The session is still alive and disposable after the fallback fired.
+    session.dispose().await;
+}
+
+// ---------------------------------------------------------------------------
 // SessionManager
 // ---------------------------------------------------------------------------
 
@@ -890,6 +945,7 @@ async fn session_manager_registers_and_disposes_sessions() {
         pi_command: BIN.to_string(),
         extra_args: vec!["--mock-rpc".to_string()],
         timeout: TIMEOUT,
+        settle_timeout: Duration::ZERO,
         cwd: tmp.path().to_path_buf(),
         outbound: outbound_tx,
         session_path: None,

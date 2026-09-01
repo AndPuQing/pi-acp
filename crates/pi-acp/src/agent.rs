@@ -322,6 +322,14 @@ impl AcpAgent {
         result
     }
 
+    /// Gracefully shut down (design §8.3): dispose every live pi session.
+    /// Invoked on SIGINT/SIGTERM so a Ctrl+C / `kill` on pi-acp never orphans
+    /// its pi subprocesses (they run in their own process group and would not
+    /// receive the terminal's signal).
+    pub async fn shutdown(&self) {
+        self.sessions.dispose_all().await;
+    }
+
     // -----------------------------------------------------------------------
     // initialize
     // -----------------------------------------------------------------------
@@ -396,6 +404,20 @@ impl AcpAgent {
 
         let file_commands = commands::load_slash_commands(&req.cwd);
         let enable_skill_commands = get_enable_skill_commands(&req.cwd);
+        let quiet_startup = get_quiet_startup(&req.cwd);
+
+        // D6: the `pi --version` probe runs on a spawned task **overlapping**
+        // the handshake below, so a slow probe never *adds* to the session/new
+        // critical path (the response waits only max(handshake, probe), never
+        // handshake + probe). Skipped under quietStartup — the prelude is then
+        // just the update notice, which carries no version header.
+        let mut version_task: Option<tokio::task::JoinHandle<Option<String>>> = None;
+        if !quiet_startup {
+            let pi_command = self.cfg.pi_command.clone();
+            version_task = Some(tokio::spawn(
+                async move { fetch_pi_version(&pi_command).await },
+            ));
+        }
 
         let session = self
             .spawn_session(Some(&req.cwd), None, None, cx, file_commands.clone())
@@ -436,7 +458,6 @@ impl AcpAgent {
         let (config_options, _models, modes) =
             get_session_configuration(&session, state.as_ref(), available_models.as_ref()).await;
 
-        let quiet_startup = get_quiet_startup(&req.cwd);
         let update_notice = if let Some(task) = notice_task {
             // The check has been running in parallel with the handshake; await
             // it (its internal timeouts bound the wait) and cache the result.
@@ -449,13 +470,18 @@ impl AcpAgent {
                 VersionCheck::Pending => None,
             }
         };
-        let prelude_text = build_startup_prelude(
-            &req.cwd,
-            &self.cfg.pi_command,
-            quiet_startup,
-            update_notice.as_deref(),
-        )
-        .await;
+        let prelude_text = {
+            let pi_version = match version_task {
+                Some(task) => task.await.unwrap_or(None),
+                None => None,
+            };
+            build_startup_prelude(
+                &req.cwd,
+                pi_version.as_deref(),
+                quiet_startup,
+                update_notice.as_deref(),
+            )
+        };
 
         // Policy: within a single ACP connection keep only one live pi
         // subprocess (TS parity — avoids leaking subprocesses when clients
@@ -885,6 +911,7 @@ impl AcpAgent {
             pi_command: self.cfg.pi_command.clone(),
             extra_args: vec![],
             timeout: std::time::Duration::from_secs(self.cfg.rpc_timeout_secs),
+            settle_timeout: std::time::Duration::from_secs(self.cfg.settle_timeout_secs),
             cwd: cwd.unwrap_or_else(|| Path::new(".")).to_path_buf(),
             outbound: outbound_tx,
             session_path,
@@ -1306,19 +1333,20 @@ fn acp_error_from_pi(e: AcpxError) -> AcpError {
 
 /// Build the startup prelude text: full startup info unless `quietStartup`,
 /// which keeps only the update notice (TS `buildStartupInfo` + quietStartup).
-async fn build_startup_prelude(
+///
+/// The caller passes the pi version, which is fetched **asynchronously** on a
+/// spawned task (design D6 — no subprocess probe adds to the session/new
+/// critical path).
+fn build_startup_prelude(
     cwd: &Path,
-    pi_command: &str,
+    pi_version: Option<&str>,
     quiet_startup: bool,
     update_notice: Option<&str>,
 ) -> String {
     if quiet_startup {
         return update_notice.map(|n| format!("{n}\n")).unwrap_or_default();
     }
-    // Async `pi --version` probe (design D6: no sync subprocess on the
-    // session/new critical path).
-    let pi_version = fetch_pi_version(pi_command).await;
-    let out = build_startup_info(cwd, pi_version.as_deref(), update_notice);
+    let out = build_startup_info(cwd, pi_version, update_notice);
     tracing::debug!(chars = out.len(), "startup prelude built");
     out
 }

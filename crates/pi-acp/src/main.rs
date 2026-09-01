@@ -21,8 +21,28 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Keep short-lived probes from creating a Tokio worker pool. These paths
+    // are used during every session handshake, so starting the runtime first
+    // needlessly raises the process/thread peak when pi is itself pi-acp.
+    if args.iter().any(|a| a == "--terminal-login") {
+        return terminal_login();
+    }
+    if args.iter().any(|a| a == "--version") {
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Structured logging (env-filter driven, e.g. RUST_LOG=pi_acp=debug).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -30,18 +50,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .try_init();
-
-    if std::env::args().skip(1).any(|a| a == "--terminal-login") {
-        return terminal_login();
-    }
-
-    // `pi --version` parity: print the version and exit (the startup prelude
-    // probes PI_ACP_PI_COMMAND with --version; when the adapter itself is the
-    // target, answer like pi does).
-    if std::env::args().skip(1).any(|a| a == "--version") {
-        println!("v{}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
 
     // Hidden test fixture (see tests/pi_process.rs): a mock `pi --mode rpc`
     // server so the RPC client can be tested without a real pi + LLM backend.

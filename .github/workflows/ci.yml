@@ -33,7 +33,10 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: test
-        run: cargo test --all --all-features
+        # Integration fixtures spawn nested pi-acp processes; serialize test
+        # binaries and cases so runner process limits cannot cause EAGAIN or
+        # close an otherwise healthy ACP transport.
+        run: cargo test --all --all-features -j 1 -- --test-threads=1
 
   # Cross-compile smoke check (no execution, no C linker — `cargo check` for
   # every target in the release matrix: Linux x64/arm64 (musl), macOS x64/arm64,

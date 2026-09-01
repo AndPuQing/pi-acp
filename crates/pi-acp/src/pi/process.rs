@@ -156,10 +156,15 @@ impl PiProcess {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
-        // Put pi in its own process group so teardown can signal the whole tree
-        // (wrapper launchers like pi.cmd may spawn grandchildren).
+        // Put real pi in its own process group so teardown can signal the whole
+        // tree (wrapper launchers like pi.cmd may spawn grandchildren). The
+        // ACP integration fixture nests a mock pi inside an externally-managed
+        // adapter process; sharing that test-only process group lets the SDK's
+        // outer teardown reap both levels instead of orphaning the mock.
         #[cfg(unix)]
-        cmd.process_group(0);
+        if std::env::var_os("PI_ACP_MOCK").is_none() {
+            cmd.process_group(0);
+        }
 
         let mut child = cmd
             .spawn()

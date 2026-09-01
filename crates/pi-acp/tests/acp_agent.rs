@@ -635,3 +635,225 @@ async fn unknown_config_option_errors() {
         .await;
     result.expect("connection should complete");
 }
+
+// ---------------------------------------------------------------------------
+// S8 (W-455): reliability — errors surface, dead pi is loud, auth promotes
+// ---------------------------------------------------------------------------
+
+/// After the pi subprocess dies, `session/prompt` on that session returns an
+/// **explicit** `internalError` — never a silent empty `end_turn`, and never a
+/// generic "session closed" that hides what happened (fixes #82).
+///
+/// `--mock-exit-after 4` (env form for the inner mock): commands 1-3 are the
+/// session/new handshake (`get_state` x2 + `get_available_models`), command 4
+/// is the first prompt, which the mock answers by dying.
+#[tokio::test]
+async fn prompt_after_pi_death_returns_explicit_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_ACP_MOCK_EXIT_AFTER", "4"),
+    );
+
+    let result = Client
+        .builder()
+        .name("s8-dead-pi-client")
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await
+                .expect("session/new must succeed before the mock dies");
+            let sid = new_session.session_id;
+
+            // The in-flight turn dies with pi: explicit PiExited error.
+            let err = cx
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("hello".to_string()))],
+                ))
+                .block_task()
+                .await
+                .expect_err("prompt must fail when pi dies mid-turn");
+            assert_eq!(
+                err.code,
+                agent_client_protocol::schema::v1::ErrorCode::InternalError
+            );
+            assert!(err.message.contains("pi process exited"), "{}", err.message);
+            assert!(
+                err.message.contains("does not restart pi"),
+                "hint must be present: {}",
+                err.message
+            );
+            let data = err.data.as_ref().expect("structured error data");
+            assert_eq!(data["errorType"], "piExited");
+            assert_eq!(data["code"], 42);
+
+            // A later prompt on the same (dead) session fails loudly too — the
+            // session remembers the exit and never hangs or goes quiet.
+            let err2 = cx
+                .send_request(PromptRequest::new(
+                    sid,
+                    vec![ContentBlock::Text(TextContent::new("again".to_string()))],
+                ))
+                .block_task()
+                .await
+                .expect_err("later prompt on a dead session must error");
+            assert_eq!(
+                err2.code,
+                agent_client_protocol::schema::v1::ErrorCode::InternalError
+            );
+            assert!(
+                err2.message.contains("pi process exited"),
+                "{}",
+                err2.message
+            );
+            assert_eq!(
+                err2.data.as_ref().expect("error data")["errorType"],
+                "piExited"
+            );
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
+/// A pi error that looks like missing credentials is promoted to ACP
+/// `authRequired` (code -32000) with the terminal auth methods attached, so
+/// the client can offer terminal login (S8 / auth.rs keyword matching).
+#[tokio::test]
+async fn auth_looking_prompt_error_surfaces_auth_required() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env(
+                "PI_ACP_MOCK_PROMPT_ERROR",
+                "unauthorized: 401 missing api key",
+            ),
+    );
+
+    let result = Client
+        .builder()
+        .name("s8-auth-prompt-client")
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await
+                .expect("session/new succeeds; the error comes from the prompt");
+            let err = cx
+                .send_request(PromptRequest::new(
+                    new_session.session_id,
+                    vec![ContentBlock::Text(TextContent::new("hi".to_string()))],
+                ))
+                .block_task()
+                .await
+                .expect_err("auth-looking pi error must promote to authRequired");
+            assert_eq!(
+                err.code,
+                agent_client_protocol::schema::v1::ErrorCode::AuthRequired
+            );
+            assert!(
+                err.message.contains("Configure an API key"),
+                "standard auth message: {}",
+                err.message
+            );
+            let data = err.data.as_ref().expect("authRequired data");
+            let methods = data["authMethods"].as_array().expect("authMethods array");
+            assert_eq!(methods.len(), 1);
+            assert_eq!(methods[0]["id"], "pi_terminal_login");
+            assert_eq!(methods[0]["type"], "terminal");
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
+/// `session/new` whose model fetch fails with auth-looking text promotes to
+/// `authRequired` (parity with TS `newSession`: models failure → auth check
+/// first, then internalError).
+#[tokio::test]
+async fn auth_looking_models_error_on_new_surfaces_auth_required() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_ACP_MOCK_MODELS_ERROR", "missing api key for provider"),
+    );
+
+    let result = Client
+        .builder()
+        .name("s8-auth-new-client")
+        .connect_with(agent, async |cx| {
+            let err = cx
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await
+                .expect_err("auth-looking models error must fail session/new");
+            assert_eq!(
+                err.code,
+                agent_client_protocol::schema::v1::ErrorCode::AuthRequired
+            );
+            let data = err.data.as_ref().expect("authRequired data");
+            let methods = data["authMethods"].as_array().expect("authMethods array");
+            assert_eq!(methods.len(), 1);
+            assert_eq!(methods[0]["id"], "pi_terminal_login");
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
+/// `session/load` surfaces `get_messages` failures explicitly instead of
+/// silently skipping history replay (S8: never swallow errors; TS parity:
+/// `loadSession` throws on `getMessages`).
+#[tokio::test]
+async fn load_session_surfaces_get_messages_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent_dir = tmp.path().join("agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    // A real pi session file so `find_stored_session` resolves the id.
+    write_pi_session(&agent_dir, "stored-session", &cwd.to_string_lossy());
+
+    // The mock dies on command 2: 1=spawn handshake `get_state` (succeeds),
+    // 2=load's `get_messages` (dies → explicit error, no silent replay skip).
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_ACP_MOCK_EXIT_AFTER", "2")
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
+    );
+
+    let result = Client
+        .builder()
+        .name("s8-load-error-client")
+        .connect_with(agent, async |cx| {
+            let err = cx
+                .send_request(LoadSessionRequest::new("stored-session", cwd))
+                .block_task()
+                .await
+                .expect_err("get_messages failure must fail session/load");
+            assert_eq!(
+                err.code,
+                agent_client_protocol::schema::v1::ErrorCode::InternalError
+            );
+            assert!(err.message.contains("pi process exited"), "{}", err.message);
+            assert_eq!(
+                err.data.as_ref().expect("error data")["errorType"],
+                "piExited"
+            );
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}

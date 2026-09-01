@@ -294,6 +294,15 @@ impl PiProcess {
         *self.shared.exit.lock().unwrap()
     }
 
+    /// Wait (bounded) for the watcher to observe the child's exit, then return
+    /// the settled exit status. The reader may observe stdout EOF a moment
+    /// before the watcher reaps the child; sessions call this when the event
+    /// stream ends so the death error carries the real exit code (S8 / #82).
+    pub async fn wait_exited(&mut self, timeout: Duration) -> Option<(Option<i32>, Option<i32>)> {
+        let _ = tokio::time::timeout(timeout, &mut self.watcher).await;
+        self.exit_status()
+    }
+
     /// Send a `prompt` command and stream each pi event to `on_event` until the
     /// turn settles (`agent_settled`). The `prompt` `response` line arrives
     /// early (before the events) and is consumed by [`PiProcess::request`]; the

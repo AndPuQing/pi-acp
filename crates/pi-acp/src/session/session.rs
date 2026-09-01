@@ -76,6 +76,11 @@ pub enum StopReason {
     Cancelled,
 }
 
+/// The pi subprocess's exit `(code, signal)` once it has exited (`None` while
+/// alive); shared between the session handle and the pump task so a dead pi is
+/// reported loudly on every later command (S8 / #82).
+type PiExitStatus = Option<(Option<i32>, Option<i32>)>;
+
 /// Outbound ACP messages produced by the session pump.
 ///
 /// Everything the session sends to the ACP client travels this single ordered
@@ -93,6 +98,11 @@ pub enum OutboundMessage {
         RequestPermissionRequest,
         oneshot::Sender<std::result::Result<RequestPermissionResponse, AcpxError>>,
     ),
+    /// Ordering barrier (S8 / D4): acknowledged once everything sent before it
+    /// has been forwarded to the connection. The pump awaits this before
+    /// resolving a turn so streamed notifications are never overtaken by the
+    /// `session/prompt` response (TS `flushEmits` parity).
+    Flush(oneshot::Sender<()>),
 }
 
 /// Parameters for spawning a session (S6 agent wiring / tests).
@@ -133,6 +143,11 @@ pub struct PiAcpSession {
     /// File-based slash commands for this session's cwd (expanded in
     /// [`PiAcpSession::prompt`]; pi RPC mode disables its own expansion).
     file_commands: Vec<crate::commands::FileSlashCommand>,
+    /// The pi subprocess's exit `(code, signal)` when it died **unexpectedly**
+    /// (stream end, not graceful dispose). Commands issued after death fail
+    /// with [`AcpxError::PiExited`] (code/signal + hint) instead of a generic
+    /// "session closed" (S8 / fixes #82 — a dead pi is always loud).
+    death: Arc<std::sync::Mutex<PiExitStatus>>,
 }
 
 /// Commands the pump task accepts from the outside world.
@@ -217,6 +232,11 @@ struct Pump {
     prompt_rx: mpsc::Receiver<std::result::Result<(), AcpxError>>,
     /// Held open so `prompt_rx.recv()` parks when no prompt is in flight.
     _prompt_tx: mpsc::Sender<std::result::Result<(), AcpxError>>,
+    /// Shared death record; set at teardown when pi exited unexpectedly so the
+    /// [`PiAcpSession`] handle fails later commands with [`AcpxError::PiExited`].
+    death: Arc<std::sync::Mutex<PiExitStatus>>,
+    /// True when the pump loop exited because pi's stdout ended (process died).
+    pi_died: bool,
 
     /// Client-side one-at-a-time turn queue.
     queue: VecDeque<QueuedTurn>,
@@ -261,6 +281,7 @@ impl PiAcpSession {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (prompt_tx, prompt_rx) = mpsc::channel(4);
         let (extension_tx, extension_rx) = mpsc::channel(8);
+        let death = Arc::new(std::sync::Mutex::new(None));
         let pump = Pump {
             proc: Arc::new(Mutex::new(proc)),
             outbound: params.outbound.clone(),
@@ -272,6 +293,8 @@ impl PiAcpSession {
             extension_tx,
             prompt_rx,
             _prompt_tx: prompt_tx,
+            death: death.clone(),
+            pi_died: false,
             queue: VecDeque::new(),
             pending_turn: None,
             cancel_requested: false,
@@ -291,11 +314,23 @@ impl PiAcpSession {
             cmd_tx,
             first_prompt: AtomicBool::new(false),
             file_commands: params.file_commands,
+            death,
         }))
     }
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// The error to surface when the session's pump is gone: [`AcpxError::PiExited`]
+    /// when pi died unexpectedly (carrying code/signal so the client gets the
+    /// "pi is dead" diagnosis + hint), else [`AcpxError::SessionClosed`].
+    fn death_error(&self) -> AcpxError {
+        if let Some((code, signal)) = *self.death.lock().unwrap() {
+            AcpxError::PiExited { code, signal }
+        } else {
+            AcpxError::SessionClosed(self.session_id.0.to_string())
+        }
     }
 
     pub fn cwd(&self) -> &Path {
@@ -329,9 +364,8 @@ impl PiAcpSession {
                 respond: tx,
             })
             .await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
-        rx.await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?
     }
 
     /// Cancel the running turn and clear all queued turns (each resolves
@@ -342,9 +376,8 @@ impl PiAcpSession {
         self.cmd_tx
             .send(SessionCommand::Cancel { respond: tx })
             .await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
-        rx.await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?
     }
 
     /// Gracefully tear the session down: dispose the pi process (SIGTERM →
@@ -373,9 +406,8 @@ impl PiAcpSession {
                 respond: tx,
             })
             .await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
-        rx.await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?
     }
 
     /// `get_state`.
@@ -415,7 +447,7 @@ impl PiAcpSession {
                 respond: tx,
             })
             .await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
+            .map_err(|_| self.death_error())?;
         let _ = rx.await;
         Ok(())
     }
@@ -539,6 +571,7 @@ async fn pump_loop(mut pump: Pump) {
                     // pi's stdout ended (process exit) — fail the in-flight turn.
                     None => {
                         pump.on_stream_end().await;
+                        pump.pi_died = true;
                         break;
                     }
                 }
@@ -561,6 +594,19 @@ async fn pump_loop(mut pump: Pump) {
             code: None,
             signal: None,
         }));
+    }
+    // pi died unexpectedly: record the (settled) exit status so later commands
+    // on this session fail with `PiExited` (code/signal + hint) instead of a
+    // generic "session closed" (S8 / fixes #82). Graceful shutdowns skip this.
+    if pump.pi_died {
+        let status = {
+            let mut proc = pump.proc.lock().await;
+            proc.wait_exited(std::time::Duration::from_millis(200))
+                .await
+        };
+        if let Some(status) = status {
+            *pump.death.lock().unwrap() = Some(status);
+        }
     }
     pump.proc.lock().await.dispose().await;
     if let Some(done) = shutdown_done {
@@ -646,6 +692,7 @@ impl Pump {
         let Some(pending) = self.pending_turn.take() else {
             return; // already settled (defensive)
         };
+        self.flush_outbound().await;
         if self.cancel_requested {
             let _ = pending.resolve.send(Ok(StopReason::Cancelled));
         } else {
@@ -693,6 +740,23 @@ impl Pump {
         {
             tracing::debug!("outbound sink closed; dropping session update");
         }
+    }
+
+    /// Ordering barrier: block until everything already sent on the outbound
+    /// channel has been forwarded to the connection (S8 / D4; TS `flushEmits`).
+    /// Resolving a turn only after this guarantees streamed notifications are
+    /// never overtaken by the `session/prompt` response frame.
+    async fn flush_outbound(&mut self) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .outbound
+            .send(OutboundMessage::Flush(tx))
+            .await
+            .is_err()
+        {
+            return; // sink closed; nothing to flush
+        }
+        let _ = rx.await;
     }
 
     async fn emit_text(&mut self, text: &str) {
@@ -853,6 +917,9 @@ impl Pump {
             tracing::debug!("agent_settled with no pending turn; ignoring");
             return;
         };
+        // All streamed updates derived from pi events are delivered before the
+        // response frame (TS `flushEmits` parity; S8 / D4 ordering).
+        self.flush_outbound().await;
         let reason = if self.cancel_requested {
             StopReason::Cancelled
         } else {
@@ -882,6 +949,7 @@ impl Pump {
             proc.exit_status().unwrap_or((None, None))
         };
         let pending_err = AcpxError::PiExited { code, signal };
+        self.flush_outbound().await;
         if let Some(p) = self.pending_turn.take() {
             let _ = p.resolve.send(Err(pending_err));
         }
@@ -1333,6 +1401,11 @@ pub fn spawn_outbound_connector(
                             }
                         });
                         let _ = respond.send(response);
+                    }
+                    OutboundMessage::Flush(ack) => {
+                        // Everything before this marker is now enqueued on the
+                        // connection's outgoing channel; release the pump.
+                        let _ = ack.send(());
                     }
                 }
             }

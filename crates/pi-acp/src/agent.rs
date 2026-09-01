@@ -124,6 +124,16 @@ struct ModeState {
     available_modes: Vec<SessionMode>,
 }
 
+/// Cached startup version-check state (design D6: the npm registry probe runs
+/// at most once per agent process, so repeated `session/new` never re-hit the
+/// network). `Done(None)` means "checked, pi is up to date".
+enum VersionCheck {
+    /// Not checked yet.
+    Pending,
+    /// Checked; the cached notice text (if any).
+    Done(Option<Arc<str>>),
+}
+
 /// The per-connection agent: shared state behind every handler.
 pub struct AcpAgent {
     cfg: Config,
@@ -132,6 +142,8 @@ pub struct AcpAgent {
     /// Most recent session cwd, used as the default `session/list` filter
     /// (TS parity: Zed sends `{}` and expects the project-scoped picker).
     last_session_cwd: Mutex<Option<PathBuf>>,
+    /// Cached startup update notice (D6: async + cache, off the critical path).
+    version_check: Mutex<VersionCheck>,
 }
 
 impl AcpAgent {
@@ -141,6 +153,7 @@ impl AcpAgent {
             sessions: SessionManager::new(),
             store: SessionStore::new(),
             last_session_cwd: Mutex::new(None),
+            version_check: Mutex::new(VersionCheck::Pending),
         }
     }
 
@@ -366,6 +379,21 @@ impl AcpAgent {
         }
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
+        // Kick off the npm update check as early as possible so it overlaps the
+        // session handshake below (design D6: async + cached; awaiting it
+        // before the response keeps the notice before `session/new`'s response,
+        // D4 / #70).
+        let mut notice_task: Option<tokio::task::JoinHandle<Option<String>>> = None;
+        if self.cfg.enable_version_check {
+            let pending = matches!(*self.version_check.lock().await, VersionCheck::Pending);
+            if pending {
+                let pi_command = self.cfg.pi_command.clone();
+                notice_task = Some(tokio::spawn(async move {
+                    build_update_notice(&pi_command).await
+                }));
+            }
+        }
+
         let file_commands = commands::load_slash_commands(&req.cwd);
         let enable_skill_commands = get_enable_skill_commands(&req.cwd);
 
@@ -409,10 +437,17 @@ impl AcpAgent {
             get_session_configuration(&session, state.as_ref(), available_models.as_ref()).await;
 
         let quiet_startup = get_quiet_startup(&req.cwd);
-        let update_notice = if self.cfg.enable_version_check {
-            build_update_notice(&self.cfg.pi_command).await
+        let update_notice = if let Some(task) = notice_task {
+            // The check has been running in parallel with the handshake; await
+            // it (its internal timeouts bound the wait) and cache the result.
+            let notice = task.await.unwrap_or(None);
+            *self.version_check.lock().await = VersionCheck::Done(notice.clone().map(Arc::from));
+            notice
         } else {
-            None
+            match &*self.version_check.lock().await {
+                VersionCheck::Done(notice) => notice.as_ref().map(|s| s.to_string()),
+                VersionCheck::Pending => None,
+            }
         };
         let prelude_text = build_startup_prelude(
             &req.cwd,
@@ -517,7 +552,7 @@ impl AcpAgent {
         let reason = session
             .prompt(pi_prompt.message, to_pi_images(pi_prompt.images))
             .await
-            .map_err(AcpError::from)?;
+            .map_err(acp_error_from_pi)?;
         let stop_reason = acp_stop_reason(reason);
         tracing::info!(session = %session_id, ?stop_reason, "prompt turn settled");
         Ok(PromptResponse::new(stop_reason))
@@ -528,7 +563,11 @@ impl AcpAgent {
         let Some(session) = self.sessions.maybe_get(&notif.session_id).await else {
             return;
         };
-        let _ = session.cancel().await;
+        if let Err(e) = session.cancel().await {
+            // A notification has no error response; log the failure so it is
+            // never silently swallowed (design D5).
+            tracing::warn!(session = %notif.session_id, error = %e, "session/cancel failed");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -572,18 +611,19 @@ impl AcpAgent {
         // Replay full conversation history. Publish the thread title first —
         // the same title `session/list` computed for this file (fixes #102/#24:
         // the restored thread shows a real title instead of "New Agent Thread").
-        if let Ok(data) = session.get_messages().await {
-            if let Some(title) = title_from_session_file(std::path::Path::new(&stored_file)) {
-                let update = SessionInfoUpdate::new()
-                    .title(title)
-                    .updated_at(utc_now_iso8601());
-                let _ = cx.send_notification(SessionNotification::new(
-                    req.session_id.clone(),
-                    SessionUpdate::SessionInfoUpdate(update),
-                ));
-            }
-            replay_history(cx, &session, &data).await;
+        // `get_messages` failures surface as an explicit error (TS parity:
+        // `loadSession` throws; S8 "never swallow errors").
+        let data = session.get_messages().await.map_err(acp_error_from_pi)?;
+        if let Some(title) = title_from_session_file(std::path::Path::new(&stored_file)) {
+            let update = SessionInfoUpdate::new()
+                .title(title)
+                .updated_at(utc_now_iso8601());
+            let _ = cx.send_notification(SessionNotification::new(
+                req.session_id.clone(),
+                SessionUpdate::SessionInfoUpdate(update),
+            ));
         }
+        replay_history(cx, &session, &data).await;
 
         let (config_options, _models, modes) =
             get_session_configuration(&session, None, None).await;
@@ -691,7 +731,7 @@ impl AcpAgent {
         session
             .set_thinking_level(level)
             .await
-            .map_err(AcpError::from)?;
+            .map_err(acp_error_from_pi)?;
 
         // Let the client know the current mode changed (keeps the dropdown in sync).
         send_current_mode_update(cx, &req.session_id, mode).await;
@@ -722,7 +762,7 @@ impl AcpAgent {
             MODEL_CONFIG_ID => {
                 set_session_model(&session, &value)
                     .await
-                    .map_err(AcpError::from)?;
+                    .map_err(acp_error_from_pi)?;
             }
             THOUGHT_LEVEL_CONFIG_ID => {
                 let level = parse_thinking_level(&value)
@@ -730,7 +770,7 @@ impl AcpAgent {
                 session
                     .set_thinking_level(level)
                     .await
-                    .map_err(AcpError::from)?;
+                    .map_err(acp_error_from_pi)?;
                 send_current_mode_update(cx, &req.session_id, &value).await;
             }
             other => {
@@ -740,7 +780,7 @@ impl AcpAgent {
 
         let config_options = emit_config_options_update(cx, &req.session_id, &session)
             .await
-            .map_err(AcpError::from)?;
+            .map_err(acp_error_from_pi)?;
         Ok(SetSessionConfigOptionResponse::new(config_options))
     }
 
@@ -765,7 +805,7 @@ impl AcpAgent {
         let session = self.restore_session(&session_id, None, cx).await?;
         set_session_model(&session, model_id)
             .await
-            .map_err(AcpError::from)?;
+            .map_err(acp_error_from_pi)?;
         let _ = emit_config_options_update(cx, &session_id, &session).await;
         tracing::info!(session = %session_id.0, model = model_id, "session/set_model applied");
         Ok(())
@@ -895,7 +935,7 @@ impl AcpAgent {
                 let res = session
                     .compact(custom.as_deref())
                     .await
-                    .map_err(AcpError::from)?;
+                    .map_err(acp_error_from_pi)?;
                 let tokens_before = res.get("tokensBefore").and_then(Value::as_u64);
                 let summary = res
                     .get("summary")
@@ -918,7 +958,10 @@ impl AcpAgent {
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
             }
             "session" => {
-                let stats = session.get_session_stats().await.map_err(AcpError::from)?;
+                let stats = session
+                    .get_session_stats()
+                    .await
+                    .map_err(acp_error_from_pi)?;
                 let mut lines: Vec<String> = Vec::new();
                 if let Some(sid) = stats.get("sessionId").and_then(Value::as_str) {
                     lines.push(format!("Session: {sid}"));
@@ -997,7 +1040,7 @@ impl AcpAgent {
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
             }
             "steering" | "follow-up" => {
-                let state = session.get_state().await.map_err(AcpError::from)?;
+                let state = session.get_state().await.map_err(acp_error_from_pi)?;
                 let (current, mode_name, action) = if cmd == "steering" {
                     (
                         queue_mode_str(state.steering_mode).to_string(),
@@ -1046,12 +1089,12 @@ impl AcpAgent {
                     session
                         .set_steering_mode(queue_mode)
                         .await
-                        .map_err(AcpError::from)?;
+                        .map_err(acp_error_from_pi)?;
                 } else {
                     session
                         .set_follow_up_mode(queue_mode)
                         .await
-                        .map_err(AcpError::from)?;
+                        .map_err(acp_error_from_pi)?;
                 }
                 let _ = send_text_chunk(
                     cx,
@@ -1083,7 +1126,7 @@ impl AcpAgent {
                 // Guard: pi's export_html reads the session JSONL file; an
                 // empty/missing file makes pi throw an uncorrelated parse
                 // error (no id) that would hang the request.
-                let state = session.get_state().await.map_err(AcpError::from)?;
+                let state = session.get_state().await.map_err(acp_error_from_pi)?;
                 let session_file = state.session_file.clone().unwrap_or_default();
                 let message_count = state.message_count;
                 let file_ok = if session_file.is_empty() || message_count == 0 {
@@ -1167,14 +1210,14 @@ impl AcpAgent {
                 let enabled = match enabled {
                     Some(v) => v,
                     None => {
-                        let state = session.get_state().await.map_err(AcpError::from)?;
+                        let state = session.get_state().await.map_err(acp_error_from_pi)?;
                         !state.auto_compaction_enabled
                     }
                 };
                 session
                     .set_auto_compaction(enabled)
                     .await
-                    .map_err(AcpError::from)?;
+                    .map_err(acp_error_from_pi)?;
                 let _ = send_text_chunk(
                     cx,
                     session_id,
@@ -1241,6 +1284,24 @@ fn auth_required() -> AcpError {
         ACP_AUTH_REQUIRED,
         "Configure an API key or log in with an OAuth provider.",
     )
+    .data(crate::error::auth_required_data())
+}
+
+/// Map an adapter/pi error onto the ACP error the client receives, promoting
+/// auth-looking pi failures to `authRequired` (with the auth methods attached
+/// so clients can offer terminal login).
+///
+/// Promotion is restricted to [`AcpxError::RpcFailed`] — the one variant that
+/// carries pi/provider error text — so spawn failures (`EACCES` renders as
+/// "Permission denied") and process exits are never misclassified as auth
+/// problems (S8 / auth.rs keyword matching).
+fn acp_error_from_pi(e: AcpxError) -> AcpError {
+    if let AcpxError::RpcFailed { message, .. } = &e {
+        if maybe_auth_required_error(message).is_some() {
+            return auth_required();
+        }
+    }
+    AcpError::from(e)
 }
 
 /// Build the startup prelude text: full startup info unless `quietStartup`,
@@ -1705,6 +1766,61 @@ fn provisional_title_from_prompt(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::provisional_title_from_prompt;
+    use super::*;
+
+    /// ACP `internalError` code (mapping asserted in the S8 tests).
+    const ACP_INTERNAL_ERROR: i32 = -32603;
+
+    #[test]
+    fn acp_error_from_pi_promotes_auth_looking_rpc_failures() {
+        let err = acp_error_from_pi(AcpxError::RpcFailed {
+            command: "prompt".into(),
+            message: "unauthorized: 401 missing api key".into(),
+        });
+        assert_eq!(err.code, ACP_AUTH_REQUIRED.into());
+        let data = err.data.as_ref().expect("authRequired data");
+        let methods = data["authMethods"].as_array().expect("authMethods");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["id"], "pi_terminal_login");
+    }
+
+    #[test]
+    fn acp_error_from_pi_does_not_promote_spawn_or_exit_errors() {
+        // EACCES renders as "Permission denied" — must stay internal, never
+        // misclassified as an auth problem (S8).
+        let spawn = acp_error_from_pi(AcpxError::PiSpawn(
+            "pi: Permission denied (os error 13)".into(),
+        ));
+        assert_eq!(spawn.code, ACP_INTERNAL_ERROR.into());
+        assert!(
+            !spawn.message.contains("Configure an API key"),
+            "{}",
+            spawn.message
+        );
+
+        let exited = acp_error_from_pi(AcpxError::PiExited {
+            code: Some(42),
+            signal: None,
+        });
+        assert_eq!(exited.code, ACP_INTERNAL_ERROR.into());
+        let data = exited.data.as_ref().expect("error data");
+        assert_eq!(data["errorType"], "piExited");
+        assert_eq!(data["code"], 42);
+    }
+
+    #[test]
+    fn acp_error_from_pi_leaves_non_auth_failures_internal() {
+        let err = acp_error_from_pi(AcpxError::RpcFailed {
+            command: "get_state".into(),
+            message: "something else entirely".into(),
+        });
+        assert_eq!(err.code, ACP_INTERNAL_ERROR.into());
+        assert!(
+            err.message.contains("something else entirely"),
+            "{}",
+            err.message
+        );
+    }
 
     #[test]
     fn provisional_title_plain_message() {

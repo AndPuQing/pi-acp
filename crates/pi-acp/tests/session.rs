@@ -120,6 +120,10 @@ async fn run_recorder(
                 });
                 let _ = respond.send(Ok(answer));
             }
+            OutboundMessage::Flush(ack) => {
+                // Ordering barrier: everything before it is already recorded.
+                let _ = ack.send(());
+            }
         }
     }
 }
@@ -837,6 +841,36 @@ async fn pi_exit_fails_the_running_turn() {
     match result {
         Err(AcpxError::PiExited { code, .. }) => assert_eq!(code, Some(42)),
         other => panic!("expected PiExited, got {other:?}"),
+    }
+}
+
+/// After pi dies, **later** prompts on the same session also fail loudly with
+/// `PiExited` (code/signal + hint), never a silent empty end_turn and never a
+/// generic "session closed" that hides what happened (S8 / fixes #82).
+#[tokio::test]
+async fn dead_session_reports_pi_exit_on_subsequent_prompts() {
+    let fx = fixture(&["--mock-exit-after", "2"]).await;
+    write_scenario(&fx.scenarios, 1, &[json!({"type":"turn_start"})]);
+
+    // First prompt dies mid-flight (command 2 = the prompt).
+    match prompt_turn(&fx, "hello").await {
+        Err(AcpxError::PiExited { code, .. }) => assert_eq!(code, Some(42)),
+        other => panic!("expected PiExited, got {other:?}"),
+    }
+
+    // The pump has torn down; the session remembers the exit and surfaces it.
+    match prompt_turn(&fx, "again").await {
+        Err(AcpxError::PiExited { code, signal }) => {
+            assert_eq!(code, Some(42), "exit code must survive the teardown");
+            assert_eq!(signal, None);
+        }
+        other => panic!("expected PiExited on subsequent prompt, got {other:?}"),
+    }
+
+    // Non-prompt commands fail the same loud way.
+    match fx.session.get_state().await {
+        Err(AcpxError::PiExited { code, .. }) => assert_eq!(code, Some(42)),
+        other => panic!("expected PiExited from get_state, got {other:?}"),
     }
 }
 

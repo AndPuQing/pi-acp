@@ -113,6 +113,10 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-event-delay-ms <n>` sleep `n` ms before each scenario event
 /// - `--mock-command-log <path>`  append each received command type
 /// - `--mock-extension-log <path>` append each received `extension_ui_response`
+/// - `--mock-prompt-error <text>`   answer `prompt` with `success:false` and this
+///   error text (auth/error-surfacing tests)
+/// - `--mock-models-error <text>`   answer `get_available_models` with
+///   `success:false` and this error text (authRequired-on-new tests)
 ///
 /// Default: respond `success: true` to every command (with a fixed `get_state`
 /// payload), and after a `prompt` command emit a `text_delta` message_update
@@ -134,6 +138,8 @@ async fn run_mock_rpc() -> Result<()> {
     let mut event_delay_ms: u64 = 0;
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
+    let mut prompt_error: Option<String> = None;
+    let mut models_error: Option<String> = None;
     let mut prompt_count: usize = 0;
     // Stateful mock: real pi keeps these across RPC calls, and the agent's
     // config-option / slash-command handlers read them back via get_state.
@@ -160,6 +166,8 @@ async fn run_mock_rpc() -> Result<()> {
             }
             "--mock-command-log" => command_log = args.next().map(PathBuf::from),
             "--mock-extension-log" => extension_log = args.next().map(PathBuf::from),
+            "--mock-prompt-error" => prompt_error = args.next(),
+            "--mock-models-error" => models_error = args.next(),
             _ => {}
         }
     }
@@ -168,6 +176,17 @@ async fn run_mock_rpc() -> Result<()> {
     }
     if command_log.is_none() {
         command_log = std::env::var_os("PI_ACP_MOCK_COMMAND_LOG").map(PathBuf::from);
+    }
+    if prompt_error.is_none() {
+        prompt_error = std::env::var("PI_ACP_MOCK_PROMPT_ERROR").ok();
+    }
+    if models_error.is_none() {
+        models_error = std::env::var("PI_ACP_MOCK_MODELS_ERROR").ok();
+    }
+    if exit_after.is_none() {
+        exit_after = std::env::var("PI_ACP_MOCK_EXIT_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok());
     }
 
     let mut stdout = tokio::io::stdout();
@@ -342,7 +361,17 @@ async fn run_mock_rpc() -> Result<()> {
             "command": ty,
             "success": true,
         });
-        if !data.is_null() {
+        // Error injection: `success:false` responses with the configured text
+        // (auth / error-surfacing tests).
+        let (success, error) = match ty {
+            "prompt" => (prompt_error.is_none(), prompt_error.clone()),
+            "get_available_models" => (models_error.is_none(), models_error.clone()),
+            _ => (true, None),
+        };
+        response["success"] = serde_json::Value::Bool(success);
+        if let Some(e) = error {
+            response["error"] = serde_json::Value::String(e);
+        } else if !data.is_null() {
             response["data"] = data;
         }
         mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
@@ -351,7 +380,7 @@ async fn run_mock_rpc() -> Result<()> {
         // Mirror pi: `setSessionName` emits `session_info_changed` on the event
         // stream (pi-agent-core `AgentSessionEvent`), which the adapter
         // forwards as ACP `session_info_update` (live thread title, #102/#24).
-        if ty == "set_session_name" {
+        if success && ty == "set_session_name" {
             let event =
                 serde_json::json!({ "type": "session_info_changed", "name": mock_session_name });
             mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
@@ -359,7 +388,7 @@ async fn run_mock_rpc() -> Result<()> {
 
         // Mirror pi: the prompt response arrives early; the streaming events
         // and the real turn-completion signal (`agent_settled`) follow after.
-        if ty == "prompt" {
+        if success && ty == "prompt" {
             prompt_count += 1;
             if let Some(dir) = &scenario_dir {
                 let scenario = dir.join(format!("{prompt_count}.jsonl"));
@@ -380,7 +409,7 @@ async fn run_mock_rpc() -> Result<()> {
             } else if !no_settle {
                 emit_default_prompt_response(&mut stdout).await?;
             }
-        } else if ty == "abort" {
+        } else if success && ty == "abort" {
             // pi settles once an aborted turn unwinds.
             mock_write_line(&mut stdout, b"{\"type\":\"agent_settled\"}").await?;
         }

@@ -63,9 +63,11 @@ async fn typed_wrappers_parse_payloads() {
     assert_eq!(state.session_id, "mock-session-id");
 
     let models = pi.get_available_models().await.unwrap();
-    assert_eq!(models.len(), 1);
+    assert_eq!(models.len(), 2);
     assert_eq!(models[0].id, "mock-model");
     assert_eq!(models[0].provider, "mock");
+    assert_eq!(models[1].id, "mock-fast");
+    assert_eq!(models[1].context_window, Some(8000));
 
     let path = pi.export_html(None).await.unwrap();
     assert_eq!(path, "/tmp/mock.html");

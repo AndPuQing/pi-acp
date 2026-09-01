@@ -16,7 +16,10 @@ rust-version = "1.85"
 # there is a single schema copy in the dependency tree (type identity matters
 # between the re-exported `agent_client_protocol::schema` and a direct dep).
 agent-client-protocol = "2.0.0"
-agent-client-protocol-schema = "=1.5.0"
+# Same pinned schema version as the SDK (single copy in the dep tree, W-449
+# constraint 1); `unstable_auth_methods` unlocks the terminal auth method
+# (AuthMethod::Terminal) the ACP `authMethods` registry shape needs (S6).
+agent-client-protocol-schema = { version = "=1.5.0", features = ["unstable_auth_methods"] }
 # --- async runtime (S2 spike validated + locked tokio, W-449 / decision D9) ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync"] }
 # --- serialization ---

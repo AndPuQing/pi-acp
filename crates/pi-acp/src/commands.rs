@@ -1,15 +1,21 @@
-//! Slash commands — file-based (user/project `.md`) loading and expansion.
+//! Slash commands — file-based (user/project `.md`) loading and expansion,
+//! built-in commands, and skill commands (S6, W-453).
 //!
-//! Ports `acp/slash-commands.ts`: frontmatter parsing, `$1`/`$@` argument
-//! substitution, and the user/project `prompts/**/*.md` scan. S6 (W-453) adds
-//! the built-in commands (`/compact` `/autocompact` ...) and skill commands on
-//! top of this layer.
+//! Ports `acp/slash-commands.ts` (frontmatter parsing, `$1`/`$@` argument
+//! substitution, the user/project `prompts/**/*.md` scan) plus the built-in
+//! command list and the pi `get_commands` conversion (`acp/pi-commands.ts`).
+//! The built-in command *handlers* (`/compact` `/session` ...) live in
+//! `agent.rs` (they need the pi RPC + outbound channel); this module owns the
+//! pure building blocks.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use agent_client_protocol::schema::v1::AvailableCommand;
+use agent_client_protocol::schema::v1::{
+    AvailableCommand, AvailableCommandInput, UnstructuredCommandInput,
+};
+use serde_json::Value;
 
 use crate::settings::agent_dir;
 
@@ -188,6 +194,137 @@ pub fn to_available_commands(file_commands: &[FileSlashCommand]) -> Vec<Availabl
     out
 }
 
+/// The built-in slash commands pi-acp implements itself (headless-friendly
+/// subset). Mirrors TS `builtinAvailableCommands` in `acp/agent.ts`.
+pub fn builtin_available_commands() -> Vec<AvailableCommand> {
+    vec![
+        AvailableCommand::new("compact", "Manually compact the session context")
+            .input(AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "optional custom instructions",
+            ))),
+        AvailableCommand::new("autocompact", "Toggle automatic context compaction")
+            .input(AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "on|off|toggle",
+            ))),
+        AvailableCommand::new(
+            "export",
+            "Export session to an HTML file in the session cwd",
+        ),
+        AvailableCommand::new(
+            "session",
+            "Show session stats (messages, tokens, cost, session file)",
+        ),
+        AvailableCommand::new("name", "Set session display name")
+            .input(AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "<name>",
+            ))),
+        AvailableCommand::new(
+            "steering",
+            "Get/set pi steering message delivery mode (how queued steering messages are delivered)",
+        )
+        .input(AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+            "(no args to show) all | one-at-a-time",
+        ))),
+        AvailableCommand::new(
+            "follow-up",
+            "Get/set pi follow-up message delivery mode (how queued follow-up messages are delivered)",
+        )
+        .input(AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+            "(no args to show) all | one-at-a-time",
+        ))),
+        AvailableCommand::new("changelog", "Show pi changelog"),
+    ]
+}
+
+/// Merge two command lists preserving order and de-duping by name (first wins).
+/// Mirrors TS `mergeCommands` in `acp/agent.ts`.
+pub fn merge_commands(a: &[AvailableCommand], b: &[AvailableCommand]) -> Vec<AvailableCommand> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for c in a.iter().chain(b) {
+        if !seen.insert(c.name.as_str()) {
+            continue;
+        }
+        out.push(c.clone());
+    }
+    out
+}
+
+/// Description fallback for pi `get_commands` entries without one: `(source)`
+/// or `(source:location)` — mirrors TS `describeFallback`.
+fn describe_fallback(source: &str, location: &str) -> String {
+    let mut parts = Vec::new();
+    if !source.is_empty() {
+        parts.push(source);
+    }
+    if !location.is_empty() {
+        parts.push(location);
+    }
+    if parts.is_empty() {
+        "(command)".to_string()
+    } else {
+        format!("({})", parts.join(":"))
+    }
+}
+
+/// Convert pi's `get_commands` payload into ACP `AvailableCommand`s.
+///
+/// Mirrors TS `toAvailableCommandsFromPiGetCommands` (`acp/pi-commands.ts`):
+/// - reads `commands` at the top level or under `data`;
+/// - skips `extension`-sourced commands unless `include_extension_commands`;
+/// - skips `skill:`-prefixed names when skill commands are disabled;
+/// - falls back to a `(source[:location])` description.
+pub fn to_available_commands_from_pi_get_commands(
+    data: &Value,
+    enable_skill_commands: bool,
+    include_extension_commands: bool,
+) -> Vec<AvailableCommand> {
+    let commands_raw: Vec<&Value> = data
+        .get("commands")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            data.get("data")
+                .and_then(|d| d.get("commands"))
+                .and_then(Value::as_array)
+        })
+        .map(|a| a.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for c in commands_raw {
+        let name = c
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let source = c.get("source").and_then(Value::as_str).unwrap_or("");
+        if !include_extension_commands && source == "extension" {
+            continue;
+        }
+        if !enable_skill_commands && name.starts_with("skill:") {
+            continue;
+        }
+        let desc = c
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let description = if desc.is_empty() {
+            describe_fallback(
+                source,
+                c.get("location").and_then(Value::as_str).unwrap_or(""),
+            )
+        } else {
+            desc.to_string()
+        };
+        out.push(AvailableCommand::new(name, description));
+    }
+    out
+}
+
 /// Parse command args bash-style (single/double quotes, whitespace-separated).
 /// Mirrors TS `parseCommandArgs`.
 pub fn parse_command_args(args_string: &str) -> Vec<String> {
@@ -281,6 +418,7 @@ pub fn expand_slash_command(text: &str, file_commands: &[FileSlashCommand]) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
 
@@ -531,5 +669,89 @@ mod tests {
         assert_eq!(available[0].name, "same");
         assert_eq!(available[0].description, "first");
         assert_eq!(available[1].name, "other");
+    }
+
+    // --- builtins / merge / pi get_commands (S6, W-453) ---
+
+    #[test]
+    fn builtin_commands_cover_the_six_headless_commands() {
+        let builtins = builtin_available_commands();
+        let names: Vec<&str> = builtins.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "compact",
+                "autocompact",
+                "export",
+                "session",
+                "name",
+                "steering",
+                "follow-up",
+                "changelog"
+            ]
+        );
+        // input hints where the TS reference provides them
+        let compact = builtins.iter().find(|c| c.name == "compact").unwrap();
+        assert!(matches!(
+            compact.input,
+            Some(AvailableCommandInput::Unstructured(_))
+        ));
+        let export = builtins.iter().find(|c| c.name == "export").unwrap();
+        assert!(export.input.is_none());
+    }
+
+    #[test]
+    fn merge_commands_preserves_order_and_dedupes_first_wins() {
+        let a = vec![
+            AvailableCommand::new("one", "1"),
+            AvailableCommand::new("two", "2"),
+        ];
+        let b = vec![
+            AvailableCommand::new("two", "2b"),
+            AvailableCommand::new("three", "3"),
+        ];
+        let merged = merge_commands(&a, &b);
+        let names: Vec<&str> = merged.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["one", "two", "three"]);
+        // first wins: "two" keeps description "2"
+        assert_eq!(merged[1].description, "2");
+    }
+
+    #[test]
+    fn pi_get_commands_conversion_filters_and_falls_back() {
+        let data = json!({
+            "commands": [
+                {"name": "review", "description": "Review code", "source": "prompt"},
+                {"name": "skill:deploy", "description": "Deploy it", "source": "skill"},
+                {"name": "ext-tool", "description": "Ext", "source": "extension"},
+                {"name": "bare", "source": "prompt", "location": "/abs/path.md"},
+                {"name": "no-desc", "source": ""},
+                {"name": "", "description": "ignored"}
+            ]
+        });
+
+        let cmds = to_available_commands_from_pi_get_commands(&data, true, false);
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["review", "skill:deploy", "bare", "no-desc"]);
+        assert_eq!(cmds[2].description, "(prompt:/abs/path.md)");
+        assert_eq!(cmds[3].description, "(command)");
+
+        // skill commands disabled -> skill: entries dropped
+        let cmds = to_available_commands_from_pi_get_commands(&data, false, false);
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["review", "bare", "no-desc"]);
+
+        // extension commands included when asked
+        let cmds = to_available_commands_from_pi_get_commands(&data, true, true);
+        assert!(cmds.iter().any(|c| c.name == "ext-tool"));
+
+        // nested `data.commands` shape
+        let nested = json!({"data": {"commands": [{"name": "n", "source": "prompt"}]}});
+        let cmds = to_available_commands_from_pi_get_commands(&nested, true, false);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name, "n");
+
+        // no commands at all
+        assert!(to_available_commands_from_pi_get_commands(&json!({}), true, false).is_empty());
     }
 }

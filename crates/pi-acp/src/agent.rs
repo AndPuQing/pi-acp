@@ -1,146 +1,1648 @@
-//! ACP `Agent` role implementation (S2 spike).
+//! ACP `Agent` role implementation — full method set (S6, W-453).
 //!
-//! Serves an ACP client over stdio and bridges the three minimal methods to a
-//! real `pi --mode rpc` child process:
+//! Serves an ACP client over stdio and bridges every v1 method to a real
+//! `pi --mode rpc` child process through the [`SessionManager`] + per-session
+//! state machine (S5). Ports `acp/agent.ts` with the design's "thin handler"
+//! rule: handlers delegate to `session` / `translate`; the heavy logic lives
+//! in [`PiAcpSession`] (turn queue, event pump, tool tracking) and the pure
+//! translate layer.
 //!
-//! - `initialize`   — advertise the (empty) agent capabilities.
-//! - `session/new`  — spawn `pi`, learn its session id via `get_state`.
-//! - `session/prompt` — send a `prompt` to pi, stream assistant text deltas back
-//!   as `session/update` notifications, and finish the turn on the
-//!   `agent_settled` event (not the early `prompt` response).
+//! Methods:
+//! - `initialize` — agent info, capabilities (load/list/delete, image prompts,
+//!   embedded context), terminal auth methods.
+//! - `session/new` — spawn pi, fetch state + models, configOptions (model +
+//!   thought_level selects) + modes, startup info prelude, `closeAllExcept`
+//!   policy, `available_commands_update` after the response.
+//! - `session/prompt` — restore-or-use session, expand file slash commands,
+//!   handle built-in slash commands headlessly, else run the turn through the
+//!   session queue. The handler **spawns** the turn and responds from the task
+//!   so the SDK dispatch loop stays free for `session/cancel` (the SDK's
+//!   dispatch loop blocks while a handler runs).
+//! - `session/cancel` — notification → session cancel.
+//! - `session/load` — restore a stored session (pi `--session`), replay
+//!   history, configOptions + modes, `available_commands_update`.
+//! - `session/list` / `session/delete` — pi session-file scanning, cwd filter,
+//!   cursor pagination, idempotent delete.
+//! - `session/set_mode` / `session/set_config_option` — thinking level / model,
+//!   `current_mode_update` + `config_option_update`.
+//! - `unstable/set_session_model` (`session/set_model` wire name) — handled via
+//!   an untyped dispatch fallback: the pinned ACP schema (1.5.0) has no typed
+//!   variant for this unstable method, so the SDK's `_`-prefixed extension
+//!   fallback does not cover it either. The last handler in the chain claims
+//!   the raw JSON-RPC request and delegates to the same model-set path.
+//! - `authenticate` — no-op (terminal auth runs out-of-band).
 //!
-//! This is the **runtime spike**: it proves the official ACP SDK's `Stdio`
-//! transport (which internally uses `blocking`/`async-io`) is driven correctly
-//! under a `tokio` multi-thread runtime, and that a real pi text round-trip
-//! flows through both bridges (design D9 / §5.3). S6 replaces this minimal
-//! wiring with the full method set and moves the logic into `session` +
-//! `translate`.
+//! ACP `usage_update` notifications (decision 3 / #106) are emitted by the
+//! session pump from pi's `message_update.usage` (see [`PiAcpSession`]).
 
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, Implementation, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, AvailableCommandsUpdate,
+    CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate,
+    DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, ResourceLink, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionId,
+    SessionInfo, SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
-use agent_client_protocol::{on_receive_request, Agent, Result, Stdio};
+use agent_client_protocol::{
+    on_receive_dispatch, on_receive_notification, on_receive_request, Agent, ConnectionTo,
+    Dispatch, Error as AcpError, Handled, Stdio, UntypedMessage,
+};
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use crate::auth::{get_auth_methods, maybe_auth_required_error};
+use crate::commands::{self, FileSlashCommand};
 use crate::config::Config;
-use crate::pi::process::{text_delta_of, PiProcess};
+use crate::error::{AcpxError, Result};
+use crate::pi::rpc::{ImageContent, Model, QueueMode, RpcSessionState, ThinkingLevel};
+use crate::pi::sessions::{find_pi_session, list_pi_sessions};
+use crate::session::{
+    spawn_outbound_connector, PiAcpSession, SessionManager, SessionParams,
+    StopReason as SessionStopReason,
+};
+use crate::session_store::SessionStore;
+use crate::settings::{get_enable_skill_commands, get_quiet_startup};
+use crate::startup::{build_startup_info, build_update_notice, fetch_pi_version};
+use crate::time::utc_now_iso8601;
+use crate::translate::bash::{
+    bash_exit_code, bash_terminal_content, bash_terminal_exit_meta, bash_terminal_info_meta,
+    bash_terminal_output_meta,
+};
+use crate::translate::messages::{replay_message, ReplayMessage};
+use crate::translate::prompt::prompt_to_pi_message;
+use crate::translate::tools::{to_tool_kind, tool_result_to_text};
 
-/// ACP `invalidParams` JSON-RPC code, used for an unknown session id.
+/// `configOptions` id for the model selector.
+const MODEL_CONFIG_ID: &str = "model";
+/// `configOptions` id for the thought-level selector.
+const THOUGHT_LEVEL_CONFIG_ID: &str = "thought_level";
+
+/// ACP `invalidParams` JSON-RPC code.
 const ACP_INVALID_PARAMS: i32 = -32602;
+/// ACP `authRequired` JSON-RPC code (reserved range).
+const ACP_AUTH_REQUIRED: i32 = -32000;
 
-/// Session state shared across the per-method handlers.
-type Sessions = Arc<Mutex<HashMap<SessionId, PiProcess>>>;
+/// The unstable `session/set_model` wire method (Zed's `unstable_setSessionModel`).
+const SESSION_SET_MODEL_METHOD: &str = "session/set_model";
 
-/// Run the ACP agent over stdio until the client disconnects (stdin EOF).
-///
-/// This future is meant to be driven by a `tokio` runtime (see `main.rs`); the
-/// spike validates exactly that this works with the SDK's `Stdio` transport.
-pub async fn run() -> Result<()> {
-    let cfg = Config::from_env();
-    let timeout = Duration::from_secs(cfg.rpc_timeout_secs);
-    let pi_command = cfg.pi_command.clone();
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    // Each `async move` handler captures the map by move; give the two that
-    // need it their own clones (the Arc is not Copy).
-    let sessions_new = sessions.clone();
-    let sessions_prompt = sessions.clone();
+/// `ConnectionTo<Client>` alias for handlers (the Agent role's counterpart).
+type Client = agent_client_protocol::Client;
 
-    Agent
-        .builder()
-        .name("pi-acp")
-        .on_receive_request(
-            async move |_req: InitializeRequest, responder, _cx| {
-                tracing::info!("ACP initialize");
-                let resp = InitializeResponse::new(_req.protocol_version)
-                    .agent_capabilities(AgentCapabilities::new())
-                    .agent_info(Implementation::new("pi-acp", env!("CARGO_PKG_VERSION")));
-                responder.respond(resp)
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |req: NewSessionRequest, responder, _cx| {
-                tracing::info!(cwd = %req.cwd.display(), "ACP session/new");
-                let mut pi = PiProcess::spawn(&pi_command, timeout).await?;
-                let state = pi.get_state().await?;
-                tracing::info!(session_id = %state.session_id, "pi session ready");
-                let session_id: SessionId = state.session_id.into();
-                sessions_new.lock().await.insert(session_id.clone(), pi);
-                responder.respond(NewSessionResponse::new(session_id))
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |req: PromptRequest, responder, cx| {
-                let text = prompt_text(&req);
-                tracing::info!(
-                    session = %req.session_id,
-                    chars = text.len(),
-                    "ACP session/prompt"
-                );
+/// ACP `internalError` JSON-RPC code.
+const ACP_INTERNAL_ERROR: i32 = -32603;
 
-                // Take the pi handle out so its guard lifetime stays local to
-                // the critical section; re-insert it after the pump.
-                let pi = {
-                    let mut sessions = sessions_prompt.lock().await;
-                    sessions.remove(&req.session_id)
-                };
-                let mut pi = match pi {
-                    Some(pi) => pi,
-                    None => {
-                        return responder.respond_with_error(agent_client_protocol::Error::new(
-                            ACP_INVALID_PARAMS,
-                            format!("unknown session: {}", req.session_id),
-                        ));
-                    }
-                };
+/// `session/list` page size (mirrors the TS reference).
+const LIST_PAGE_SIZE: usize = 50;
 
-                // Stream assistant text deltas to the client as session/update
-                // notifications while pumping pi events until `agent_settled`.
-                let sid_for_stream = req.session_id.clone();
-                let sid_for_reinsert = req.session_id.clone();
-                let pump = pi.prompt_until_settled(&text, move |event| {
-                    if let Some(delta) = text_delta_of(event) {
-                        let notif = SessionNotification::new(
-                            sid_for_stream.clone(),
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                ContentBlock::Text(TextContent::new(delta.to_string())),
-                            )),
-                        );
-                        let _ = cx.send_notification(notif);
-                    }
-                });
-                let result = pump.await;
-
-                {
-                    let mut sessions = sessions_prompt.lock().await;
-                    sessions.insert(sid_for_reinsert, pi);
-                }
-
-                result?;
-                tracing::info!("prompt turn settled");
-                responder.respond(PromptResponse::new(StopReason::EndTurn))
-            },
-            on_receive_request!(),
-        )
-        .connect_to(Stdio::new())
-        .await
+/// A model advertised to the client (`provider/id` + `provider/name` labels).
+#[derive(Debug, Clone)]
+struct AdvertisedModel {
+    model_id: String,
+    name: String,
 }
 
-/// Concatenate the text blocks of an ACP prompt (the spike only needs text; S4
-/// adds images / resource blocks).
-fn prompt_text(req: &PromptRequest) -> String {
-    req.prompt
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(t) => Some(t.text.clone()),
-            _ => None,
+/// Model state for a session (available models + the active one).
+#[derive(Debug, Clone)]
+struct ModelState {
+    available_models: Vec<AdvertisedModel>,
+    current_model_id: String,
+}
+
+/// Thought-level mode state (the fixed `off..xhigh` ladder).
+#[derive(Debug, Clone)]
+struct ModeState {
+    current_mode_id: String,
+    available_modes: Vec<SessionMode>,
+}
+
+/// The per-connection agent: shared state behind every handler.
+pub struct AcpAgent {
+    cfg: Config,
+    sessions: SessionManager,
+    store: SessionStore,
+    /// Most recent session cwd, used as the default `session/list` filter
+    /// (TS parity: Zed sends `{}` and expects the project-scoped picker).
+    last_session_cwd: Mutex<Option<PathBuf>>,
+}
+
+impl AcpAgent {
+    pub fn new(cfg: Config) -> Self {
+        Self {
+            cfg,
+            sessions: SessionManager::new(),
+            store: SessionStore::new(),
+            last_session_cwd: Mutex::new(None),
+        }
+    }
+
+    /// Run the ACP agent over stdio until the client disconnects; dispose all
+    /// sessions on the way out.
+    pub async fn run(self: &Arc<Self>) -> Result<()> {
+        let agent = self.clone();
+        let a_init = agent.clone();
+        let a_new = agent.clone();
+        let a_prompt = agent.clone();
+        let a_cancel = agent.clone();
+        let a_load = agent.clone();
+        let a_list = agent.clone();
+        let a_delete = agent.clone();
+        let a_set_mode = agent.clone();
+        let a_set_config = agent.clone();
+        let a_set_model = agent.clone();
+
+        let result = Agent
+            .builder()
+            .name("pi-acp")
+            .on_receive_request(
+                async move |req: InitializeRequest, responder, _cx| {
+                    let resp = a_init.handle_initialize(&req);
+                    responder.respond(resp)
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: NewSessionRequest, responder, cx| {
+                    let agent = a_new.clone();
+                    let result = agent.handle_new_session(&req, &cx).await;
+                    match result {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest, responder, cx| {
+                    // Spawn the turn: the SDK dispatch loop blocks while a
+                    // handler runs, and `session/cancel` must stay processable
+                    // during a long turn. The responder travels into the task
+                    // and answers when the turn settles.
+                    let agent = a_prompt.clone();
+                    let cx_for_task = cx.clone();
+                    cx.spawn(async move {
+                        let result = agent.handle_prompt(&req, &cx_for_task).await;
+                        match result {
+                            Ok(resp) => responder.respond(resp),
+                            Err(e) => responder.respond_with_error(e),
+                        }
+                    })?;
+                    Ok(())
+                },
+                on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |notif: CancelNotification, _cx| {
+                    a_cancel.handle_cancel(&notif).await;
+                    Ok(())
+                },
+                on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |req: LoadSessionRequest, responder, cx| {
+                    let agent = a_load.clone();
+                    let result = agent.handle_load_session(&req, &cx).await;
+                    match result {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ListSessionsRequest, responder, _cx| {
+                    let agent = a_list.clone();
+                    let result = agent.handle_list_sessions(&req).await;
+                    match result {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: DeleteSessionRequest, responder, _cx| {
+                    let agent = a_delete.clone();
+                    let result = agent.handle_delete_session(&req).await;
+                    match result {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SetSessionModeRequest, responder, cx| {
+                    let agent = a_set_mode.clone();
+                    let result = agent.handle_set_mode(&req, &cx).await;
+                    match result {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SetSessionConfigOptionRequest, responder, cx| {
+                    let agent = a_set_config.clone();
+                    let result = agent.handle_set_config_option(&req, &cx).await;
+                    match result {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: AuthenticateRequest, responder, _cx| {
+                    tracing::info!(method_id = %req.method_id, "ACP authenticate (no-op; terminal auth runs out-of-band)");
+                    responder.respond(AuthenticateResponse::new())
+                },
+                on_receive_request!(),
+            )
+            // LAST handler: the unstable `session/set_model` method, which the
+            // pinned schema cannot type. Claims only that method; everything
+            // else passes through untouched.
+            .on_receive_dispatch(
+                async move |dispatch: Dispatch<UntypedMessage, UntypedMessage>, cx| {
+                    let Dispatch::Request(message, responder) = dispatch else {
+                        return Ok(Handled::No {
+                            message: dispatch,
+                            retry: false,
+                        });
+                    };
+                    if message.method != SESSION_SET_MODEL_METHOD {
+                        return Ok(Handled::No {
+                            message: Dispatch::Request(message, responder),
+                            retry: false,
+                        });
+                    }
+                    let agent = a_set_model.clone();
+                    let cx_for_task = cx.clone();
+                    cx.spawn(async move {
+                        let result = agent.handle_set_session_model(&message.params, &cx_for_task).await;
+                        match result {
+                            Ok(()) => responder.respond(json!({})),
+                            Err(e) => responder.respond_with_error(e),
+                        }
+                    })?;
+                    Ok(Handled::Yes)
+                },
+                on_receive_dispatch!(),
+            )
+            .connect_to(Stdio::new())
+            .await
+            .map_err(|e| AcpxError::RpcFailed {
+                command: "acp-stdio".into(),
+                message: e.to_string(),
+            });
+
+        self.sessions.dispose_all().await;
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize
+    // -----------------------------------------------------------------------
+
+    fn handle_initialize(&self, req: &InitializeRequest) -> InitializeResponse {
+        tracing::info!(protocol_version = ?req.protocol_version, "ACP initialize");
+        // We currently only support ACP protocol version 1.
+        let protocol_version = agent_client_protocol::schema::ProtocolVersion::V1;
+
+        let supports_terminal_auth_meta = req
+            .client_capabilities
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("terminal-auth"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let capabilities = AgentCapabilities::new()
+            .load_session(true)
+            .mcp_capabilities(McpCapabilities::new().http(false).sse(false))
+            .prompt_capabilities(
+                PromptCapabilities::new()
+                    .image(true)
+                    .audio(false)
+                    .embedded_context(self.cfg.enable_embedded_context),
+            )
+            .session_capabilities(
+                SessionCapabilities::new()
+                    .list(agent_client_protocol::schema::v1::SessionListCapabilities::new())
+                    .delete(agent_client_protocol::schema::v1::SessionDeleteCapabilities::new()),
+            );
+
+        InitializeResponse::new(protocol_version)
+            .agent_capabilities(capabilities)
+            .agent_info(
+                Implementation::new("pi-acp", env!("CARGO_PKG_VERSION")).title("pi ACP adapter"),
+            )
+            .auth_methods(get_auth_methods(supports_terminal_auth_meta))
+    }
+
+    // -----------------------------------------------------------------------
+    // session/new
+    // -----------------------------------------------------------------------
+
+    async fn handle_new_session(
+        &self,
+        req: &NewSessionRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<NewSessionResponse, AcpError> {
+        if !req.cwd.is_absolute() {
+            return Err(invalid_params(&format!(
+                "cwd must be an absolute path: {}",
+                req.cwd.display()
+            )));
+        }
+        *self.last_session_cwd.lock().await = Some(req.cwd.clone());
+
+        let file_commands = commands::load_slash_commands(&req.cwd);
+        let enable_skill_commands = get_enable_skill_commands(&req.cwd);
+
+        let session = self
+            .spawn_session(Some(&req.cwd), None, None, cx, file_commands.clone())
+            .await?;
+        let session_id = session.session_id().clone();
+
+        // Fetch state + models once (parallel) to reduce startup latency.
+        let (state_res, models_res) =
+            tokio::join!(session.get_state(), session.get_available_models());
+        let state = state_res.as_ref().ok().cloned();
+        let available_models = models_res.as_ref().ok().cloned();
+
+        // Auth checks (parity with TS): a model-list failure that smells like
+        // missing credentials, or zero models, both mean "authenticate first".
+        if let Some(err) = models_res.as_ref().err() {
+            if maybe_auth_required_error(&err.to_string()).is_some() {
+                self.cleanup_failed_new_session(&session, state.as_ref())
+                    .await;
+                return Err(auth_required());
+            }
+            self.cleanup_failed_new_session(&session, state.as_ref())
+                .await;
+            return Err(AcpError::new(ACP_INTERNAL_ERROR, err.to_string()));
+        }
+        let raw_models_count = available_models.as_ref().map(Vec::len).unwrap_or(0);
+        if raw_models_count == 0 {
+            self.cleanup_failed_new_session(&session, state.as_ref())
+                .await;
+            return Err(auth_required());
+        }
+        if let Some(err) = state_res.as_ref().err() {
+            if maybe_auth_required_error(&err.to_string()).is_some() {
+                self.cleanup_failed_new_session(&session, None).await;
+                return Err(auth_required());
+            }
+        }
+
+        let (config_options, _models, modes) =
+            get_session_configuration(&session, state.as_ref(), available_models.as_ref()).await;
+
+        let quiet_startup = get_quiet_startup(&req.cwd);
+        let update_notice = if self.cfg.enable_version_check {
+            build_update_notice(&self.cfg.pi_command).await
+        } else {
+            None
+        };
+        let prelude_text = build_startup_prelude(
+            &req.cwd,
+            &self.cfg.pi_command,
+            quiet_startup,
+            update_notice.as_deref(),
+        )
+        .await;
+
+        // Policy: within a single ACP connection keep only one live pi
+        // subprocess (TS parity — avoids leaking subprocesses when clients
+        // start new sessions without closing old ones).
+        self.sessions.close_all_except(&session_id).await;
+
+        let mut meta = serde_json::Map::new();
+        if !prelude_text.is_empty() {
+            meta.insert("piAcp".to_string(), json!({ "startupInfo": prelude_text }));
+        }
+
+        let response = NewSessionResponse::new(session_id.clone())
+            .modes(mode_state_to_acp(&modes))
+            .config_options(config_options.clone())
+            .meta(meta);
+
+        // Send the startup info immediately after the response so it surfaces
+        // even before the first prompt (design D4 / #70 ordering).
+        if !prelude_text.is_empty() {
+            let _ = send_text_chunk(cx, &session_id, &prelude_text).await;
+        }
+
+        // Advertise slash commands after the response (clients ignore
+        // notifications for unknown session ids).
+        advertise_commands(cx, &session, enable_skill_commands, &file_commands).await;
+
+        tracing::info!(session = %session_id, "session/new complete");
+        Ok(response)
+    }
+
+    /// Close a failed `session/new`: dispose the session, remove its session
+    /// file (when known) and store entry (TS `cleanupFailedNewSession`).
+    async fn cleanup_failed_new_session(
+        &self,
+        session: &Arc<PiAcpSession>,
+        state: Option<&RpcSessionState>,
+    ) {
+        let session_id = session.session_id().clone();
+        self.sessions.close(&session_id).await;
+
+        let session_file = state
+            .and_then(|s| s.session_file.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| self.store.get(&session_id.0).map(|e| e.session_file));
+
+        if let Some(file) = session_file {
+            let _ = std::fs::remove_file(file);
+        }
+        self.store.delete(&session_id.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // session/prompt
+    // -----------------------------------------------------------------------
+
+    async fn handle_prompt(
+        &self,
+        req: &PromptRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<PromptResponse, AcpError> {
+        let session = self.restore_session(&req.session_id, None, cx).await?;
+        let session_id = session.session_id().clone();
+
+        let pi_prompt = prompt_to_pi_message(&req.prompt);
+
+        // Built-in ACP slash command handling (headless-friendly subset).
+        // File-based slash commands are expanded inside session.prompt().
+        if pi_prompt.images.is_empty() && pi_prompt.message.trim_start().starts_with('/') {
+            if let Some(resp) = self
+                .handle_builtin_command(cx, &session, &session_id, &pi_prompt.message)
+                .await?
+            {
+                return Ok(resp);
+            }
+        }
+
+        let reason = session
+            .prompt(pi_prompt.message, to_pi_images(pi_prompt.images))
+            .await
+            .map_err(AcpError::from)?;
+        let stop_reason = acp_stop_reason(reason);
+        tracing::info!(session = %session_id, ?stop_reason, "prompt turn settled");
+        Ok(PromptResponse::new(stop_reason))
+    }
+
+    async fn handle_cancel(&self, notif: &CancelNotification) {
+        tracing::info!(session = %notif.session_id, "ACP session/cancel");
+        let Some(session) = self.sessions.maybe_get(&notif.session_id).await else {
+            return;
+        };
+        let _ = session.cancel().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // session/load
+    // -----------------------------------------------------------------------
+
+    async fn handle_load_session(
+        &self,
+        req: &LoadSessionRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<LoadSessionResponse, AcpError> {
+        if !req.cwd.is_absolute() {
+            return Err(invalid_params(&format!(
+                "cwd must be an absolute path: {}",
+                req.cwd.display()
+            )));
+        }
+
+        // Re-loading an active session: tear down the existing pi subprocess
+        // so we start fresh and re-advertise commands reliably.
+        self.sessions.close(&req.session_id).await;
+
+        *self.last_session_cwd.lock().await = Some(req.cwd.clone());
+
+        let stored = self
+            .find_stored_session(&req.session_id.0)
+            .ok_or_else(|| invalid_params(&format!("Unknown sessionId: {}", req.session_id.0)))?;
+        let (stored_cwd, stored_file) = stored;
+
+        let enable_skill_commands = get_enable_skill_commands(&req.cwd);
+        let file_commands = commands::load_slash_commands(&req.cwd);
+
+        let session = self
+            .restore_session(&req.session_id, Some(&req.cwd), cx)
+            .await?;
+
+        self.sessions.close_all_except(&req.session_id).await;
+        self.store
+            .upsert(&req.session_id.0, &stored_cwd, &stored_file);
+
+        // Replay full conversation history.
+        if let Ok(data) = session.get_messages().await {
+            replay_history(cx, &session, &data).await;
+        }
+
+        let (config_options, _models, modes) =
+            get_session_configuration(&session, None, None).await;
+
+        let response = LoadSessionResponse::new()
+            .modes(mode_state_to_acp(&modes))
+            .config_options(config_options);
+
+        advertise_commands(cx, &session, enable_skill_commands, &file_commands).await;
+
+        tracing::info!(session = %req.session_id, "session/load complete");
+        Ok(response)
+    }
+
+    // -----------------------------------------------------------------------
+    // session/list / session/delete
+    // -----------------------------------------------------------------------
+
+    async fn handle_list_sessions(
+        &self,
+        req: &ListSessionsRequest,
+    ) -> std::result::Result<ListSessionsResponse, AcpError> {
+        let all = list_pi_sessions();
+
+        // ACP: filter by cwd if provided. Zed sends `{}`, so default to the
+        // last session cwd to emulate pi's project-scoped `/resume` picker.
+        let effective_cwd = req.cwd.clone().or_else(|| {
+            self.last_session_cwd
+                .try_lock()
+                .ok()
+                .and_then(|l| l.clone())
+        });
+        let filtered: Vec<_> = match &effective_cwd {
+            Some(cwd) => all
+                .into_iter()
+                .filter(|s| s.cwd == cwd.to_string_lossy())
+                .collect(),
+            None => all,
+        };
+
+        let offset = req
+            .cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let page: Vec<SessionInfo> = filtered
+            .iter()
+            .skip(offset)
+            .take(LIST_PAGE_SIZE)
+            .map(|s| {
+                SessionInfo::new(s.session_id.clone(), PathBuf::from(&s.cwd))
+                    .title(s.title.clone())
+                    .updated_at(s.updated_at.clone())
+            })
+            .collect();
+
+        let next_cursor = if offset + LIST_PAGE_SIZE < filtered.len() {
+            Some((offset + LIST_PAGE_SIZE).to_string())
+        } else {
+            None
+        };
+
+        Ok(ListSessionsResponse::new(page).next_cursor(next_cursor))
+    }
+
+    async fn handle_delete_session(
+        &self,
+        req: &DeleteSessionRequest,
+    ) -> std::result::Result<DeleteSessionResponse, AcpError> {
+        let stored = self.store.get(&req.session_id.0);
+        let pi_session = find_pi_session(&req.session_id.0);
+
+        // Deleting a session that does not exist succeeds idempotently (ACP
+        // `session/delete` semantics).
+        if stored.is_none() && pi_session.is_none() {
+            return Ok(DeleteSessionResponse::new());
+        }
+
+        let session_file = stored
+            .as_ref()
+            .map(|s| s.session_file.clone())
+            .or_else(|| pi_session.as_ref().map(|s| s.session_file.clone()));
+        if let Some(file) = session_file {
+            let _ = std::fs::remove_file(file); // best-effort cleanup
+        }
+        self.sessions.close(&req.session_id).await;
+        self.store.delete(&req.session_id.0);
+        Ok(DeleteSessionResponse::new())
+    }
+
+    // -----------------------------------------------------------------------
+    // session/set_mode / session/set_config_option / session/set_model
+    // -----------------------------------------------------------------------
+
+    async fn handle_set_mode(
+        &self,
+        req: &SetSessionModeRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<SetSessionModeResponse, AcpError> {
+        let session = self.restore_session(&req.session_id, None, cx).await?;
+        let mode = req.mode_id.0.as_ref();
+        let level = parse_thinking_level(mode)
+            .ok_or_else(|| invalid_params(&format!("Unknown modeId: {mode}")))?;
+
+        session
+            .set_thinking_level(level)
+            .await
+            .map_err(AcpError::from)?;
+
+        // Let the client know the current mode changed (keeps the dropdown in sync).
+        send_current_mode_update(cx, &req.session_id, mode).await;
+
+        let _ = emit_config_options_update(cx, &req.session_id, &session).await;
+        Ok(SetSessionModeResponse::new())
+    }
+
+    async fn handle_set_config_option(
+        &self,
+        req: &SetSessionConfigOptionRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<SetSessionConfigOptionResponse, AcpError> {
+        let session = self.restore_session(&req.session_id, None, cx).await?;
+        let config_id = req.config_id.0.as_ref();
+
+        let value = req
+            .value
+            .as_value_id()
+            .map(|v| v.0.as_ref().to_string())
+            .ok_or_else(|| {
+                invalid_params(&format!(
+                    "Expected string value for config option: {config_id}"
+                ))
+            })?;
+
+        match config_id {
+            MODEL_CONFIG_ID => {
+                set_session_model(&session, &value)
+                    .await
+                    .map_err(AcpError::from)?;
+            }
+            THOUGHT_LEVEL_CONFIG_ID => {
+                let level = parse_thinking_level(&value)
+                    .ok_or_else(|| invalid_params(&format!("Unknown thinking level: {value}")))?;
+                session
+                    .set_thinking_level(level)
+                    .await
+                    .map_err(AcpError::from)?;
+                send_current_mode_update(cx, &req.session_id, &value).await;
+            }
+            other => {
+                return Err(invalid_params(&format!("Unknown config option: {other}")));
+            }
+        }
+
+        let config_options = emit_config_options_update(cx, &req.session_id, &session)
+            .await
+            .map_err(AcpError::from)?;
+        Ok(SetSessionConfigOptionResponse::new(config_options))
+    }
+
+    /// Handle the unstable `session/set_model` request (raw params:
+    /// `{ sessionId, modelId }`).
+    async fn handle_set_session_model(
+        &self,
+        params: &Value,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<(), AcpError> {
+        let session_id: SessionId = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| invalid_params("session/set_model missing sessionId"))?
+            .into();
+        let model_id = params
+            .get("modelId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("session/set_model missing modelId"))?;
+
+        let session = self.restore_session(&session_id, None, cx).await?;
+        set_session_model(&session, model_id)
+            .await
+            .map_err(AcpError::from)?;
+        let _ = emit_config_options_update(cx, &session_id, &session).await;
+        tracing::info!(session = %session_id.0, model = model_id, "session/set_model applied");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // session restoration & spawning
+    // -----------------------------------------------------------------------
+
+    /// Locate a session's `{cwd, sessionFile}`: the session map first, then a
+    /// fresh scan of pi's session files (updating the map).
+    fn find_stored_session(&self, session_id: &str) -> Option<(String, String)> {
+        if let Some(stored) = self.store.get(session_id) {
+            return Some((stored.cwd, stored.session_file));
+        }
+        let pi_session = find_pi_session(session_id)?;
+        self.store
+            .upsert(session_id, &pi_session.cwd, &pi_session.session_file);
+        Some((pi_session.cwd, pi_session.session_file))
+    }
+
+    /// Get the live session for `session_id`, restoring it (spawning a pi
+    /// against its session file) when necessary. Mirrors TS `restoreSession`.
+    async fn restore_session(
+        &self,
+        session_id: &SessionId,
+        cwd: Option<&Path>,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<Arc<PiAcpSession>, AcpError> {
+        if let Some(existing) = self.sessions.maybe_get(session_id).await {
+            return Ok(existing);
+        }
+
+        let (stored_cwd, session_file) = self
+            .find_stored_session(&session_id.0)
+            .ok_or_else(|| invalid_params(&format!("Unknown sessionId: {}", session_id.0)))?;
+
+        let effective_cwd = cwd
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(&stored_cwd));
+        let file_commands = commands::load_slash_commands(&effective_cwd);
+
+        let session = self
+            .spawn_session(
+                Some(&effective_cwd),
+                Some(PathBuf::from(&session_file)),
+                Some(session_id.clone()),
+                cx,
+                file_commands,
+            )
+            .await?;
+
+        *self.last_session_cwd.lock().await = Some(effective_cwd.clone());
+        self.store.upsert(
+            &session_id.0,
+            &effective_cwd.to_string_lossy(),
+            &session_file,
+        );
+        Ok(session)
+    }
+
+    /// Spawn a session (new or restored) and register it, wiring its outbound
+    /// channel to the SDK connection.
+    async fn spawn_session(
+        &self,
+        cwd: Option<&Path>,
+        session_path: Option<PathBuf>,
+        session_id_override: Option<SessionId>,
+        cx: &ConnectionTo<Client>,
+        file_commands: Vec<FileSlashCommand>,
+    ) -> std::result::Result<Arc<PiAcpSession>, AcpError> {
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(512);
+        let conn = cx.clone();
+        spawn_outbound_connector(conn, outbound_rx)?;
+
+        let session = PiAcpSession::spawn(SessionParams {
+            pi_command: self.cfg.pi_command.clone(),
+            extra_args: vec![],
+            timeout: std::time::Duration::from_secs(self.cfg.rpc_timeout_secs),
+            cwd: cwd.unwrap_or_else(|| Path::new(".")).to_path_buf(),
+            outbound: outbound_tx,
+            session_path,
+            session_id_override,
+            file_commands,
+        })
+        .await?;
+        self.sessions.insert(session.clone()).await;
+        Ok(session)
+    }
+
+    // -----------------------------------------------------------------------
+    // built-in slash commands (headless subset, TS `agent.ts`)
+    // -----------------------------------------------------------------------
+
+    /// Handle one built-in slash command. Returns `Some(response)` when the
+    /// text names a built-in (the turn is complete); `None` to fall through to
+    /// a real pi turn.
+    async fn handle_builtin_command(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session: &Arc<PiAcpSession>,
+        session_id: &SessionId,
+        message: &str,
+    ) -> std::result::Result<Option<PromptResponse>, AcpError> {
+        let trimmed = message.trim();
+        let space = trimmed.find(' ');
+        let cmd = match space {
+            Some(i) => &trimmed[1..i],
+            None => &trimmed[1..],
+        };
+        let args_string = match space {
+            Some(i) => &trimmed[i + 1..],
+            None => "",
+        };
+        let args = commands::parse_command_args(args_string);
+
+        match cmd {
+            "compact" => {
+                // TS: `args.join(' ').trim() || undefined` — whitespace-only
+                // args mean no custom instructions.
+                let joined = args.join(" ");
+                let custom = if joined.trim().is_empty() {
+                    None
+                } else {
+                    Some(joined.trim().to_string())
+                };
+                let res = session
+                    .compact(custom.as_deref())
+                    .await
+                    .map_err(AcpError::from)?;
+                let tokens_before = res.get("tokensBefore").and_then(Value::as_u64);
+                let summary = res
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+
+                let mut first = "Compaction completed.".to_string();
+                if custom.is_some() {
+                    first.push_str(" (custom instructions applied)");
+                }
+                let mut lines = vec![first];
+                if let Some(tb) = tokens_before {
+                    lines.push(format!("Tokens before: {tb}"));
+                }
+                let mut text = lines.join("\n");
+                if let Some(s) = summary {
+                    text.push_str(&format!("\n\n{s}"));
+                }
+                let _ = send_text_chunk(cx, session_id, &text).await;
+                Ok(Some(PromptResponse::new(StopReason::EndTurn)))
+            }
+            "session" => {
+                let stats = session.get_session_stats().await.map_err(AcpError::from)?;
+                let mut lines: Vec<String> = Vec::new();
+                if let Some(sid) = stats.get("sessionId").and_then(Value::as_str) {
+                    lines.push(format!("Session: {sid}"));
+                }
+                if let Some(sf) = stats.get("sessionFile").and_then(Value::as_str) {
+                    lines.push(format!("Session file: {sf}"));
+                }
+                if let Some(n) = stats.get("totalMessages").and_then(Value::as_u64) {
+                    lines.push(format!("Messages: {n}"));
+                }
+                if let Some(c) = stats.get("cost").and_then(Value::as_f64) {
+                    lines.push(format!("Cost: {c}"));
+                }
+                if let Some(t) = stats.get("tokens") {
+                    let mut parts: Vec<String> = Vec::new();
+                    for (key, label) in [
+                        ("input", "in"),
+                        ("output", "out"),
+                        ("cacheRead", "cache read"),
+                        ("cacheWrite", "cache write"),
+                        ("total", "total"),
+                    ] {
+                        if let Some(v) = t.get(key).and_then(Value::as_u64) {
+                            parts.push(format!("{label} {v}"));
+                        }
+                    }
+                    if !parts.is_empty() {
+                        lines.push(format!("Tokens: {}", parts.join(", ")));
+                    }
+                }
+                let text = if lines.is_empty() {
+                    format!(
+                        "Session stats:\n{}",
+                        serde_json::to_string_pretty(&stats).unwrap_or_else(|_| "{}".to_string())
+                    )
+                } else {
+                    lines.join("\n")
+                };
+                let _ = send_text_chunk(cx, session_id, &text).await;
+                Ok(Some(PromptResponse::new(StopReason::EndTurn)))
+            }
+            "name" => {
+                let name = args.join(" ").trim().to_string();
+                if name.is_empty() {
+                    let _ = send_text_chunk(cx, session_id, "Usage: /name <name>").await;
+                    return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
+                }
+                match session.set_session_name(&name).await {
+                    Ok(()) => {
+                        let update = SessionInfoUpdate::new()
+                            .title(name.clone())
+                            .updated_at(utc_now_iso8601());
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::SessionInfoUpdate(update),
+                        ));
+                        let _ =
+                            send_text_chunk(cx, session_id, &format!("Session name set: {name}"))
+                                .await;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let hint = if msg.contains("set_session_name") {
+                            " This requires a newer pi version that supports `set_session_name` in RPC mode."
+                        } else {
+                            ""
+                        };
+                        let _ = send_text_chunk(
+                            cx,
+                            session_id,
+                            &format!("Failed to set session name: {msg}{hint}"),
+                        )
+                        .await;
+                    }
+                }
+                Ok(Some(PromptResponse::new(StopReason::EndTurn)))
+            }
+            "steering" | "follow-up" => {
+                let state = session.get_state().await.map_err(AcpError::from)?;
+                let (current, mode_name, action) = if cmd == "steering" {
+                    (
+                        queue_mode_str(state.steering_mode).to_string(),
+                        "Steering",
+                        "steering",
+                    )
+                } else {
+                    (
+                        queue_mode_str(state.follow_up_mode).to_string(),
+                        "Follow-up",
+                        "follow-up",
+                    )
+                };
+                let mode_raw = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
+                if mode_raw.is_empty() {
+                    let _ = send_text_chunk(
+                        cx,
+                        session_id,
+                        &format!(
+                            "{mode_name} mode: {}",
+                            if current.is_empty() {
+                                "unknown"
+                            } else {
+                                &current
+                            }
+                        ),
+                    )
+                    .await;
+                    return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
+                }
+                if mode_raw != "all" && mode_raw != "one-at-a-time" {
+                    let _ = send_text_chunk(
+                        cx,
+                        session_id,
+                        &format!("Usage: /{action} all | /{action} one-at-a-time"),
+                    )
+                    .await;
+                    return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
+                }
+                let queue_mode = if mode_raw == "all" {
+                    QueueMode::All
+                } else {
+                    QueueMode::OneAtATime
+                };
+                if cmd == "steering" {
+                    session
+                        .set_steering_mode(queue_mode)
+                        .await
+                        .map_err(AcpError::from)?;
+                } else {
+                    session
+                        .set_follow_up_mode(queue_mode)
+                        .await
+                        .map_err(AcpError::from)?;
+                }
+                let _ = send_text_chunk(
+                    cx,
+                    session_id,
+                    &format!("{mode_name} mode set to: {mode_raw}"),
+                )
+                .await;
+                Ok(Some(PromptResponse::new(StopReason::EndTurn)))
+            }
+            "changelog" => {
+                let text = match find_changelog().await {
+                    Some(path) => match std::fs::read_to_string(&path) {
+                        Ok(mut text) => {
+                            const MAX_CHARS: usize = 20_000;
+                            if text.chars().count() > MAX_CHARS {
+                                text = text.chars().take(MAX_CHARS).collect();
+                                text.push_str("\n\n...(truncated)...");
+                            }
+                            text
+                        }
+                        Err(e) => format!("Failed to read changelog: {e}"),
+                    },
+                    None => "Changelog not found (couldn't locate pi installation).".to_string(),
+                };
+                let _ = send_text_chunk(cx, session_id, &text).await;
+                Ok(Some(PromptResponse::new(StopReason::EndTurn)))
+            }
+            "export" => {
+                // Guard: pi's export_html reads the session JSONL file; an
+                // empty/missing file makes pi throw an uncorrelated parse
+                // error (no id) that would hang the request.
+                let state = session.get_state().await.map_err(AcpError::from)?;
+                let session_file = state.session_file.clone().unwrap_or_default();
+                let message_count = state.message_count;
+                let file_ok = if session_file.is_empty() || message_count == 0 {
+                    false
+                } else {
+                    let raw = std::fs::read_to_string(&session_file);
+                    match raw {
+                        Ok(raw) => !raw.trim().is_empty(),
+                        Err(_) => false,
+                    }
+                };
+                if !file_ok {
+                    let _ = send_text_chunk(
+                        cx,
+                        session_id,
+                        "Nothing to export yet (no session messages). Send a prompt first.",
+                    )
+                    .await;
+                    return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
+                }
+
+                let safe_session_id: String = session_id
+                    .0
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let output_path = session
+                    .cwd()
+                    .join(format!("pi-session-{safe_session_id}.html"));
+
+                match session.export_html(&output_path.to_string_lossy()).await {
+                    Ok(result_path) => {
+                        if result_path.is_empty() {
+                            let _ = send_text_chunk(
+                                cx,
+                                session_id,
+                                "Export failed: no output path returned by pi.",
+                            )
+                            .await;
+                        } else {
+                            let _ = send_text_chunk(cx, session_id, "Session exported: ").await;
+                            let link = ContentBlock::ResourceLink(
+                                ResourceLink::new(
+                                    format!("pi-session-{safe_session_id}.html"),
+                                    format!("file://{result_path}"),
+                                )
+                                .mime_type("text/html")
+                                .title("Session exported"),
+                            );
+                            let chunk = ContentChunk::new(link);
+                            let _ = cx.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(chunk),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let _ =
+                            send_text_chunk(cx, session_id, &format!("Export failed: {e}")).await;
+                    }
+                }
+                Ok(Some(PromptResponse::new(StopReason::EndTurn)))
+            }
+            "autocompact" => {
+                let mode = args
+                    .first()
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_else(|| "toggle".to_string());
+                let mut enabled: Option<bool> = None;
+                if matches!(mode.as_str(), "on" | "true" | "enable" | "enabled") {
+                    enabled = Some(true);
+                } else if matches!(mode.as_str(), "off" | "false" | "disable" | "disabled") {
+                    enabled = Some(false);
+                }
+                let enabled = match enabled {
+                    Some(v) => v,
+                    None => {
+                        let state = session.get_state().await.map_err(AcpError::from)?;
+                        !state.auto_compaction_enabled
+                    }
+                };
+                session
+                    .set_auto_compaction(enabled)
+                    .await
+                    .map_err(AcpError::from)?;
+                let _ = send_text_chunk(
+                    cx,
+                    session_id,
+                    &format!(
+                        "Auto-compaction {}.",
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                )
+                .await;
+                Ok(Some(PromptResponse::new(StopReason::EndTurn)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // helpers
+    // -----------------------------------------------------------------------
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+/// `PiImage` (translate) → pi-RPC `ImageContent` (same wire shape).
+fn to_pi_images(images: Vec<crate::translate::prompt::PiImage>) -> Vec<ImageContent> {
+    images
+        .into_iter()
+        .map(|i| ImageContent {
+            data: i.data,
+            mime_type: i.mime_type,
         })
         .collect()
+}
+
+/// Convert the session's mode state to the ACP `modes` field shape.
+fn mode_state_to_acp(modes: &ModeState) -> SessionModeState {
+    SessionModeState::new(modes.current_mode_id.clone(), modes.available_modes.clone())
+}
+
+/// The wire form of a pi queue mode (`all` / `one-at-a-time` / legacy `queue`).
+fn queue_mode_str(mode: QueueMode) -> &'static str {
+    match mode {
+        QueueMode::All => "all",
+        QueueMode::OneAtATime => "one-at-a-time",
+        QueueMode::Queue => "queue",
+        QueueMode::Other => "unknown",
+    }
+}
+
+fn acp_stop_reason(reason: SessionStopReason) -> StopReason {
+    match reason {
+        SessionStopReason::EndTurn => StopReason::EndTurn,
+        SessionStopReason::Cancelled => StopReason::Cancelled,
+    }
+}
+
+fn invalid_params(msg: &str) -> AcpError {
+    AcpError::new(ACP_INVALID_PARAMS, msg.to_string())
+}
+
+fn auth_required() -> AcpError {
+    AcpError::new(
+        ACP_AUTH_REQUIRED,
+        "Configure an API key or log in with an OAuth provider.",
+    )
+}
+
+/// Build the startup prelude text: full startup info unless `quietStartup`,
+/// which keeps only the update notice (TS `buildStartupInfo` + quietStartup).
+async fn build_startup_prelude(
+    cwd: &Path,
+    pi_command: &str,
+    quiet_startup: bool,
+    update_notice: Option<&str>,
+) -> String {
+    if quiet_startup {
+        return update_notice.map(|n| format!("{n}\n")).unwrap_or_default();
+    }
+    // Async `pi --version` probe (design D6: no sync subprocess on the
+    // session/new critical path).
+    let pi_version = fetch_pi_version(pi_command).await;
+    let out = build_startup_info(cwd, pi_version.as_deref(), update_notice);
+    tracing::debug!(chars = out.len(), "startup prelude built");
+    out
+}
+
+/// Advertise slash commands: pi `get_commands` first, file-based prompts as
+/// the legacy fallback (TS `newSession`/`loadSession`).
+async fn advertise_commands(
+    cx: &ConnectionTo<Client>,
+    session: &Arc<PiAcpSession>,
+    enable_skill_commands: bool,
+    file_commands: &[FileSlashCommand],
+) {
+    let session_id = session.session_id().clone();
+    let from_pi = match session.get_commands().await {
+        Ok(data) => commands::to_available_commands_from_pi_get_commands(
+            &data,
+            enable_skill_commands,
+            false,
+        ),
+        Err(_) => Vec::new(),
+    };
+    let available = if from_pi.is_empty() {
+        commands::merge_commands(
+            &commands::to_available_commands(file_commands),
+            &commands::builtin_available_commands(),
+        )
+    } else {
+        commands::merge_commands(&from_pi, &commands::builtin_available_commands())
+    };
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available)),
+    ));
+}
+
+/// Rebuild and emit the `config_option_update` notification; returns the new
+/// options (also used in the `session/set_config_option` response).
+async fn emit_config_options_update(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    session: &Arc<PiAcpSession>,
+) -> std::result::Result<Vec<SessionConfigOption>, AcpxError> {
+    let (config_options, _models, _modes) = get_session_configuration(session, None, None).await;
+    let update = ConfigOptionUpdate::new(config_options.clone());
+    cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::ConfigOptionUpdate(update),
+    ))
+    .map_err(|e| AcpxError::RpcFailed {
+        command: "config_option_update".into(),
+        message: e.to_string(),
+    })?;
+    Ok(config_options)
+}
+
+async fn send_current_mode_update(cx: &ConnectionTo<Client>, session_id: &SessionId, mode: &str) {
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.to_string())),
+    ));
+}
+
+async fn send_text_chunk(cx: &ConnectionTo<Client>, session_id: &SessionId, text: &str) {
+    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentMessageChunk(chunk),
+    ));
+}
+
+/// Fetch `session_configuration`: configOptions + model/mode states.
+/// Pre-fetched state/models are reused when provided (session/new).
+async fn get_session_configuration(
+    session: &Arc<PiAcpSession>,
+    pre_state: Option<&RpcSessionState>,
+    pre_models: Option<&Vec<Model>>,
+) -> (Vec<SessionConfigOption>, Option<ModelState>, ModeState) {
+    let models = get_model_state(session, pre_state, pre_models).await;
+    let modes = get_mode_state(session, pre_state).await;
+    let config_options = build_config_options(models.as_ref(), &modes);
+    (config_options, models, modes)
+}
+
+async fn get_model_state(
+    session: &Arc<PiAcpSession>,
+    pre_state: Option<&RpcSessionState>,
+    pre_models: Option<&Vec<Model>>,
+) -> Option<ModelState> {
+    let (available, state) = tokio::join!(
+        async {
+            if let Some(models) = pre_models {
+                models.clone()
+            } else {
+                session.get_available_models().await.unwrap_or_default()
+            }
+        },
+        async {
+            if let Some(state) = pre_state {
+                Some(state.clone())
+            } else {
+                session.get_state().await.ok()
+            }
+        }
+    );
+
+    let available_models: Vec<AdvertisedModel> = available
+        .iter()
+        .filter_map(|m| {
+            let provider = m.provider.trim();
+            let id = m.id.trim();
+            if provider.is_empty() || id.is_empty() {
+                return None;
+            }
+            Some(AdvertisedModel {
+                model_id: format!("{provider}/{id}"),
+                name: format!("{provider}/{}", m.name),
+            })
+        })
+        .collect();
+
+    let current_model_id = state.as_ref().and_then(|s| s.model.as_ref()).and_then(|m| {
+        let provider = m.provider.trim();
+        let id = m.id.trim();
+        if provider.is_empty() || id.is_empty() {
+            None
+        } else {
+            Some(format!("{provider}/{id}"))
+        }
+    });
+
+    if available_models.is_empty() && current_model_id.is_none() {
+        return None;
+    }
+
+    let current_model_id = current_model_id
+        .or_else(|| available_models.first().map(|a| a.model_id.clone()))
+        .unwrap_or_else(|| "default".to_string());
+
+    Some(ModelState {
+        available_models,
+        current_model_id,
+    })
+}
+
+async fn get_mode_state(
+    session: &Arc<PiAcpSession>,
+    pre_state: Option<&RpcSessionState>,
+) -> ModeState {
+    let state: Option<RpcSessionState> = if let Some(state) = pre_state {
+        Some(state.clone())
+    } else {
+        session.get_state().await.ok()
+    };
+    let current = state
+        .as_ref()
+        .and_then(|s| thinking_level_str(s.thinking_level))
+        .unwrap_or("medium");
+
+    ModeState {
+        current_mode_id: current.to_string(),
+        available_modes: THINKING_LEVELS
+            .iter()
+            .map(|(id, name)| {
+                SessionMode::new(SessionModeId::new(*id), format!("Thinking: {name}"))
+            })
+            .collect(),
+    }
+}
+
+fn build_config_options(
+    models: Option<&ModelState>,
+    modes: &ModeState,
+) -> Vec<SessionConfigOption> {
+    let thought_level_options: Vec<SessionConfigSelectOption> = modes
+        .available_modes
+        .iter()
+        .map(|m| SessionConfigSelectOption::new(m.id.0.as_ref().to_string(), m.name.clone()))
+        .collect();
+    let mut options = vec![SessionConfigOption::select(
+        THOUGHT_LEVEL_CONFIG_ID,
+        "Thinking",
+        modes.current_mode_id.clone(),
+        thought_level_options,
+    )
+    .description("Set the reasoning effort for this session")
+    .category(SessionConfigOptionCategory::ThoughtLevel)];
+
+    if let Some(models) = models {
+        if !models.available_models.is_empty() {
+            let model_options: Vec<SessionConfigSelectOption> = models
+                .available_models
+                .iter()
+                .map(|m| SessionConfigSelectOption::new(m.model_id.clone(), m.name.clone()))
+                .collect();
+            options.insert(
+                0,
+                SessionConfigOption::select(
+                    MODEL_CONFIG_ID,
+                    "Model",
+                    models.current_model_id.clone(),
+                    model_options,
+                )
+                .description("Select the model for this session")
+                .category(SessionConfigOptionCategory::Model),
+            );
+        }
+    }
+    options
+}
+
+/// Resolve `provider/model` (or bare `model` via the available-model list) and
+/// apply it (TS `setSessionModel`).
+async fn set_session_model(
+    session: &Arc<PiAcpSession>,
+    requested_model_id: &str,
+) -> std::result::Result<(), AcpxError> {
+    let (mut provider, mut model_id) = match requested_model_id.split_once('/') {
+        Some((p, rest)) => (Some(p.to_string()), rest.to_string()),
+        None => (None, requested_model_id.to_string()),
+    };
+
+    if provider.is_none() {
+        let models = session.get_available_models().await?;
+        if let Some(found) = models.iter().find(|m| m.id == model_id) {
+            provider = Some(found.provider.clone());
+            model_id = found.id.clone();
+        }
+    }
+
+    match (provider, model_id.is_empty()) {
+        (Some(p), false) => {
+            session.set_model(&p, &model_id).await?;
+            Ok(())
+        }
+        _ => Err(AcpxError::RpcFailed {
+            command: "set_model".into(),
+            message: format!("Unknown modelId: {requested_model_id}"),
+        }),
+    }
+}
+
+fn parse_thinking_level(s: &str) -> Option<ThinkingLevel> {
+    match s {
+        "off" => Some(ThinkingLevel::Off),
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "low" => Some(ThinkingLevel::Low),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        "xhigh" => Some(ThinkingLevel::XHigh),
+        _ => None,
+    }
+}
+
+fn thinking_level_str(level: ThinkingLevel) -> Option<&'static str> {
+    match level {
+        ThinkingLevel::Off => Some("off"),
+        ThinkingLevel::Minimal => Some("minimal"),
+        ThinkingLevel::Low => Some("low"),
+        ThinkingLevel::Medium => Some("medium"),
+        ThinkingLevel::High => Some("high"),
+        ThinkingLevel::XHigh => Some("xhigh"),
+    }
+}
+
+/// The fixed thought-level ladder (id, display name).
+const THINKING_LEVELS: [(&str, &str); 6] = [
+    ("off", "off"),
+    ("minimal", "minimal"),
+    ("low", "low"),
+    ("medium", "medium"),
+    ("high", "high"),
+    ("xhigh", "xhigh"),
+];
+
+/// Replay a session's message history as ACP notifications (TS `loadSession`).
+async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, data: &Value) {
+    let session_id = session.session_id().clone();
+    let cwd = session.cwd().to_string_lossy().to_string();
+    let messages = data
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut synthetic_id: usize = 0;
+    for m in &messages {
+        let Some(replay) = replay_message(m) else {
+            continue;
+        };
+        match replay {
+            ReplayMessage::UserText(text) => {
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::UserMessageChunk(chunk),
+                ));
+            }
+            ReplayMessage::AssistantText(text) => {
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(chunk),
+                ));
+            }
+            ReplayMessage::ToolResult(t) => {
+                let tool_call_id = t.tool_call_id.unwrap_or_else(|| {
+                    synthetic_id += 1;
+                    format!("pi-replay-{synthetic_id}")
+                });
+                if t.is_bash {
+                    let call = ToolCall::new(tool_call_id.clone(), t.title.clone())
+                        .kind(ToolKind::Execute)
+                        .status(ToolCallStatus::Completed)
+                        .content(bash_terminal_content(&tool_call_id))
+                        .meta(bash_terminal_info_meta(&tool_call_id, &cwd));
+                    let _ = cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCall(call),
+                    ));
+                    let mut meta = serde_json::Map::new();
+                    if !t.text.is_empty() {
+                        meta.extend(bash_terminal_output_meta(&tool_call_id, &t.text));
+                    }
+                    meta.extend(bash_terminal_exit_meta(
+                        &tool_call_id,
+                        bash_exit_code(&t.raw, t.is_error),
+                    ));
+                    let fields = ToolCallUpdateFields::new().status(Some(if t.is_error {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    }));
+                    let update = ToolCallUpdate::new(tool_call_id.clone(), fields).meta(meta);
+                    let _ = cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(update),
+                    ));
+                } else {
+                    let call = ToolCall::new(tool_call_id.clone(), t.title.clone())
+                        .kind(to_tool_kind(&t.tool_name))
+                        .status(ToolCallStatus::Completed)
+                        .raw_input(Value::Null)
+                        .raw_output(t.raw.clone());
+                    let _ = cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCall(call),
+                    ));
+                    let text = tool_result_to_text(&t.raw);
+                    let content = if text.is_empty() {
+                        None
+                    } else {
+                        Some(vec![ToolCallContent::Content(
+                            agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                                TextContent::new(text),
+                            )),
+                        )])
+                    };
+                    let fields = ToolCallUpdateFields::new()
+                        .status(Some(if t.is_error {
+                            ToolCallStatus::Failed
+                        } else {
+                            ToolCallStatus::Completed
+                        }))
+                        .content(content)
+                        .raw_output(t.raw.clone());
+                    let _ = cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields)),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Locate pi's installed `CHANGELOG.md` (TS `findChangelog`): resolve the `pi`
+/// executable and walk up to its package root, else the npm global root.
+async fn find_changelog() -> Option<PathBuf> {
+    // 1) `which pi` (or `where` on Windows) → realpath → pkg root → CHANGELOG.md
+    let which_cmd = if cfg!(windows) { "where" } else { "which" };
+    let which = tokio::process::Command::new(which_cmd)
+        .arg("pi")
+        .output()
+        .await
+        .ok()?;
+    let first_line = String::from_utf8_lossy(&which.stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if !first_line.is_empty() {
+        let resolved = std::fs::canonicalize(&first_line).ok()?;
+        let pkg_root = resolved.parent()?.parent()?;
+        let p = pkg_root.join("CHANGELOG.md");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // 2) Fallback: npm global root.
+    let npm_root = tokio::process::Command::new("npm")
+        .args(["root", "-g"])
+        .output()
+        .await
+        .ok()?;
+    let root = String::from_utf8_lossy(&npm_root.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(root)
+        .join("@earendil-works")
+        .join("pi-coding-agent")
+        .join("CHANGELOG.md");
+    p.exists().then_some(p)
 }

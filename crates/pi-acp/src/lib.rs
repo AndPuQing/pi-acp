@@ -31,6 +31,7 @@ pub mod session;
 pub mod session_store;
 pub mod settings;
 pub mod startup;
+pub mod time;
 pub mod translate;
 
 pub use error::AcpxError;

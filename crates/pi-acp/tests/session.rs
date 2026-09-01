@@ -80,6 +80,9 @@ async fn fixture(extra_args: &[&str]) -> Fixture {
         timeout: TIMEOUT,
         cwd: tmp.path().to_path_buf(),
         outbound: outbound_tx,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
     })
     .await
     .expect("session spawn");
@@ -855,6 +858,9 @@ async fn session_manager_registers_and_disposes_sessions() {
         timeout: TIMEOUT,
         cwd: tmp.path().to_path_buf(),
         outbound: outbound_tx,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
     })
     .await
     .unwrap();

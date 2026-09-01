@@ -12,12 +12,13 @@
 //! under tokio (design D9 / §5.3).
 
 use anyhow::Result;
-use pi_acp::agent;
+use pi_acp::agent::AcpAgent;
 use pi_acp::config::Config;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,41 +34,67 @@ async fn main() -> Result<()> {
         return terminal_login();
     }
 
+    // `pi --version` parity: print the version and exit (the startup prelude
+    // probes PI_ACP_PI_COMMAND with --version; when the adapter itself is the
+    // target, answer like pi does).
+    if std::env::args().skip(1).any(|a| a == "--version") {
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Hidden test fixture (see tests/pi_process.rs): a mock `pi --mode rpc`
     // server so the RPC client can be tested without a real pi + LLM backend.
-    if std::env::args().skip(1).any(|a| a == "--mock-rpc") {
+    // Also triggered by `PI_ACP_MOCK=1` **when spawned with `--mode rpc`**
+    // (the ACP e2e drives the mock through `PI_ACP_PI_COMMAND` without argv —
+    // see tests/acp_agent.rs). The agent process itself must never take this
+    // branch, so the env trigger requires the `--mode` argv marker.
+    let is_mock = std::env::args().skip(1).any(|a| a == "--mock-rpc")
+        || (std::env::var_os("PI_ACP_MOCK").is_some()
+            && std::env::args().skip(1).any(|a| a == "--mode"));
+    if is_mock {
         return run_mock_rpc().await;
     }
 
     let cfg = Config::from_env();
     tracing::info!(pi_command = %cfg.pi_command, "pi-acp (Rust) starting");
-    agent::run()
+    let agent = Arc::new(AcpAgent::new(cfg));
+    agent
+        .run()
         .await
         .map_err(|e| anyhow::anyhow!("ACP error: {e:?}"))?;
     Ok(())
 }
 
-/// Launch `pi` with inherited stdio for interactive login/setup.
+/// Launch `pi` with inherited stdio for interactive login/setup (ACP Terminal
+/// Auth, §6.3): spawn `pi` without any RPC flags so the user can configure API
+/// keys / OAuth in the interactive TUI, and propagate its exit code. A missing
+/// `pi` binary surfaces a clear install hint.
 fn terminal_login() -> Result<()> {
     let cfg = Config::from_env();
     let pi_command = cfg.pi_command.clone();
     tracing::info!(pi_command, "launching pi for terminal login");
 
-    // TODO(S3, W-450): spawn `pi` (inherited stdio) and propagate its exit code;
-    // surface a clear "install pi" message on ENOENT.
-    eprintln!(
-        "pi-acp (Rust): --terminal-login not yet wired (scaffold). Would launch: {pi_command}"
-    );
-    Ok(())
+    let status = std::process::Command::new(&pi_command)
+        .status()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to launch `{pi_command}` for terminal login: {e}. \
+                 Is pi installed? Install it with `npm i -g @earendil-works/pi-coding-agent` \
+                 or set PI_ACP_PI_COMMAND."
+            )
+        })?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Test-only mock `pi --mode rpc` server.
 ///
 /// Hidden fixture behind `--mock-rpc` (spawned by `tests/pi_process.rs` and
-/// `tests/session.rs`): speaks the same JSONL protocol as pi so
-/// [`pi_acp::pi::process::PiProcess`] and the session state machine can be
-/// exercised without a real pi + LLM backend. All other args (`--mode rpc
-/// --no-themes --session <path>`) are ignored.
+/// `tests/session.rs`) or the `PI_ACP_MOCK=1` env var (spawned by the ACP e2e
+/// tests, which cannot pass argv to the inner pi): speaks the same JSONL
+/// protocol as pi so [`pi_acp::pi::process::PiProcess`], the session state
+/// machine, and the ACP agent (S6) can be exercised without a real pi + LLM
+/// backend. All other args (`--mode rpc --no-themes --session <path>`) are
+/// ignored.
 ///
 /// Behavior flags (any combination):
 /// - `--mock-prelude <n>`   emit `n` ANSI-styled human-readable lines before NDJSON
@@ -76,8 +103,9 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-delay-ms <n>`  delay each response by `n` ms (concurrency tests)
 /// - `--mock-unknown-event` emit one unknown event type (protocol-evolution guard)
 /// - `--mock-scenario <dir>` per-prompt event replay from `<dir>/<n>.jsonl`
-///   (`n` = 1-based prompt ordinal). Each line is a JSON event emitted after
-///   the prompt response; `{"__directive__":"write_file",...}` /
+///   (`n` = 1-based prompt ordinal; also settable via `PI_ACP_MOCK_SCENARIO` so
+///   the ACP e2e can configure it without argv). Each line is a JSON event
+///   emitted after the prompt response; `{"__directive__":"write_file",...}` /
 ///   `{"__directive__":"delete_file",...}` lines mutate the filesystem
 ///   instead of emitting. `agent_settled` is auto-appended unless the file
 ///   already contains one or `--mock-no-settle` is set.
@@ -88,11 +116,13 @@ fn terminal_login() -> Result<()> {
 ///
 /// Default: respond `success: true` to every command (with a fixed `get_state`
 /// payload), and after a `prompt` command emit a `text_delta` message_update
-/// followed by `agent_settled` (mirroring pi's early-response + settled-event
-/// semantics, S2 constraint 2). After an `abort`, emit `agent_settled` (pi
-/// settles once the aborted turn unwinds).
+/// (carrying token usage) followed by `agent_settled` (mirroring pi's
+/// early-response + settled-event semantics, S2 constraint 2). After an
+/// `abort`, emit `agent_settled` (pi settles once the aborted turn unwinds).
 async fn run_mock_rpc() -> Result<()> {
     use std::path::PathBuf;
+
+    let env_scenario = std::env::var_os("PI_ACP_MOCK_SCENARIO").map(PathBuf::from);
 
     let mut prelude = 0usize;
     let mut hang = false;
@@ -105,6 +135,13 @@ async fn run_mock_rpc() -> Result<()> {
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
     let mut prompt_count: usize = 0;
+    // Stateful mock: real pi keeps these across RPC calls, and the agent's
+    // config-option / slash-command handlers read them back via get_state.
+    let mut mock_thinking_level = "medium".to_string();
+    let mut mock_model = "mock-model".to_string();
+    let mut mock_auto_compaction = false;
+    let mut mock_steering_mode = "one-at-a-time".to_string();
+    let mut mock_follow_up_mode = "one-at-a-time".to_string();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -124,6 +161,12 @@ async fn run_mock_rpc() -> Result<()> {
             "--mock-extension-log" => extension_log = args.next().map(PathBuf::from),
             _ => {}
         }
+    }
+    if scenario_dir.is_none() {
+        scenario_dir = env_scenario;
+    }
+    if command_log.is_none() {
+        command_log = std::env::var_os("PI_ACP_MOCK_COMMAND_LOG").map(PathBuf::from);
     }
 
     let mut stdout = tokio::io::stdout();
@@ -203,30 +246,89 @@ async fn run_mock_rpc() -> Result<()> {
 
         let data = match ty {
             "get_state" => serde_json::json!({
-                "model": {"id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
-                "thinkingLevel": "medium",
+                "model": {"id": mock_model, "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
+                "thinkingLevel": mock_thinking_level,
                 "isStreaming": false,
                 "isCompacting": false,
-                "steeringMode": "one-at-a-time",
-                "followUpMode": "one-at-a-time",
+                "steeringMode": mock_steering_mode,
+                "followUpMode": mock_follow_up_mode,
                 "sessionFile": "/tmp/mock-session.jsonl",
                 "sessionId": "mock-session-id",
                 "sessionName": "Mock Session",
-                "autoCompactionEnabled": false,
-                "messageCount": 0,
+                "autoCompactionEnabled": mock_auto_compaction,
+                "messageCount": 3,
                 "pendingMessageCount": 0
             }),
             "get_available_models" => serde_json::json!({
                 "models": [
-                    {"id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100}
+                    {"id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
+                    {"id": "mock-fast", "name": "Mock Fast", "provider": "mock", "reasoning": false, "contextWindow": 8000, "maxTokens": 100}
                 ]
             }),
             "export_html" => serde_json::json!({"path": "/tmp/mock.html"}),
             "set_model" => serde_json::json!({
-                "id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false
+                "id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000
+            }),
+            "compact" => serde_json::json!({
+                "tokensBefore": 1500,
+                "summary": "The conversation was summarized."
+            }),
+            "get_session_stats" => serde_json::json!({
+                "sessionId": "mock-session-id",
+                "sessionFile": "/tmp/mock-session.jsonl",
+                "totalMessages": 3,
+                "cost": 0.0123,
+                "tokens": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "total": 165}
+            }),
+            "get_commands" => serde_json::json!({
+                "commands": [
+                    {"name": "review", "description": "Review the current diff", "source": "prompt"},
+                    {"name": "skill:deploy", "description": "Deploy to staging", "source": "skill"},
+                    {"name": "ext-thing", "description": "An extension command", "source": "extension"}
+                ]
+            }),
+            "get_messages" => serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "hello there"},
+                    {"role": "assistant", "content": [{"type": "text", "text": "hi! how can I help?"}]},
+                    {"role": "toolResult", "toolName": "bash", "toolCallId": "bash-1", "isError": false, "command": "ls", "content": {"stdout": "a.txt\nb.txt\n", "exitCode": 0}, "details": {}},
+                    {"role": "toolResult", "toolName": "read", "toolCallId": "read-1", "isError": false, "content": {"output": "file contents", "exitCode": 0}, "details": {"path": "a.txt"}}
+                ]
             }),
             _ => serde_json::Value::Null,
         };
+
+        // Apply stateful mutations (real pi persists these; the agent reads
+        // them back via get_state for configOptions / slash-command displays).
+        match ty {
+            "set_thinking_level" => {
+                if let Some(l) = command.get("level").and_then(serde_json::Value::as_str) {
+                    mock_thinking_level = l.to_string();
+                }
+            }
+            "set_model" => {
+                if let Some(m) = command.get("modelId").and_then(serde_json::Value::as_str) {
+                    mock_model = m.to_string();
+                }
+            }
+            "set_auto_compaction" => {
+                mock_auto_compaction = command
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            }
+            "set_steering_mode" => {
+                if let Some(m) = command.get("mode").and_then(serde_json::Value::as_str) {
+                    mock_steering_mode = m.to_string();
+                }
+            }
+            "set_follow_up_mode" => {
+                if let Some(m) = command.get("mode").and_then(serde_json::Value::as_str) {
+                    mock_follow_up_mode = m.to_string();
+                }
+            }
+            _ => {}
+        }
 
         let mut response = serde_json::json!({
             "id": id,
@@ -258,20 +360,10 @@ async fn run_mock_rpc() -> Result<()> {
                     )
                     .await?;
                 } else if !no_settle {
-                    mock_write_line(&mut stdout, b"{\"type\":\"agent_settled\"}").await?;
+                    emit_default_prompt_response(&mut stdout).await?;
                 }
             } else if !no_settle {
-                let update = serde_json::json!({
-                    "type": "message_update",
-                    "usage": {},
-                    "assistantMessageEvent": {
-                        "type": "text_delta",
-                        "contentIndex": 0,
-                        "delta": "hello from mock"
-                    }
-                });
-                mock_write_line(&mut stdout, update.to_string().as_bytes()).await?;
-                mock_write_line(&mut stdout, b"{\"type\":\"agent_settled\"}").await?;
+                emit_default_prompt_response(&mut stdout).await?;
             }
         } else if ty == "abort" {
             // pi settles once an aborted turn unwinds.
@@ -279,6 +371,23 @@ async fn run_mock_rpc() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// The default post-prompt event sequence: a `text_delta` message_update
+/// (carrying token usage) followed by `agent_settled`.
+async fn emit_default_prompt_response(stdout: &mut tokio::io::Stdout) -> Result<()> {
+    let update = serde_json::json!({
+        "type": "message_update",
+        "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15},
+        "assistantMessageEvent": {
+            "type": "text_delta",
+            "contentIndex": 0,
+            "delta": "hello from mock"
+        }
+    });
+    mock_write_line(stdout, update.to_string().as_bytes()).await?;
+    mock_write_line(stdout, b"{\"type\":\"agent_settled\"}").await?;
     Ok(())
 }
 

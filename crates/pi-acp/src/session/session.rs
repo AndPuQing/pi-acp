@@ -40,10 +40,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Diff, PermissionOption, PermissionOptionKind,
+    ContentBlock, ContentChunk, Cost, Diff, PermissionOption, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
     SessionInfoUpdate, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::{json, Value};
@@ -53,7 +53,7 @@ use crate::error::{AcpxError, Result};
 use crate::pi::process::PiProcess;
 use crate::pi::rpc::{
     AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
-    RpcCommand, RpcEvent,
+    RpcCommand, RpcEvent, Usage,
 };
 use crate::translate::bash::{
     bash_command, bash_exit_code, bash_output_delta, bash_result_text, bash_terminal_content,
@@ -106,6 +106,15 @@ pub struct SessionParams {
     pub cwd: PathBuf,
     /// Outbound ACP message sink (see [`OutboundMessage`]).
     pub outbound: mpsc::Sender<OutboundMessage>,
+    /// Optional pi session file to resume (`--session <path>`; used by
+    /// `session/load`).
+    pub session_path: Option<PathBuf>,
+    /// Optional ACP session id override (used by `session/load`: the session
+    /// is registered under the requested id, not the spawned pi's own).
+    pub session_id_override: Option<SessionId>,
+    /// File-based slash commands to expand in `prompt` (pi RPC mode disables
+    /// its own slash expansion, so pi-acp does it — TS `session.ts`).
+    pub file_commands: Vec<crate::commands::FileSlashCommand>,
 }
 
 /// A handle to a running session. The heavy lifting lives in the pump task;
@@ -116,6 +125,9 @@ pub struct PiAcpSession {
     session_id: SessionId,
     cwd: PathBuf,
     cmd_tx: mpsc::Sender<SessionCommand>,
+    /// File-based slash commands for this session's cwd (expanded in
+    /// [`PiAcpSession::prompt`]; pi RPC mode disables its own expansion).
+    file_commands: Vec<crate::commands::FileSlashCommand>,
 }
 
 /// Commands the pump task accepts from the outside world.
@@ -129,6 +141,19 @@ enum SessionCommand {
     /// Clear the queue and abort the in-flight turn.
     Cancel {
         respond: oneshot::Sender<Result<()>>,
+    },
+    /// Run an arbitrary pi RPC command on the session's process and return the
+    /// response `data` (thin delegation for the agent's method handlers —
+    /// `set_model`, `compact`, `get_commands`, ...).
+    Rpc {
+        command: RpcCommand,
+        respond: oneshot::Sender<Result<Value>>,
+    },
+    /// Refresh the cached context window after a successful `set_model` (feeds
+    /// ACP `usage_update.size`).
+    SetContextWindow {
+        window: Option<u64>,
+        respond: oneshot::Sender<()>,
     },
     /// Graceful teardown: dispose the pi process, then signal completion.
     Shutdown { done: oneshot::Sender<()> },
@@ -203,16 +228,23 @@ struct Pump {
     file_snapshots: HashMap<String, FileSnapshot>,
     bash_tool_call_ids: HashSet<String>,
     bash_output_snapshots: HashMap<String, String>,
+    /// The active model's context window (tokens), from `get_state` at spawn
+    /// and refreshed on `set_model`. Feeds ACP `usage_update.size` (S6).
+    context_window: Option<u64>,
 }
 
 impl PiAcpSession {
     /// Spawn `pi --mode rpc`, learn its session id, and start the pump task.
     pub async fn spawn(params: SessionParams) -> Result<Arc<Self>> {
         let extra: Vec<&str> = params.extra_args.iter().map(String::as_str).collect();
+        let session_path = params.session_path.as_deref();
         let mut proc =
-            PiProcess::spawn_with_args(&params.pi_command, &extra, None, params.timeout).await?;
+            PiProcess::spawn_with_args(&params.pi_command, &extra, session_path, params.timeout)
+                .await?;
         let state = proc.get_state().await?;
-        let session_id: SessionId = state.session_id.into();
+        let session_id = params
+            .session_id_override
+            .unwrap_or_else(|| state.session_id.clone().into());
         tracing::info!(session_id = %session_id.0, "pi session ready");
         let event_rx = proc
             .take_event_receiver()
@@ -244,6 +276,7 @@ impl PiAcpSession {
             file_snapshots: HashMap::new(),
             bash_tool_call_ids: HashSet::new(),
             bash_output_snapshots: HashMap::new(),
+            context_window: state.model.as_ref().and_then(|m| m.context_window),
         };
         tokio::spawn(pump_loop(pump));
 
@@ -251,6 +284,7 @@ impl PiAcpSession {
             session_id,
             cwd: params.cwd,
             cmd_tx,
+            file_commands: params.file_commands,
         }))
     }
 
@@ -266,14 +300,18 @@ impl PiAcpSession {
     /// completion — which happens at pi's `agent_settled`, **not** at the
     /// early `prompt` response (S2 constraint 2).
     ///
+    /// File-based slash commands are expanded first (pi RPC mode disables its
+    /// own expansion; TS `session.prompt` does the same).
+    ///
     /// Returns [`StopReason::EndTurn`] for a normal settle, [`StopReason::Cancelled`]
     /// when `cancel()` was requested, or `Err` when the turn failed (pi error /
     /// process death) — surfaced explicitly per design D5.
     pub async fn prompt(&self, message: String, images: Vec<ImageContent>) -> Result<StopReason> {
+        let expanded = crate::commands::expand_slash_command(&message, &self.file_commands);
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::Prompt {
-                message,
+                message: expanded,
                 images,
                 respond: tx,
             })
@@ -307,6 +345,139 @@ impl PiAcpSession {
             .await;
         let _ = rx.await;
     }
+
+    // --- thin pi RPC delegation (agent method handlers, S6) ---
+    //
+    // The pump owns the `PiProcess`; these send a [`SessionCommand::Rpc`] and
+    // await the response. Keeps the ACP handlers thin while the process stays
+    // inside the session.
+
+    async fn rpc(&self, command: RpcCommand) -> Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::Rpc {
+                command,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
+        rx.await
+            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+    }
+
+    /// `get_state`.
+    pub async fn get_state(&self) -> Result<crate::pi::rpc::RpcSessionState> {
+        let data = self.rpc(RpcCommand::GetState).await?;
+        serde_json::from_value(data).map_err(Into::into)
+    }
+
+    /// `get_available_models`.
+    pub async fn get_available_models(&self) -> Result<Vec<crate::pi::rpc::Model>> {
+        let data = self.rpc(RpcCommand::GetAvailableModels).await?;
+        let models = data
+            .get("models")
+            .cloned()
+            .ok_or_else(|| AcpxError::RpcFailed {
+                command: "get_available_models".into(),
+                message: "response missing data.models".into(),
+            })?;
+        serde_json::from_value(models).map_err(Into::into)
+    }
+
+    /// `set_model`; refreshes the cached context window for `usage_update`.
+    pub async fn set_model(&self, provider: &str, model_id: &str) -> Result<()> {
+        let data = self
+            .rpc(RpcCommand::SetModel {
+                provider: provider.to_string(),
+                model_id: model_id.to_string(),
+            })
+            .await?;
+        let window = serde_json::from_value::<crate::pi::rpc::Model>(data)
+            .ok()
+            .and_then(|m| m.context_window);
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::SetContextWindow {
+                window,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
+        let _ = rx.await;
+        Ok(())
+    }
+
+    /// `set_thinking_level`.
+    pub async fn set_thinking_level(&self, level: crate::pi::rpc::ThinkingLevel) -> Result<()> {
+        self.rpc(RpcCommand::SetThinkingLevel { level }).await?;
+        Ok(())
+    }
+
+    /// `set_steering_mode`.
+    pub async fn set_steering_mode(&self, mode: crate::pi::rpc::QueueMode) -> Result<()> {
+        self.rpc(RpcCommand::SetSteeringMode { mode }).await?;
+        Ok(())
+    }
+
+    /// `set_follow_up_mode`.
+    pub async fn set_follow_up_mode(&self, mode: crate::pi::rpc::QueueMode) -> Result<()> {
+        self.rpc(RpcCommand::SetFollowUpMode { mode }).await?;
+        Ok(())
+    }
+
+    /// `compact`.
+    pub async fn compact(&self, custom_instructions: Option<&str>) -> Result<Value> {
+        self.rpc(RpcCommand::Compact {
+            custom_instructions: custom_instructions.map(str::to_string),
+        })
+        .await
+    }
+
+    /// `get_session_stats`.
+    pub async fn get_session_stats(&self) -> Result<Value> {
+        self.rpc(RpcCommand::GetSessionStats).await
+    }
+
+    /// `set_session_name`.
+    pub async fn set_session_name(&self, name: &str) -> Result<()> {
+        self.rpc(RpcCommand::SetSessionName {
+            name: name.to_string(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// `set_auto_compaction`.
+    pub async fn set_auto_compaction(&self, enabled: bool) -> Result<()> {
+        self.rpc(RpcCommand::SetAutoCompaction { enabled }).await?;
+        Ok(())
+    }
+
+    /// `export_html` → the written file path.
+    pub async fn export_html(&self, output_path: &str) -> Result<String> {
+        let data = self
+            .rpc(RpcCommand::ExportHtml {
+                output_path: Some(output_path.to_string()),
+            })
+            .await?;
+        data.get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| AcpxError::RpcFailed {
+                command: "export_html".into(),
+                message: "response missing data.path".into(),
+            })
+    }
+
+    /// `get_messages` (session/load history replay).
+    pub async fn get_messages(&self) -> Result<Value> {
+        self.rpc(RpcCommand::GetMessages).await
+    }
+
+    /// `get_commands` (slash / skill / extension command list).
+    pub async fn get_commands(&self) -> Result<Value> {
+        self.rpc(RpcCommand::GetCommands).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +496,15 @@ async fn pump_loop(mut pump: Pump) {
                     }
                     Some(SessionCommand::Cancel { respond }) => {
                         pump.on_cancel(respond).await;
+                    }
+                    Some(SessionCommand::Rpc { command, respond }) => {
+                        pump.on_rpc(command, respond).await;
+                    }
+                    Some(SessionCommand::SetContextWindow { window, respond }) => {
+                        if let Some(window) = window {
+                            pump.context_window = Some(window);
+                        }
+                        let _ = respond.send(());
                     }
                     Some(SessionCommand::Shutdown { done }) => {
                         shutdown_done = Some(done);
@@ -433,6 +613,13 @@ impl Pump {
         }
     }
 
+    /// Run one delegated pi RPC command (thin agent delegation).
+    async fn on_rpc(&mut self, command: RpcCommand, respond: oneshot::Sender<Result<Value>>) {
+        let mut proc = self.proc.lock().await;
+        let result = proc.request(&command).await;
+        let _ = respond.send(result);
+    }
+
     /// The early `prompt` RPC response. `Ok` means pi accepted the turn (it
     /// completes at `agent_settled`); `Err` means the prompt was rejected or
     /// pi died — resolve the pending turn explicitly (TS parity), surfacing
@@ -514,14 +701,46 @@ impl Pump {
         self.emit(update).await;
     }
 
+    /// Emit an ACP `usage_update` from pi's `message_update.usage` (decision 3:
+    /// first release includes the standard notification, aligning #106).
+    ///
+    /// `used` = pi's cumulative context token count (`totalTokens`, falling
+    /// back to the component sum); `size` = the active model's context window;
+    /// `cost` = the cumulative USD cost when pi reports one. Skipped when the
+    /// usage is all-zero or the model's context window is unknown (a
+    /// `usage_update` without a meaningful `size` would be misleading).
+    async fn emit_usage_update(&mut self, usage: &Usage) {
+        let Some(size) = self.context_window else {
+            return;
+        };
+        let used = if usage.total_tokens > 0 {
+            usage.total_tokens
+        } else {
+            usage.input + usage.output + usage.cache_read + usage.cache_write
+        };
+        if used == 0 && !usage.cost.as_ref().is_some_and(|c| c.total > 0.0) {
+            return;
+        }
+        let mut update = UsageUpdate::new(used, size);
+        if let Some(cost) = &usage.cost {
+            if cost.total > 0.0 {
+                update = update.cost(Cost::new(cost.total, "USD"));
+            }
+        }
+        self.emit(SessionUpdate::UsageUpdate(update)).await;
+    }
+
     // --- pi events ---
 
     async fn on_event(&mut self, ev: RpcEvent) {
         match ev {
             RpcEvent::MessageUpdate {
+                usage,
                 assistant_message_event,
-                ..
-            } => self.on_message_update(&assistant_message_event).await,
+            } => {
+                self.emit_usage_update(&usage).await;
+                self.on_message_update(&assistant_message_event).await;
+            }
             RpcEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,

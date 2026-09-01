@@ -15,9 +15,11 @@ bridge + translation layer. It does **not** re-implement pi.
 
 ## Status
 
-🚧 **Scaffold.** The workspace, module skeleton, error/config foundation, and
-cross-platform CI are in place. The ACP server wiring begins in the **S2 spike**
-(issue W-449).
+🚧 **In progress.** Stages 1–3 are merged: the ACP SDK × tokio spike (S2),
+pi RPC client (S3), pure translate layer (S4), the session state machine (S5),
+and — current — the full ACP agent method set with slash commands, settings,
+startup info, and `usage_update` (S6). S7 (session persistence polish + replay
+edge cases) and S8 (reliability hardening) remain on the roadmap.
 
 ## Layout
 

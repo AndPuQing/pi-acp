@@ -76,7 +76,9 @@ fn normalize_frame(raw: &str, cwd: &str) -> Option<String> {
 fn normalize_value(v: &mut Value, cwd: &str) {
     match v {
         Value::String(s) => {
-            *s = s.replace(cwd, "<CWD>");
+            // Keep the checked-in golden independent of both path separators
+            // and the temp directory representation used by the host OS.
+            *s = s.replace(cwd, "<CWD>").replace('\\', "/");
             *s = normalize_pi_version(s);
         }
         Value::Object(map) => {
@@ -195,6 +197,7 @@ async fn acp_frame_sequence_matches_golden() {
     let golden = fs::read_to_string(&golden_path).unwrap_or_else(|_| {
         panic!("golden file missing at {GOLDEN}; run with UPDATE_GOLDEN=1 to create it")
     });
+    let golden = golden.replace("\r\n", "\n");
     assert_eq!(body, golden, "ACP frame sequence drifted from the golden file\n--- recorded ---\n{body}\n--- golden ---\n{golden}");
 
     // The ordering property the golden guards, stated explicitly: the startup
@@ -264,4 +267,8 @@ fn normalization_is_stable() {
     assert!(out.contains("<CWD>/AGENTS.md"), "{out}");
     assert!(out.contains("\"updatedAt\":\"<TS>\""), "{out}");
     assert!(!out.contains("/tmp/x"), "{out}");
+
+    let mut windows = serde_json::json!({ "path": "C:\\tmp\\x\\AGENTS.md" });
+    normalize_value(&mut windows, "C:\\tmp\\x");
+    assert_eq!(windows["path"], "<CWD>/AGENTS.md");
 }

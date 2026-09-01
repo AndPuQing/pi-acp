@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // Structured logging (env-filter driven, e.g. RUST_LOG=pi_acp=debug).
     let _ = tracing_subscriber::fmt()

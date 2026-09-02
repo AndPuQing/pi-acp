@@ -139,6 +139,7 @@ fn write_pi_session(dir: &Path, id: &str, cwd: &str) -> PathBuf {
 #[tokio::test]
 async fn full_method_set_against_mock_pi() {
     let _test_guard = acquire_test_lock().await;
+    println!("full_method: setup");
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
@@ -189,10 +190,12 @@ async fn full_method_set_against_mock_pi() {
             // ---------------------------------------------------------------
             // 1. initialize
             // ---------------------------------------------------------------
+            println!("full_method: initialize");
             let init = cx
                 .send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
+            println!("full_method: initialize complete");
             assert_eq!(init.agent_info.as_ref().unwrap().name, "pi-acp");
             assert!(
                 init.agent_capabilities.load_session,
@@ -213,10 +216,12 @@ async fn full_method_set_against_mock_pi() {
             // ---------------------------------------------------------------
             // 2. session/new
             // ---------------------------------------------------------------
+            println!("full_method: session/new");
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd.clone()))
                 .block_task()
                 .await?;
+            println!("full_method: session/new complete");
             let sid = new_session.session_id.clone();
             assert!(!sid.0.is_empty());
 
@@ -291,6 +296,7 @@ async fn full_method_set_against_mock_pi() {
             // ---------------------------------------------------------------
             // 6. cancel (through the full ACP path, mid-turn)
             // ---------------------------------------------------------------
+            println!("full_method: cancel prompt");
             let slow_prompt = {
                 let cx = cx.clone();
                 let sid = sid.clone();
@@ -306,6 +312,7 @@ async fn full_method_set_against_mock_pi() {
             tokio::time::sleep(Duration::from_millis(80)).await;
             cx.send_notification(CancelNotification::new(sid.clone()))?;
             let slow_result = slow_prompt.await.expect("slow prompt task panicked")?;
+            println!("full_method: cancel prompt complete");
             assert_eq!(slow_result.stop_reason, StopReason::Cancelled);
 
             // First real prompt names the thread (fixes #102/#24: without a
@@ -321,6 +328,7 @@ async fn full_method_set_against_mock_pi() {
             // ---------------------------------------------------------------
             // 3. plain prompt: streaming + usage_update
             // ---------------------------------------------------------------
+            println!("full_method: plain prompt");
             let prompt_resp = cx
                 .send_request(PromptRequest::new(
                     sid.clone(),
@@ -328,6 +336,7 @@ async fn full_method_set_against_mock_pi() {
                 ))
                 .block_task()
                 .await?;
+            println!("full_method: plain prompt complete");
             assert_eq!(prompt_resp.stop_reason, StopReason::EndTurn);
             // The streamed chunk may still be in flight when the response
             // lands; wait for it explicitly.
@@ -349,6 +358,7 @@ async fn full_method_set_against_mock_pi() {
             // ---------------------------------------------------------------
             // 4. built-in slash commands
             // ---------------------------------------------------------------
+            println!("full_method: slash commands");
             let compact = cx
                 .send_request(prompt_for(&sid, "/compact fix the context"))
                 .block_task()
@@ -419,6 +429,7 @@ async fn full_method_set_against_mock_pi() {
             // ---------------------------------------------------------------
             // 5. set_mode / set_config_option / session/set_model
             // ---------------------------------------------------------------
+            println!("full_method: config methods");
             let set_mode = cx
                 .send_request(SetSessionModeRequest::new(sid.clone(), "xhigh"))
                 .block_task()
@@ -483,10 +494,12 @@ async fn full_method_set_against_mock_pi() {
             // ---------------------------------------------------------------
             // 7. session/list, session/load, session/delete
             // ---------------------------------------------------------------
+            println!("full_method: session/list");
             let listed = cx
                 .send_request(ListSessionsRequest::new())
                 .block_task()
                 .await?;
+            println!("full_method: session/list complete; session/load");
             assert!(
                 listed.sessions.iter().any(|s| s.session_id.0.as_ref() == "old-session"),
                 "list should include the fake pi session: {:?}",
@@ -526,6 +539,7 @@ async fn full_method_set_against_mock_pi() {
             .await;
 
             // Prompt the restored session: it must work (session id preserved).
+            println!("full_method: restored prompt");
             let loaded_prompt = cx
                 .send_request(PromptRequest::new(
                     "old-session".to_string(),
@@ -533,6 +547,7 @@ async fn full_method_set_against_mock_pi() {
                 ))
                 .block_task()
                 .await?;
+            println!("full_method: restored prompt complete; delete");
             assert_eq!(loaded_prompt.stop_reason, StopReason::EndTurn);
 
             let deleted = cx
@@ -546,6 +561,7 @@ async fn full_method_set_against_mock_pi() {
                 .send_request(DeleteSessionRequest::new("old-session"))
                 .block_task()
                 .await?;
+            println!("full_method: delete complete");
             let _: agent_client_protocol::schema::v1::DeleteSessionResponse = deleted_again;
 
             Ok(())

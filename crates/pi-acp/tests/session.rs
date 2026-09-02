@@ -300,6 +300,72 @@ async fn prompts_queue_and_drain_serially() {
     assert_eq!(depths, vec![(0, true), (1, true), (0, true), (0, false)]);
 }
 
+/// Responses and events are delivered through separate channels. A late prompt
+/// response must not arm the settle deadline for the queued turn when pi emits
+/// `agent_settled` before that response is observed by the pump.
+#[tokio::test]
+async fn prompt_response_order_cannot_poison_the_next_turn() {
+    let fx = fixture_with_settle_timeout(
+        &[
+            "--mock-no-settle",
+            "--mock-event-delay-ms",
+            "150",
+            "--mock-prompt-response-after-events-ms",
+            "50",
+        ],
+        Duration::from_millis(100),
+    )
+    .await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "usage": {},
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "first"
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+    write_scenario(
+        &fx.scenarios,
+        2,
+        &[
+            json!({
+                "type": "message_update",
+                "usage": {},
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "second"
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+
+    let first_session = fx.session.clone();
+    let first = tokio::spawn(async move { first_session.prompt("first".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    // Queue the next turn before the first prompt response is emitted. Its
+    // response is intentionally delayed until after its own settle event too.
+    let second_session = fx.session.clone();
+    let second = tokio::spawn(async move { second_session.prompt("second".into(), vec![]).await });
+    wait_until(&fx, |recorded| {
+        text_chunks(recorded).contains(&"Queued message (position 1).".to_string())
+    })
+    .await;
+
+    assert_eq!(first.await.unwrap().unwrap(), StopReason::EndTurn);
+    assert_eq!(second.await.unwrap().unwrap(), StopReason::EndTurn);
+}
+
 /// A rejected prompt must fail the queued turns too, and a later prompt must
 /// not reuse an unhealthy pi session.
 #[tokio::test]
@@ -401,6 +467,30 @@ async fn cancel_clears_queue_and_aborts_running_turn() {
     assert_eq!(
         tool_statuses(&recorded, "t1"),
         vec![ToolCallStatus::InProgress]
+    );
+}
+
+/// Cancellation must be able to reach pi while the prompt RPC is still
+/// waiting for its early response. The abort request must not wait for the
+/// session's process ownership mutex, or cancellation can hang until timeout.
+#[tokio::test]
+async fn cancel_interrupts_prompt_waiting_for_early_response() {
+    let fx = fixture(&["--mock-prompt-hang"]).await;
+
+    let s = fx.session.clone();
+    let turn = tokio::spawn(async move { s.prompt("stuck".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    tokio::time::timeout(Duration::from_secs(1), fx.session.cancel())
+        .await
+        .expect("cancel must not wait for the prompt RPC timeout")
+        .expect("abort must be accepted by pi");
+    assert_eq!(turn.await.unwrap().unwrap(), StopReason::Cancelled);
+
+    let commands = read_log(&fx.command_log);
+    assert!(
+        commands.iter().any(|command| command == "abort"),
+        "abort missing: {commands:?}"
     );
 }
 
@@ -1063,4 +1153,46 @@ async fn session_manager_registers_and_disposes_sessions() {
     // The session is gone: a prompt fails explicitly instead of hanging.
     let err = session.prompt("hi".into(), vec![]).await.unwrap_err();
     assert!(matches!(err, AcpxError::SessionClosed(_)), "got {err:?}");
+}
+
+/// Replacing an existing session id must dispose the old process without
+/// leaving the manager pointing at a dead instance. The mock intentionally
+/// returns the same id for every spawn, matching the collision this guards.
+#[tokio::test]
+async fn session_manager_replacement_disposes_previous_instance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (first_outbound, _first_receiver) = mpsc::channel(64);
+    let (second_outbound, _second_receiver) = mpsc::channel(64);
+    let manager = SessionManager::new();
+
+    let params = |outbound| SessionParams {
+        pi_command: BIN.to_string(),
+        extra_args: vec!["--mock-rpc".to_string()],
+        timeout: TIMEOUT,
+        settle_timeout: Duration::ZERO,
+        cwd: tmp.path().to_path_buf(),
+        outbound,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
+    };
+    let first = PiAcpSession::spawn(params(first_outbound)).await.unwrap();
+    let session_id = first.session_id().clone();
+    manager.insert(first.clone()).await;
+
+    let second = PiAcpSession::spawn(params(second_outbound)).await.unwrap();
+    manager.insert(second.clone()).await;
+
+    let current = manager.maybe_get(&session_id).await.unwrap();
+    assert!(Arc::ptr_eq(&current, &second));
+    assert!(matches!(
+        first.prompt("old".into(), vec![]).await,
+        Err(AcpxError::SessionClosed(_))
+    ));
+    assert_eq!(
+        second.get_state().await.unwrap().session_id,
+        "mock-session-id"
+    );
+
+    manager.dispose_all().await;
 }

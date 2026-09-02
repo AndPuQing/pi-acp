@@ -1,75 +1,58 @@
-# pi-acp (Rust)
+# pi-acp
 
-ACP ([Agent Client Protocol](https://agentclientprotocol.com)) adapter for the
-[pi coding agent](https://github.com/earendil-works/pi), written in **Rust**.
+Use the [pi coding agent](https://github.com/earendil-works/pi) from [Zed](https://zed.dev/)
+and other [Agent Client Protocol (ACP)](https://agentclientprotocol.com) clients.
 
-`pi-acp` speaks **ACP JSON-RPC 2.0 over stdio** to an ACP client (e.g. Zed) and
-spawns `pi --mode rpc`, bridging requests/events between the two. The LLM loop,
-tools, and session management live in **pi** itself — this adapter is only the
-bridge + translation layer. It does **not** re-implement pi.
+`pi-acp` connects an ACP client to pi over a local process boundary. It starts
+pi when a session is opened and forwards prompts, tool activity, session history,
+model settings, and usage information. pi still owns the agent loop, providers,
+credentials, and tools; `pi-acp` is the adapter between pi and the client.
 
-> This is a Rust rewrite of
-> [svkozak/pi-acp](https://github.com/svkozak/pi-acp) (TypeScript). See the
-> design doc (Multica issues **W-446** / **W-447**) for rationale, architecture,
-> and roadmap.
+## Requirements
 
-## Status
-
-✅ **Ready for use.** All stages (S1–S9) are merged: the ACP SDK × tokio spike
-(S2), pi RPC client (S3), pure translate layer (S4), session state machine
-(S5), the full ACP agent method set with slash commands / settings / startup /
-`usage_update` (S6), session persistence + replay (S7), reliability hardening
-(S8), and cross-platform polish + release (S9). A single static `pi-acp`
-binary is produced per platform via the GitHub Release pipeline.
-
-`pi-acp` is a **drop-in replacement** for the TypeScript `pi-acp` in an existing
-Zed `agent_servers` config — same ACP method surface, same stdio transport.
+- Node.js and npm, to install pi
+- pi installed and available on your `PATH`
+- Zed or another ACP-compatible client
+- Linux (x86-64 or arm64), macOS (Intel or Apple Silicon), or Windows (x86-64)
 
 ## Install
 
-`pi-acp` still needs the **pi coding agent** on your `PATH` at runtime (it
-spawns `pi --mode rpc`). Install pi first:
+### 1. Install pi
 
 ```bash
-npm i -g @earendil-works/pi-coding-agent
+npm install --global @earendil-works/pi-coding-agent
+pi --version
 ```
 
-Then get the `pi-acp` binary:
+### 2. Install pi-acp
 
-**Option A — prebuilt binary (recommended).** Download the latest release for
-your platform from [GitHub Releases](https://github.com/AndPuQing/pi-acp/releases)
-and put it on your `PATH`:
+Download the latest release for your platform from [GitHub Releases](https://github.com/AndPuQing/pi-acp/releases).
 
-| Platform        | Asset                    |
-|-----------------|--------------------------|
-| Linux x86-64    | `pi-acp-linux-x64`       |
-| Linux arm64     | `pi-acp-linux-arm64`     |
-| macOS x86-64    | `pi-acp-macos-x64`       |
-| macOS Apple Silicon | `pi-acp-macos-arm64`     |
-| Windows x86-64  | `pi-acp-windows-x64.exe` |
+| Platform | Release asset |
+| --- | --- |
+| Linux x86-64 | `pi-acp-linux-x64` |
+| Linux arm64 | `pi-acp-linux-arm64` |
+| macOS Intel | `pi-acp-macos-x64` |
+| macOS Apple Silicon | `pi-acp-macos-arm64` |
+| Windows x86-64 | `pi-acp-windows-x64.exe` |
 
-Linux binaries are **musl / statically linked** (no glibc requirement); verify a
-checksum against `CHECKSUMS.txt`.
+On Linux and macOS, make the downloaded file executable and move it to a
+directory on your `PATH`:
 
 ```bash
-# Linux/macOS
-chmod +x pi-acp-linux-x64 && sudo mv pi-acp-linux-x64 /usr/local/bin/pi-acp
-# Windows: put pi-acp-windows-x64.exe on your PATH
+chmod +x pi-acp-<platform>
+sudo mv pi-acp-<platform> /usr/local/bin/pi-acp
+pi-acp --version
 ```
 
-**Option B — build from source** (requires a Rust toolchain; see
-`rust-toolchain.toml`):
+On Windows, keep the `.exe` suffix and add the directory containing
+`pi-acp-windows-x64.exe` to `PATH`. You can also point Zed directly at the full
+path to the executable. The release includes `CHECKSUMS.txt`; verify the
+download's SHA-256 checksum when installing from a release.
 
-```bash
-git clone git@github.com:AndPuQing/pi-acp.git && cd pi-acp
-cargo build --release
-# binary at target/release/pi-acp
-```
+## Configure Zed
 
-## Configure (Zed, drop-in)
-
-In Zed's `settings.json`, point the `pi` agent server at the binary. This
-replaces the TypeScript `pi-acp` command one-for-one:
+Add `pi-acp` to Zed's `settings.json`:
 
 ```json
 {
@@ -83,102 +66,89 @@ replaces the TypeScript `pi-acp` command one-for-one:
 }
 ```
 
-Use an absolute `command` (e.g. `"/usr/local/bin/pi-acp"`) if `pi-acp` is not on
-the `PATH` that Zed inherits. Any `env` you set here is passed to `pi-acp` (and
-inherited by the `pi` child it spawns), so `PI_PROVIDER` / `PI_MODEL` etc. work
-here too.
+Restart or open a new agent thread in Zed. If Zed cannot find a binary installed
+on your shell's `PATH`, use an absolute path instead:
 
-## Environment variables
-
-| Variable                     | Default | Meaning |
-|------------------------------|---------|---------|
-| `PI_ACP_PI_COMMAND`          | `pi`    | Executable to spawn for `pi --mode rpc`. Set this if pi is not named `pi` / not on `PATH`. On Windows this is typically the npm global `pi.cmd`. |
-| `PI_ACP_VERSION_CHECK`       | `false` | Enable the startup "update available" notice (decision 2: **off by default** to keep startup fast). |
-| `PI_ACP_ENABLE_EMBEDDED_CONTEXT` | `false` | Advertise ACP `promptCapabilities.embeddedContext`. |
-| `PI_ACP_RPC_TIMEOUT_SECS`    | `30`    | Per-request `pi` RPC deadline in seconds (fixes the "first prompt hangs forever" class of bugs). |
-| `PI_ACP_SETTLE_TIMEOUT_SECS` | `600`   | Deadline for a turn's `agent_settled` after `pi` accepts the prompt (design §11 risk #84 mitigation: a `pi` that accepts but never settles must not hang `session/prompt` forever). `0` disables the fallback. |
-| `RUST_LOG`                   | `warn`  | Structured log level (e.g. `RUST_LOG=pi_acp=debug`). Logs go to **stderr**, never stdout (stdout is the ACP protocol channel). |
-
-## Platform notes
-
-- **Windows** — `pi` is an npm global, i.e. a `pi.cmd` batch wrapper, not a
-  native `pi.exe`. `pi-acp` resolves a bare `pi` against `PATH`/`PATHEXT` and
-  launches a `.cmd`/`.bat` wrapper via `cmd.exe /d /s /c`, so it works with the
-  default npm install out of the box (fixes upstream pi-acp #27). If your npm
-  dir is not on `PATH`, set `PI_ACP_PI_COMMAND` to the full path of `pi.cmd`.
-- **Missing pi** — if the configured pi command cannot be found, `pi-acp` fails
-  fast with an actionable install hint (npm package + `PI_ACP_PI_COMMAND` + the
-  Windows `pi.cmd` note) instead of hanging.
-- **Dead pi child** — `pi-acp` detects a dead pi subprocess and surfaces a clear
-  error; it does **not** auto-respawn (decision 1). Start a new session
-  (`session/new`) to recover.
-
-## Layout
-
-```
-crates/pi-acp/src/
-├── main.rs            # entry: --terminal-login / --version / ACP stdio server + mock fixture
-├── lib.rs
-├── agent.rs           # ACP Agent role (S6)
-├── config.rs          # env/CLI config
-├── error.rs           # AcpxError (unified error type + ACP RequestError mapping)
-├── session/           # per-session state machine (S5)
-├── pi/
-│   ├── process.rs     # pi subprocess RPC client (S3)
-│   ├── rpc.rs         # pi RPC serde types (S3)
-│   ├── sessions.rs    # session-file scanning (S7)
-│   └── resolve.rs     # pi command resolution / Windows pi.cmd handling (S9)
-├── translate/         # pure pi <-> ACP translation (S4)
-│   ├── messages.rs
-│   ├── tools.rs
-│   ├── bash.rs
-│   └── prompt.rs
-├── commands.rs        # slash commands (S6)
-├── settings.rs        # settings.json merge (S6)
-├── session_store.rs   # session-map.json persistence (S7)
-├── auth.rs            # Terminal Auth (S6/S8)
-└── startup.rs         # startup info + version check (S6)
+```json
+{
+  "agent_servers": {
+    "pi": {
+      "command": "/usr/local/bin/pi-acp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
 ```
 
-## Build & test
+Environment variables in this block are inherited by pi. This is where you can
+set pi options such as `PI_PROVIDER` and `PI_MODEL` if your pi setup uses them.
+
+## Sign in to pi
+
+If pi needs an API key or provider login, run its interactive setup once:
 
 ```bash
-cargo build
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --all -- --check
+pi-acp --terminal-login
 ```
 
-CI runs `fmt` + `clippy -D warnings` + `test` on **Windows / macOS / Linux**,
-plus a `cargo check` smoke across the full release matrix
-(Linux x64/arm64 musl, macOS x64/arm64, Windows x64).
+Complete the setup in the terminal, then start a new agent session in Zed. ACP
+clients that support terminal authentication can also launch this action from
+their authentication prompt.
 
-## Release
+## Configuration
 
-Tag a `vX.Y.Z` (or run the **Release** workflow manually) to build the
-three-platform static binary matrix and publish it as a GitHub Release with
-`CHECKSUMS.txt`. See `.github/workflows/release.yml`.
+Most users can keep the defaults. Set these variables in Zed's `env` block or
+in the environment that launches `pi-acp`:
 
-## Decisions (reviewed 2026-08-31)
+| Variable | Default | Use |
+| --- | --- | --- |
+| `PI_ACP_PI_COMMAND` | `pi` | Path or command name for pi. On Windows, use the full path to the npm-generated `pi.cmd` when it is not on `PATH`. |
+| `PI_ACP_VERSION_CHECK` | `false` | Set to `true` to show a startup notice when a newer pi version is available. |
+| `PI_ACP_ENABLE_EMBEDDED_CONTEXT` | `false` | Set to `true` for ACP clients that send embedded context. |
+| `PI_ACP_RPC_TIMEOUT_SECS` | `30` | Maximum time to wait for an individual pi request. |
+| `PI_ACP_SETTLE_TIMEOUT_SECS` | `600` | Maximum time to wait for pi to finish a turn after accepting a prompt. Set to `0` to disable this fallback. |
+| `RUST_LOG` | `warn` | Set to `pi_acp=debug` for diagnostic logs. Logs are written to stderr so ACP stdout remains available for protocol messages. |
 
-1. Dead `pi` child: **no auto-respawn** — detect and report a clear error.
-2. Startup version check: **off by default** (`PI_ACP_VERSION_CHECK=true` to enable).
-3. First release includes ACP `usage_update` notifications.
-4. Target platforms: **Linux / macOS / Windows** (CI on all three).
+## Troubleshooting
 
-## Roadmap (Multica sub-issues)
+### `pi-acp` or `pi` cannot be found
 
-| Stage | Issue | Scope                                                        | Status |
-|-------|-------|--------------------------------------------------------------|--------|
-| 1     | W-448 | Cargo scaffold + module skeleton + CI (Win/Mac/Linux)        | ✅ |
-| 1     | W-449 | ACP SDK × tokio runtime spike                                 | ✅ |
-| 2     | W-450 | pi RPC client                                                 | ✅ |
-| 2     | W-451 | Translation layer + unit tests                                | ✅ |
-| 3     | W-452 | Session state machine                                         | ✅ |
-| 3     | W-453 | ACP Agent methods + commands + settings + startup             | ✅ |
-| 4     | W-454 | Session persistence + replay                                  | ✅ |
-| 4     | W-455 | Reliability fixes                                             | ✅ |
-| 5     | W-456 | Cross-platform polish + release                               | ✅ |
+Check both commands from a terminal:
+
+```bash
+pi --version
+pi-acp --version
+```
+
+If they work in a terminal but not in Zed, use absolute paths in Zed's
+`command` or set `PI_ACP_PI_COMMAND` to the full path of pi. On Windows, pi is
+usually an npm `pi.cmd` wrapper rather than a native `pi.exe`.
+
+### Authentication fails
+
+Run `pi-acp --terminal-login` and complete the provider setup. If you use
+environment variables for credentials, make sure they are present in Zed's
+`env` block as well as in your shell.
+
+### A session stops unexpectedly
+
+`pi-acp` reports when its pi child process exits and does not restart it
+automatically. Start a new agent session after fixing the underlying pi error.
+Set `RUST_LOG=pi_acp=debug` temporarily if you need more detail.
+
+## Build from source
+
+Prebuilt releases are recommended. To build locally, install the Rust toolchain
+specified by [`rust-toolchain.toml`](rust-toolchain.toml), then run:
+
+```bash
+git clone https://github.com/AndPuQing/pi-acp.git
+cd pi-acp
+cargo build --release
+```
+
+The binary is written to `target/release/pi-acp`.
 
 ## License
 

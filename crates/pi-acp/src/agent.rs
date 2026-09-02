@@ -1966,7 +1966,10 @@ mod tests {
         let changelog = package.join("CHANGELOG.md");
         std::fs::write(&changelog, "changes").unwrap();
 
-        assert_eq!(changelog_near_executable(&bin), Some(changelog));
+        assert_eq!(
+            changelog_near_executable(&bin),
+            Some(std::fs::canonicalize(changelog).unwrap())
+        );
     }
 
     #[test]

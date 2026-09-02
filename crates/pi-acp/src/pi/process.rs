@@ -50,6 +50,11 @@ pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
 /// How long [`PiProcess::dispose`] waits after SIGTERM before escalating to
 /// SIGKILL (pi runs a graceful shutdown handler on SIGTERM).
 const SIGTERM_GRACE: Duration = Duration::from_secs(3);
+/// A just-exited process can briefly keep the runner from accepting another
+/// child (`EAGAIN`, especially on Unix). Retry only that transient condition;
+/// permanent spawn failures still surface immediately.
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(25);
+const SPAWN_RETRY_ATTEMPTS: usize = 120;
 /// Bounded event channel capacity. The reader task awaits sends (backpressure),
 /// so a slow event pump stalls the stream rather than unboundedly buffering.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -166,9 +171,26 @@ impl PiProcess {
             cmd.process_group(0);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AcpxError::PiSpawn(spawn_error(pi_command, &resolved, e)))?;
+        let mut attempts = 0;
+        let mut child = loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) && attempts < SPAWN_RETRY_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(AcpxError::PiSpawn(spawn_error(
+                        pi_command, &resolved, error,
+                    )))
+                }
+            }
+        };
 
         let stdin = child
             .stdin

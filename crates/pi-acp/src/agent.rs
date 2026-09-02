@@ -134,6 +134,22 @@ enum VersionCheck {
     Done(Option<Arc<str>>),
 }
 
+/// Await startup probes that were launched before a session handshake. Error
+/// paths must join them too: dropping a Tokio `JoinHandle` detaches its task,
+/// which can otherwise leave a short-lived probe child running into the next
+/// process-backed ACP fixture.
+async fn drain_startup_tasks(
+    notice_task: Option<tokio::task::JoinHandle<Option<String>>>,
+    version_task: Option<tokio::task::JoinHandle<Option<String>>>,
+) {
+    if let Some(task) = notice_task {
+        let _ = task.await;
+    }
+    if let Some(task) = version_task {
+        let _ = task.await;
+    }
+}
+
 /// The per-connection agent: shared state behind every handler.
 pub struct AcpAgent {
     cfg: Config,
@@ -424,9 +440,16 @@ impl AcpAgent {
             ));
         }
 
-        let session = self
+        let session = match self
             .spawn_session(Some(&req.cwd), None, None, cx, file_commands.clone())
-            .await?;
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                drain_startup_tasks(notice_task.take(), version_task.take()).await;
+                return Err(err);
+            }
+        };
         let session_id = session.session_id().clone();
 
         // Fetch state + models once (parallel) to reduce startup latency.
@@ -441,21 +464,25 @@ impl AcpAgent {
             if maybe_auth_required_error(&err.to_string()).is_some() {
                 self.cleanup_failed_new_session(&session, state.as_ref())
                     .await;
+                drain_startup_tasks(notice_task.take(), version_task.take()).await;
                 return Err(auth_required());
             }
             self.cleanup_failed_new_session(&session, state.as_ref())
                 .await;
+            drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(AcpError::new(ACP_INTERNAL_ERROR, err.to_string()));
         }
         let raw_models_count = available_models.as_ref().map(Vec::len).unwrap_or(0);
         if raw_models_count == 0 {
             self.cleanup_failed_new_session(&session, state.as_ref())
                 .await;
+            drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(auth_required());
         }
         if let Some(err) = state_res.as_ref().err() {
             if maybe_auth_required_error(&err.to_string()).is_some() {
                 self.cleanup_failed_new_session(&session, None).await;
+                drain_startup_tasks(notice_task.take(), version_task.take()).await;
                 return Err(auth_required());
             }
         }
@@ -472,7 +499,7 @@ impl AcpAgent {
                 .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
         }
 
-        let update_notice = if let Some(task) = notice_task {
+        let update_notice = if let Some(task) = notice_task.take() {
             // The check has been running in parallel with the handshake; await
             // it (its internal timeouts bound the wait) and cache the result.
             let notice = task.await.unwrap_or(None);
@@ -485,7 +512,7 @@ impl AcpAgent {
             }
         };
         let prelude_text = {
-            let pi_version = match version_task {
+            let pi_version = match version_task.take() {
                 Some(task) => task.await.unwrap_or(None),
                 None => None,
             };

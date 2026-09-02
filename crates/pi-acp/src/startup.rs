@@ -254,6 +254,7 @@ pub async fn fetch_pi_version(pi_command: &str) -> Option<String> {
         let output = tokio::process::Command::new(&resolved.program)
             .args(&resolved.cmd_args)
             .arg("--version")
+            .kill_on_drop(true)
             .output()
             .await
             .ok()?;
@@ -286,6 +287,7 @@ pub async fn build_update_notice(pi_command: &str) -> Option<String> {
         async {
             let output = tokio::process::Command::new("npm")
                 .args(["view", "@earendil-works/pi-coding-agent", "version"])
+                .kill_on_drop(true)
                 .output()
                 .await
                 .ok()?;

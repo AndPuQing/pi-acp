@@ -288,17 +288,30 @@ impl PiAcpSession {
             params.timeout,
         )
         .await?;
-        let state = proc.get_state().await?;
+        let state = match proc.get_state().await {
+            Ok(state) => state,
+            Err(err) => {
+                // The process is owned locally until the pump is installed;
+                // dispose it here so a failed startup cannot orphan the pi
+                // child while the caller handles the handshake error.
+                proc.dispose().await;
+                return Err(err);
+            }
+        };
         let session_id = params
             .session_id_override
             .unwrap_or_else(|| state.session_id.clone().into());
         tracing::info!(session_id = %session_id.0, "pi session ready");
-        let event_rx = proc
-            .take_event_receiver()
-            .ok_or_else(|| AcpxError::RpcFailed {
-                command: "session".into(),
-                message: "pi event channel already taken".into(),
-            })?;
+        let event_rx = match proc.take_event_receiver() {
+            Some(event_rx) => event_rx,
+            None => {
+                proc.dispose().await;
+                return Err(AcpxError::RpcFailed {
+                    command: "session".into(),
+                    message: "pi event channel already taken".into(),
+                });
+            }
+        };
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (prompt_tx, prompt_rx) = mpsc::channel(4);

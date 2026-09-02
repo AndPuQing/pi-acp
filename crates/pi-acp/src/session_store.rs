@@ -11,7 +11,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,6 +20,14 @@ use crate::settings::agent_dir;
 use crate::time::utc_now_iso8601;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes map-file read-modify-write transactions across all stores in
+/// this process. An ACP agent normally owns one store, but tests and embedded
+/// callers can create more than one store for the same path.
+fn session_store_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// One stored session entry (mirrors TS `StoredSession`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,11 +104,14 @@ impl SessionStore {
     where
         F: FnOnce(&mut SessionMapFile) -> bool,
     {
-        // Keep the cache lock across load, mutation, and atomic replacement.
-        // The store is used by concurrent ACP handlers, so separating load()
-        // and save() would allow two read-modify-write operations to lose data.
+        // The file lock covers the disk reload, mutation, and replacement. Do
+        // not use a possibly stale per-store cache as the transaction base:
+        // another SessionStore may have committed since this store was read.
+        let _file_lock = session_store_lock()
+            .lock()
+            .expect("session store file lock poisoned");
         let mut cache = self.cache.lock().expect("session store cache poisoned");
-        let mut db = cache.clone().unwrap_or_else(|| load_file(&self.path));
+        let mut db = load_file(&self.path);
         if update(&mut db) && atomic_write_json(&self.path, &db) {
             *cache = Some(db);
         }
@@ -145,7 +156,7 @@ fn load_file(path: &Path) -> SessionMapFile {
     }
 }
 
-/// Write the map file atomically: temp file in the same directory + rename.
+/// Write the map file through a same-directory temp file and replacement.
 fn atomic_write_json(path: &Path, db: &SessionMapFile) -> bool {
     let Some(parent) = path.parent() else {
         return false;
@@ -173,7 +184,7 @@ fn atomic_write_json(path: &Path, db: &SessionMapFile) -> bool {
             .open(&tmp)?;
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
-        fs::rename(&tmp, path)?;
+        replace_file(&tmp, path)?;
         Ok(())
     })();
     if let Err(e) = write {
@@ -182,6 +193,29 @@ fn atomic_write_json(path: &Path, db: &SessionMapFile) -> bool {
         false
     } else {
         true
+    }
+}
+
+/// Replace the destination with the completed temp file. Unix rename replaces
+/// an existing file atomically. The standard Windows rename API rejects an
+/// existing destination, so use its best available two-step fallback there;
+/// all callers are serialized by [`session_store_lock`].
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        match fs::rename(tmp, path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(path)?;
+                fs::rename(tmp, path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, path)
     }
 }
 
@@ -272,6 +306,26 @@ mod tests {
         for i in 0..16 {
             assert!(fresh.get(&format!("session-{i}")).is_some());
         }
+    }
+
+    #[test]
+    fn independent_stores_do_not_lose_read_modify_write_updates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("map.json");
+        let first = SessionStore::at(path.clone());
+        let second = SessionStore::at(path.clone());
+
+        // Prime both caches before either writer runs. A per-instance cache
+        // lock alone would make the second upsert overwrite the first entry.
+        assert!(first.get("first").is_none());
+        assert!(second.get("second").is_none());
+
+        first.upsert("first", "/one", "/one/session.jsonl");
+        second.upsert("second", "/two", "/two/session.jsonl");
+
+        let fresh = SessionStore::at(path);
+        assert!(fresh.get("first").is_some());
+        assert!(fresh.get("second").is_some());
     }
 
     #[test]

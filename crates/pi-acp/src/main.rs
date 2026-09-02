@@ -181,6 +181,10 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-cwd-log <path>`      write the mock's startup cwd
 /// - `--mock-prompt-error <text>`   answer `prompt` with `success:false` and this
 ///   error text (auth/error-surfacing tests)
+/// - `--mock-prompt-hang`          accept/read `prompt` but withhold its response;
+///   a later `abort` is still processed (cancel race tests)
+/// - `--mock-prompt-response-after-events-ms <n>` delay each successful prompt
+///   response until its scenario events have been emitted (channel-order tests)
 /// - `--mock-models-error <text>`   answer `get_available_models` with
 ///   `success:false` and this error text (authRequired-on-new tests)
 ///
@@ -206,6 +210,8 @@ async fn run_mock_rpc() -> Result<()> {
     let mut extension_log: Option<PathBuf> = None;
     let mut cwd_log: Option<PathBuf> = None;
     let mut prompt_error: Option<String> = None;
+    let mut prompt_hang = false;
+    let mut prompt_response_after_events_ms: u64 = 0;
     let mut models_error: Option<String> = None;
     let mut prompt_count: usize = 0;
     // Stateful mock: real pi keeps these across RPC calls, and the agent's
@@ -235,6 +241,11 @@ async fn run_mock_rpc() -> Result<()> {
             "--mock-extension-log" => extension_log = args.next().map(PathBuf::from),
             "--mock-cwd-log" => cwd_log = args.next().map(PathBuf::from),
             "--mock-prompt-error" => prompt_error = args.next(),
+            "--mock-prompt-hang" => prompt_hang = true,
+            "--mock-prompt-response-after-events-ms" => {
+                prompt_response_after_events_ms =
+                    args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
             "--mock-models-error" => models_error = args.next(),
             _ => {}
         }
@@ -323,6 +334,14 @@ async fn run_mock_rpc() -> Result<()> {
 
         if let Some(log) = &command_log {
             append_log(log, ty);
+        }
+
+        // Keep reading after a prompt without producing its early response so
+        // the client can prove that cancellation does not wait on the prompt
+        // request's ownership guard. The abort branch below still settles it.
+        if prompt_hang && ty == "prompt" {
+            handled += 1;
+            continue;
         }
 
         // Fire-and-forget extension answers: pi matches these by the request's
@@ -448,7 +467,11 @@ async fn run_mock_rpc() -> Result<()> {
         } else if !data.is_null() {
             response["data"] = data;
         }
-        mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
+        let delay_prompt_response =
+            success && ty == "prompt" && prompt_response_after_events_ms > 0;
+        if !delay_prompt_response {
+            mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
+        }
         handled += 1;
 
         // Mirror pi: `setSessionName` emits `session_info_changed` on the event
@@ -482,6 +505,13 @@ async fn run_mock_rpc() -> Result<()> {
                 }
             } else if !no_settle {
                 emit_default_prompt_response(&mut stdout).await?;
+            }
+            if delay_prompt_response {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    prompt_response_after_events_ms,
+                ))
+                .await;
+                mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
             }
         } else if success && ty == "abort" {
             // pi settles once an aborted turn unwinds.

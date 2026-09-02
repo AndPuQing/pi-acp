@@ -33,7 +33,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use crate::error::{AcpxError, Result};
@@ -73,12 +73,21 @@ struct Shared {
     prelude: Mutex<Vec<String>>,
 }
 
+/// The request transport shared with session operations. Its stdin lock only
+/// covers one JSONL write; it is never held while waiting for a response.
+pub(crate) struct RpcClient {
+    stdin: Arc<AsyncMutex<ChildStdin>>,
+    next_id: Arc<AtomicU64>,
+    timeout: Duration,
+    shared: Arc<Shared>,
+}
+
 /// A spawned `pi --mode rpc` child process plus its JSONL request/response
 /// plumbing.
 pub struct PiProcess {
-    stdin: ChildStdin,
+    stdin: Arc<AsyncMutex<ChildStdin>>,
     /// Monotonic id source for pi RPC requests (matched back by `id`).
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     /// Per-request deadline.
     timeout: Duration,
     shared: Arc<Shared>,
@@ -224,8 +233,8 @@ impl PiProcess {
         let watcher = tokio::spawn(wait_loop(child, watcher_shared));
 
         Ok(Self {
-            stdin,
-            next_id: AtomicU64::new(0),
+            stdin: Arc::new(AsyncMutex::new(stdin)),
+            next_id: Arc::new(AtomicU64::new(0)),
             timeout,
             shared,
             events: Some(events_rx),
@@ -234,16 +243,24 @@ impl PiProcess {
         })
     }
 
-    fn next_id(&self) -> String {
-        self.next_id.fetch_add(1, Ordering::Relaxed).to_string()
+    /// Clone the request transport for session operations that must run while
+    /// another RPC is waiting for its response.
+    pub(crate) fn request_client(&self) -> Arc<RpcClient> {
+        Arc::new(RpcClient {
+            stdin: self.stdin.clone(),
+            next_id: self.next_id.clone(),
+            timeout: self.timeout,
+            shared: self.shared.clone(),
+        })
     }
 
     /// Write a single JSON line to pi's stdin.
-    async fn write_line(&mut self, value: &Value) -> std::io::Result<()> {
+    async fn write_line(&self, value: &Value) -> std::io::Result<()> {
         let mut line = value.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
         Ok(())
     }
 
@@ -253,60 +270,13 @@ impl PiProcess {
     /// [`AcpxError::RpcFailed`]. A child exit while awaiting rejects the
     /// request with [`AcpxError::PiExited`] (fixes #82).
     pub async fn request(&mut self, command: &RpcCommand) -> Result<Value> {
-        self.request_response(command).await?.ok()
+        self.request_client().request(command).await
     }
 
     /// [`PiProcess::request`] without unwrapping `data` — callers that need the
     /// full response envelope (e.g. to distinguish error payloads) use this.
     pub async fn request_response(&mut self, command: &RpcCommand) -> Result<RpcResponse> {
-        // Fail fast on a dead child instead of writing into a broken pipe and
-        // hoping for a timeout (design D3; fixes #82's silent empty end_turn).
-        if let Some((code, signal)) = self.exit_status() {
-            return Err(AcpxError::PiExited { code, signal });
-        }
-
-        let id = self.next_id();
-        let mut msg = serde_json::to_value(command)?;
-        msg["id"] = Value::String(id.clone());
-
-        let (tx, rx) = oneshot::channel();
-        self.shared.pending.lock().await.insert(id.clone(), tx);
-
-        if let Err(e) = self.write_line(&msg).await {
-            // Write failed (EPIPE etc.): the request never reached pi — drop the
-            // pending entry and surface the io error.
-            self.shared.pending.lock().await.remove(&id);
-            return Err(e.into());
-        }
-
-        let timeout = self.timeout;
-        let secs = timeout.as_secs();
-        match tokio::time::timeout(timeout, rx).await {
-            // The pending map stores `oneshot::Sender<Result<Value>>`: the outer
-            // `Ok` is the oneshot completing, the inner is the reader's/watcher's
-            // payload (`Ok(response)` / `Err(PiExited)`).
-            Ok(Ok(Ok(res))) => serde_json::from_value(res).map_err(Into::into),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => {
-                // Sender dropped without a payload (stream ended before the
-                // watcher rejected pending) — treat as a dead process.
-                self.shared.pending.lock().await.remove(&id);
-                Err(AcpxError::PiExited {
-                    code: None,
-                    signal: None,
-                })
-            }
-            Err(_) => {
-                // Deadline hit; drop the pending entry so a late response is
-                // routed to the event channel as `UnmatchedResponse` instead of
-                // resolving a vanished request.
-                self.shared.pending.lock().await.remove(&id);
-                Err(AcpxError::RpcTimeout {
-                    cmd: command.name().to_string(),
-                    secs,
-                })
-            }
-        }
+        self.request_client().request_response(command).await
     }
 
     /// The next pi event, or `None` once the event stream has ended (reader
@@ -343,13 +313,22 @@ impl PiProcess {
         *self.shared.exit.lock().unwrap()
     }
 
-    /// Wait (bounded) for the watcher to observe the child's exit, then return
-    /// the settled exit status. The reader may observe stdout EOF a moment
-    /// before the watcher reaps the child; sessions call this when the event
-    /// stream ends so the death error carries the real exit code (S8 / #82).
+    /// Wait (bounded) for the watcher to publish the child's exit status, then
+    /// return it. This polls shared state instead of polling the JoinHandle so
+    /// the teardown path can still await that handle exactly once.
     pub async fn wait_exited(&mut self, timeout: Duration) -> Option<(Option<i32>, Option<i32>)> {
-        let _ = tokio::time::timeout(timeout, &mut self.watcher).await;
-        self.exit_status()
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.exit_status() {
+                return Some(status);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return self.exit_status();
+            }
+            let remaining = deadline - now;
+            tokio::time::sleep(remaining.min(Duration::from_millis(1))).await;
+        }
     }
 
     /// Send a `prompt` command and stream each pi event to `on_event` until the
@@ -551,6 +530,124 @@ impl PiProcess {
         }
         // Close the event stream: any pump sees `None` and stops.
         self.events = None;
+    }
+}
+
+impl RpcClient {
+    fn next_id(&self) -> String {
+        self.next_id.fetch_add(1, Ordering::Relaxed).to_string()
+    }
+
+    /// Write a single JSON line to pi's stdin. The lock covers only the write
+    /// and flush, so another request can wait for its response concurrently.
+    async fn write_line(&self, value: &Value) -> std::io::Result<()> {
+        let mut line = value.to_string();
+        line.push('\n');
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn request(&self, command: &RpcCommand) -> Result<Value> {
+        self.request_response(command).await?.ok()
+    }
+
+    /// Send a request and notify `started` once its JSON line has been written
+    /// and flushed. Session cancellation uses this to keep `abort` behind the
+    /// prompt write while still allowing both responses to be awaited
+    /// independently.
+    pub(crate) async fn request_with_started(
+        &self,
+        command: &RpcCommand,
+        started: oneshot::Sender<()>,
+    ) -> Result<Value> {
+        self.request_response_with_started(command, Some(started))
+            .await?
+            .ok()
+    }
+
+    pub(crate) async fn send_extension_ui_response(
+        &self,
+        response: ExtensionUiResponse,
+    ) -> Result<()> {
+        let mut msg = serde_json::to_value(response)?;
+        msg["type"] = Value::String("extension_ui_response".into());
+        self.write_line(&msg).await?;
+        Ok(())
+    }
+
+    async fn request_response(&self, command: &RpcCommand) -> Result<RpcResponse> {
+        self.request_response_with_started(command, None).await
+    }
+
+    async fn request_response_with_started(
+        &self,
+        command: &RpcCommand,
+        started: Option<oneshot::Sender<()>>,
+    ) -> Result<RpcResponse> {
+        // Fail fast on a dead child instead of writing into a broken pipe and
+        // hoping for a timeout (design D3; fixes #82's silent empty end_turn).
+        if let Some((code, signal)) = *self.shared.exit.lock().unwrap() {
+            return Err(AcpxError::PiExited { code, signal });
+        }
+
+        let id = self.next_id();
+        let mut msg = serde_json::to_value(command)?;
+        msg["id"] = Value::String(id.clone());
+
+        let (tx, rx) = oneshot::channel();
+        self.shared.pending.lock().await.insert(id.clone(), tx);
+
+        match tokio::time::timeout(self.timeout, self.write_line(&msg)).await {
+            Ok(Ok(())) => {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+            }
+            Ok(Err(e)) => {
+                // Write failed (EPIPE etc.): the request never reached pi —
+                // drop the pending entry and surface the io error.
+                self.shared.pending.lock().await.remove(&id);
+                return Err(e.into());
+            }
+            Err(_) => {
+                self.shared.pending.lock().await.remove(&id);
+                return Err(AcpxError::RpcTimeout {
+                    cmd: command.name().to_string(),
+                    secs: self.timeout.as_secs(),
+                });
+            }
+        }
+
+        let timeout = self.timeout;
+        let secs = timeout.as_secs();
+        match tokio::time::timeout(timeout, rx).await {
+            // The pending map stores `oneshot::Sender<Result<Value>>`: the outer
+            // `Ok` is the oneshot completing, the inner is the reader's/watcher's
+            // payload (`Ok(response)` / `Err(PiExited)`).
+            Ok(Ok(Ok(res))) => serde_json::from_value(res).map_err(Into::into),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => {
+                // Sender dropped without a payload (stream ended before the
+                // watcher rejected pending) — treat as a dead process.
+                self.shared.pending.lock().await.remove(&id);
+                Err(AcpxError::PiExited {
+                    code: None,
+                    signal: None,
+                })
+            }
+            Err(_) => {
+                // Deadline hit; drop the pending entry so a late response is
+                // routed to the event channel as `UnmatchedResponse` instead
+                // of resolving a vanished request.
+                self.shared.pending.lock().await.remove(&id);
+                Err(AcpxError::RpcTimeout {
+                    cmd: command.name().to_string(),
+                    secs,
+                })
+            }
+        }
     }
 }
 

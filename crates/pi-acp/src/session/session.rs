@@ -51,7 +51,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{AcpxError, Result};
-use crate::pi::process::PiProcess;
+use crate::pi::process::{PiProcess, RpcClient};
 use crate::pi::rpc::{
     AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
     RpcCommand, RpcEvent, Usage,
@@ -194,6 +194,28 @@ struct QueuedTurn {
 /// The currently running turn.
 struct PendingTurn {
     resolve: oneshot::Sender<Result<StopReason>>,
+    /// Monotonic identity for the prompt RPC that owns this turn. Pi events do
+    /// not carry a turn id, but prompt responses do arrive through a separate
+    /// channel, so this prevents a late response from an earlier turn from
+    /// mutating the current turn's deadline or result.
+    turn_id: u64,
+    /// Whether pi has acknowledged the prompt RPC. Normally this precedes all
+    /// events, but separate response/event channels can be observed in either
+    /// order by the pump.
+    prompt_accepted: bool,
+    /// An `agent_settled` observed before the prompt response. Keep it until
+    /// the matching response confirms that it belongs to this turn.
+    settled_before_accept: bool,
+    /// Completes once the prompt JSON line is written. Cancellation waits for
+    /// this before sending abort so abort cannot overtake a prompt that has not
+    /// reached pi yet.
+    prompt_started: Option<oneshot::Receiver<()>>,
+}
+
+/// Result of the early prompt RPC, tagged with the turn that sent it.
+struct PromptResult {
+    turn_id: u64,
+    result: std::result::Result<(), AcpxError>,
 }
 
 /// Monotonic tool-call status tracked by the session. pi may surface a tool
@@ -220,6 +242,9 @@ struct FileSnapshot {
 /// Per-session state machine state, owned by the pump task.
 struct Pump {
     proc: Arc<Mutex<PiProcess>>,
+    /// Shared request transport. Request waits do not hold `proc`, allowing
+    /// cancellation to send `abort` while the prompt response is pending.
+    rpc: Arc<RpcClient>,
     outbound: mpsc::Sender<OutboundMessage>,
     session_id: SessionId,
     cwd: PathBuf,
@@ -234,9 +259,9 @@ struct Pump {
     extension_tx: mpsc::Sender<ExtensionUiResponse>,
     /// Receives the result of the in-flight `prompt` RPC (the *early*
     /// acceptance response — the turn itself completes at `agent_settled`).
-    prompt_rx: mpsc::Receiver<std::result::Result<(), AcpxError>>,
+    prompt_rx: mpsc::Receiver<PromptResult>,
     /// Held open so `prompt_rx.recv()` parks when no prompt is in flight.
-    _prompt_tx: mpsc::Sender<std::result::Result<(), AcpxError>>,
+    _prompt_tx: mpsc::Sender<PromptResult>,
     /// Shared death record; set at teardown when pi exited unexpectedly so the
     /// [`PiAcpSession`] handle fails later commands with [`AcpxError::PiExited`].
     death: Arc<std::sync::Mutex<PiExitStatus>>,
@@ -246,6 +271,7 @@ struct Pump {
     /// Client-side one-at-a-time turn queue.
     queue: VecDeque<QueuedTurn>,
     pending_turn: Option<PendingTurn>,
+    next_turn_id: u64,
     /// Maps abort semantics to the ACP stop reason for the running turn.
     cancel_requested: bool,
     /// A turn failure leaves pi's event stream ambiguous (late settle events
@@ -302,6 +328,7 @@ impl PiAcpSession {
             .session_id_override
             .unwrap_or_else(|| state.session_id.clone().into());
         tracing::info!(session_id = %session_id.0, "pi session ready");
+        let rpc = proc.request_client();
         let event_rx = match proc.take_event_receiver() {
             Some(event_rx) => event_rx,
             None => {
@@ -319,6 +346,7 @@ impl PiAcpSession {
         let death = Arc::new(std::sync::Mutex::new(None));
         let pump = Pump {
             proc: Arc::new(Mutex::new(proc)),
+            rpc,
             outbound: params.outbound.clone(),
             session_id: session_id.clone(),
             cwd: params.cwd.clone(),
@@ -332,6 +360,7 @@ impl PiAcpSession {
             pi_died: false,
             queue: VecDeque::new(),
             pending_turn: None,
+            next_turn_id: 0,
             cancel_requested: false,
             poisoned: false,
             in_agent_loop: false,
@@ -729,14 +758,23 @@ impl Pump {
             self.emit_queue_depth(self.pending_turn.is_some()).await;
         }
 
+        // The prompt is sent from a spawned task so the pump can service
+        // cancellation while its response is pending. Preserve the wire
+        // ordering by waiting only for the write/flush milestone, never for
+        // the prompt response itself.
+        let prompt_started = self
+            .pending_turn
+            .as_mut()
+            .and_then(|pending| pending.prompt_started.take());
+        if let Some(prompt_started) = prompt_started {
+            let _ = prompt_started.await;
+        }
+
         // Complete the abort before the pump handles another command/event.
         // This keeps a delayed abort from acquiring the process mutex after a
         // queued turn has already started. The resulting agent_settled event
         // is buffered by the event channel while the RPC is in flight.
-        let result = {
-            let mut proc = self.proc.lock().await;
-            proc.abort().await
-        };
+        let result = self.rpc.request(&RpcCommand::Abort).await.map(|_| ());
         if result.is_err() {
             // Without a confirmed abort, pi may still settle asynchronously;
             // retire the session so that event cannot resolve a later turn.
@@ -754,16 +792,14 @@ impl Pump {
     }
 
     async fn on_extension_ui_response(&mut self, resp: ExtensionUiResponse) {
-        let mut proc = self.proc.lock().await;
-        if let Err(e) = proc.send_extension_ui_response(resp).await {
+        if let Err(e) = self.rpc.send_extension_ui_response(resp).await {
             tracing::warn!(error = %e, "failed to write extension_ui_response to pi");
         }
     }
 
     /// Run one delegated pi RPC command (thin agent delegation).
     async fn on_rpc(&mut self, command: RpcCommand, respond: oneshot::Sender<Result<Value>>) {
-        let mut proc = self.proc.lock().await;
-        let result = proc.request(&command).await;
+        let result = self.rpc.request(&command).await;
         let _ = respond.send(result);
     }
 
@@ -772,56 +808,103 @@ impl Pump {
     /// pi died — resolve the pending turn explicitly (TS parity), surfacing
     /// the error per design D5, and do **not** auto-start queued turns (pi may
     /// be unhealthy).
-    async fn on_prompt_result(&mut self, result: Option<std::result::Result<(), AcpxError>>) {
-        let result = match result {
-            Some(Ok(())) | None => {
-                // Accepted: arm the settle fallback (design §11 risk #84). The
-                // turn completes at `agent_settled`; without a deadline a pi
-                // that accepts a prompt but never settles would hang
-                // `session/prompt` forever — the per-request RPC timeout only
-                // bounds the early response, not the settle wait.
-                if self.settle_timeout > Duration::ZERO {
+    async fn on_prompt_result(&mut self, prompt: Option<PromptResult>) {
+        let Some(PromptResult { turn_id, result }) = prompt else {
+            return;
+        };
+
+        let Some(pending) = self.pending_turn.as_ref() else {
+            tracing::debug!(
+                turn_id,
+                "late prompt response with no pending turn; ignoring"
+            );
+            return;
+        };
+        if pending.turn_id != turn_id {
+            tracing::debug!(
+                turn_id,
+                current_turn_id = pending.turn_id,
+                "late prompt response; ignoring"
+            );
+            return;
+        }
+
+        match result {
+            Ok(()) => {
+                // The response and event channels are separate. A fast pi can
+                // therefore put agent_settled in the event channel before the
+                // pump observes this response even though pi wrote the
+                // response first. Mark the response before deciding whether a
+                // buffered settle can complete this turn.
+                let settled_before_accept = {
+                    let pending = self
+                        .pending_turn
+                        .as_mut()
+                        .expect("pending turn checked above");
+                    pending.prompt_accepted = true;
+                    pending.settled_before_accept
+                };
+                if settled_before_accept {
+                    self.settle_pending_turn().await;
+                } else if self.settle_timeout > Duration::ZERO {
+                    // Accepted: arm the settle fallback (design §11 risk #84).
+                    // The turn completes at `agent_settled`; the per-request
+                    // RPC timeout only bounds the early response.
                     self.settle_deadline = Some(tokio::time::Instant::now() + self.settle_timeout);
                 }
-                return;
             }
-            Some(Err(e)) => e,
-        };
-        self.settle_deadline = None;
-        let Some(pending) = self.pending_turn.take() else {
-            return; // already settled (defensive)
-        };
-        self.flush_outbound().await;
-        let _ = pending.resolve.send(Err(result));
-        self.fail_queued_turns();
-        self.poisoned = true;
-        self.in_agent_loop = false;
-        self.emit_queue_depth(false).await;
+            Err(result) => {
+                self.settle_deadline = None;
+                let Some(pending) = self.pending_turn.take() else {
+                    return;
+                };
+                self.flush_outbound().await;
+                let _ = pending.resolve.send(Err(result));
+                self.fail_queued_turns();
+                self.poisoned = true;
+                self.cancel_requested = false;
+                self.in_agent_loop = false;
+                self.emit_queue_depth(false).await;
+            }
+        }
     }
 
     async fn start_turn(&mut self, queued: QueuedTurn) {
         self.cancel_requested = false;
         self.in_agent_loop = false;
+        let turn_id = self.next_turn_id;
+        self.next_turn_id += 1;
+        let (prompt_started_tx, prompt_started_rx) = oneshot::channel();
         self.pending_turn = Some(PendingTurn {
             resolve: queued.resolve,
+            turn_id,
+            prompt_accepted: false,
+            settled_before_accept: false,
+            prompt_started: Some(prompt_started_rx),
         });
         self.emit_queue_depth(true).await;
 
         // Send the prompt in a spawned task so the pump keeps servicing
         // commands (cancel) and events while the early response is in flight.
-        let proc = self.proc.clone();
+        let rpc = self.rpc.clone();
         let tx = self._prompt_tx.clone();
         tokio::spawn(async move {
-            let result = {
-                let mut p = proc.lock().await;
-                p.request(&RpcCommand::Prompt {
-                    message: queued.message,
-                    images: Some(queued.images),
-                    streaming_behavior: None,
+            let result = rpc
+                .request_with_started(
+                    &RpcCommand::Prompt {
+                        message: queued.message,
+                        images: Some(queued.images),
+                        streaming_behavior: None,
+                    },
+                    prompt_started_tx,
+                )
+                .await;
+            let _ = tx
+                .send(PromptResult {
+                    turn_id,
+                    result: result.map(|_| ()),
                 })
-                .await
-            };
-            let _ = tx.send(result.map(|_| ())).await;
+                .await;
         });
     }
 
@@ -1007,12 +1090,33 @@ impl Pump {
         }
     }
 
+    /// Handle pi's turn-completion event. The event does not carry a turn id,
+    /// so an event observed before the matching prompt response is held until
+    /// that response confirms the turn. During cancellation, the abort is the
+    /// confirmation that an early response is no longer required.
+    async fn on_agent_settled(&mut self) {
+        if let Some(pending) = self.pending_turn.as_mut() {
+            if !pending.prompt_accepted && !self.cancel_requested {
+                pending.settled_before_accept = true;
+                tracing::debug!(
+                    turn_id = pending.turn_id,
+                    "agent_settled arrived before prompt response; buffering"
+                );
+                return;
+            }
+        } else {
+            tracing::debug!("agent_settled with no pending turn; ignoring");
+            return;
+        }
+        self.settle_pending_turn().await;
+    }
+
     /// The turn is truly over. Resolve the pending ACP prompt, then either
     /// start the next queued turn or publish the idle queue depth.
-    async fn on_agent_settled(&mut self) {
+    async fn settle_pending_turn(&mut self) {
         self.settle_deadline = None;
         let Some(pending) = self.pending_turn.take() else {
-            tracing::debug!("agent_settled with no pending turn; ignoring");
+            tracing::debug!("settling with no pending turn; ignoring");
             return;
         };
         // All streamed updates derived from pi events are delivered before the
@@ -1036,6 +1140,7 @@ impl Pump {
         } else {
             self.emit_queue_depth(false).await;
         }
+        self.cancel_requested = false;
     }
 
     /// pi's stdout ended without a settle: the process exited mid-turn. Fail
@@ -1043,10 +1148,15 @@ impl Pump {
     /// (fixes #82 — a dead pi is never a silent empty `end_turn`).
     async fn on_stream_end(&mut self) {
         self.settle_deadline = None;
-        let (code, signal) = {
-            let proc = self.proc.lock().await;
-            proc.exit_status().unwrap_or((None, None))
+        // The reader can observe stdout EOF just before Child::wait() records
+        // the exit status. Give the watcher a short polling window before
+        // rejecting turns so a real exit code is not lost in that race. The
+        // helper polls shared state, leaving the JoinHandle for teardown.
+        let status = {
+            let mut proc = self.proc.lock().await;
+            proc.wait_exited(Duration::from_millis(200)).await
         };
+        let (code, signal) = status.unwrap_or((None, None));
         let pending_err = AcpxError::PiExited { code, signal };
         self.flush_outbound().await;
         if let Some(p) = self.pending_turn.take() {
@@ -1082,9 +1192,9 @@ impl Pump {
         // Best-effort: tell pi to stop whatever it accepted (it may still be
         // inside an agent loop; the resulting late `agent_settled` is ignored
         // — the pending turn is already resolved).
-        let proc = self.proc.clone();
+        let rpc = self.rpc.clone();
         tokio::spawn(async move {
-            if let Err(e) = proc.lock().await.abort().await {
+            if let Err(e) = rpc.request(&RpcCommand::Abort).await {
                 tracing::warn!(error = %e, "abort after settle timeout failed");
             }
         });

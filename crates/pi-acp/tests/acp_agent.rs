@@ -359,24 +359,30 @@ async fn full_method_set_against_mock_pi() {
             // 4. built-in slash commands
             // ---------------------------------------------------------------
             println!("full_method: slash commands");
+            println!("full_method: compact");
             let compact = cx
                 .send_request(prompt_for(&sid, "/compact fix the context"))
                 .block_task()
                 .await?;
+            println!("full_method: compact complete");
             assert_eq!(compact.stop_reason, StopReason::EndTurn);
             let text = all_text(&log.lock().await.clone());
             assert!(text.contains("Compaction completed. (custom instructions applied)"), "{text}");
             assert!(text.contains("Tokens before: 1500"), "{text}");
             assert!(text.contains("The conversation was summarized."), "{text}");
 
+            println!("full_method: session stats");
             let stats = cx.send_request(prompt_for(&sid, "/session")).block_task().await?;
+            println!("full_method: session stats complete");
             assert_eq!(stats.stop_reason, StopReason::EndTurn);
             let text = all_text(&log.lock().await.clone());
             assert!(text.contains("Session: mock-session-id"), "{text}");
             assert!(text.contains("Messages: 3"), "{text}");
             assert!(text.contains("Tokens: in 100, out 50, cache read 10, cache write 5, total 165"), "{text}");
 
+            println!("full_method: name");
             let named = cx.send_request(prompt_for(&sid, "/name My Session")).block_task().await?;
+            println!("full_method: name complete");
             assert_eq!(named.stop_reason, StopReason::EndTurn);
             let text = all_text(&log.lock().await.clone());
             assert!(text.contains("Session name set: My Session"), "{text}");
@@ -399,26 +405,38 @@ async fn full_method_set_against_mock_pi() {
             .await;
             assert_eq!(named_updates.len(), 2);
 
+            println!("full_method: steering show");
             let steer_show = cx.send_request(prompt_for(&sid, "/steering")).block_task().await?;
+            println!("full_method: steering show complete");
             assert_eq!(steer_show.stop_reason, StopReason::EndTurn);
             assert!(all_text(&log.lock().await.clone()).contains("Steering mode: one-at-a-time"));
 
+            println!("full_method: steering set");
             let steer_set = cx.send_request(prompt_for(&sid, "/steering all")).block_task().await?;
+            println!("full_method: steering set complete");
             assert_eq!(steer_set.stop_reason, StopReason::EndTurn);
             assert!(all_text(&log.lock().await.clone()).contains("Steering mode set to: all"));
 
+            println!("full_method: follow-up");
             let follow = cx.send_request(prompt_for(&sid, "/follow-up one-at-a-time")).block_task().await?;
+            println!("full_method: follow-up complete");
             assert_eq!(follow.stop_reason, StopReason::EndTurn);
             assert!(all_text(&log.lock().await.clone()).contains("Follow-up mode set to: one-at-a-time"));
 
+            println!("full_method: autocompact");
             let auto = cx.send_request(prompt_for(&sid, "/autocompact")).block_task().await?;
+            println!("full_method: autocompact complete");
             assert_eq!(auto.stop_reason, StopReason::EndTurn);
             assert!(all_text(&log.lock().await.clone()).contains("Auto-compaction enabled."));
 
+            println!("full_method: changelog");
             let changelog = cx.send_request(prompt_for(&sid, "/changelog")).block_task().await?;
+            println!("full_method: changelog complete");
             assert_eq!(changelog.stop_reason, StopReason::EndTurn);
 
+            println!("full_method: export");
             let export = cx.send_request(prompt_for(&sid, "/export")).block_task().await?;
+            println!("full_method: export complete");
             assert_eq!(export.stop_reason, StopReason::EndTurn);
             assert!(
                 all_text(&log.lock().await.clone())

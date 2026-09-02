@@ -1177,7 +1177,7 @@ impl AcpAgent {
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
             }
             "changelog" => {
-                let text = match find_changelog().await {
+                let text = match find_changelog(&self.cfg.pi_command).await {
                     Some(path) => match std::fs::read_to_string(&path) {
                         Ok(mut text) => {
                             const MAX_CHARS: usize = 20_000;
@@ -1767,36 +1767,34 @@ async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, 
     }
 }
 
-/// Locate pi's installed `CHANGELOG.md` (TS `findChangelog`): resolve the `pi`
-/// executable and walk up to its package root, else the npm global root.
-async fn find_changelog() -> Option<PathBuf> {
-    // 1) `which pi` (or `where` on Windows) → realpath → pkg root → CHANGELOG.md
-    let which_cmd = if cfg!(windows) { "where" } else { "which" };
-    let which = tokio::process::Command::new(which_cmd)
-        .arg("pi")
-        .output()
-        .await
-        .ok()?;
-    let first_line = String::from_utf8_lossy(&which.stdout)
-        .lines()
-        .next()
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    if !first_line.is_empty() {
-        let resolved = std::fs::canonicalize(&first_line).ok()?;
-        let pkg_root = resolved.parent()?.parent()?;
-        let p = pkg_root.join("CHANGELOG.md");
-        if p.exists() {
-            return Some(p);
-        }
+/// Locate pi's installed `CHANGELOG.md` (TS `findChangelog`): resolve the
+/// configured executable and walk its ancestors, else query the npm global
+/// root when the configuration uses the default bare `pi` command.
+async fn find_changelog(pi_command: &str) -> Option<PathBuf> {
+    let resolved = crate::pi::resolve::resolve_current_env(pi_command);
+    if let Some(path) = changelog_near_executable(&changelog_executable(&resolved)) {
+        return Some(path);
     }
-    // 2) Fallback: npm global root.
-    let npm_root = tokio::process::Command::new("npm")
-        .args(["root", "-g"])
-        .output()
-        .await
-        .ok()?;
+
+    // An explicit command path is authoritative. Searching npm in that case
+    // can find an unrelated global installation and needlessly spawns a child
+    // process (which is especially costly for nested ACP fixtures).
+    if !is_bare_pi_command(pi_command) {
+        return None;
+    }
+
+    // Fallback: npm global root. Bound the probe and make cancellation kill the
+    // child so a slow/broken npm cannot leak into the next ACP operation.
+    let npm_root = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        tokio::process::Command::new("npm")
+            .args(["root", "-g"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let root = String::from_utf8_lossy(&npm_root.stdout).trim().to_string();
     if root.is_empty() {
         return None;
@@ -1806,6 +1804,38 @@ async fn find_changelog() -> Option<PathBuf> {
         .join("pi-coding-agent")
         .join("CHANGELOG.md");
     p.exists().then_some(p)
+}
+
+/// Return whether `pi_command` is the default-style bare command name rather
+/// than an explicit path or wrapper filename.
+fn is_bare_pi_command(pi_command: &str) -> bool {
+    let command = pi_command.trim();
+    !command.is_empty()
+        && !command.contains('/')
+        && !command.contains('\\')
+        && Path::new(command).extension().is_none()
+}
+
+/// Extract the actual pi executable from a resolved launch command. On Windows
+/// a `.cmd`/`.bat` wrapper is launched through `cmd.exe`, so the fourth command
+/// argument carries the path that should be searched for its package root.
+fn changelog_executable(resolved: &crate::pi::resolve::ResolvedPi) -> PathBuf {
+    if cfg!(windows) && resolved.program.eq_ignore_ascii_case("cmd.exe") {
+        if let Some(path) = resolved.cmd_args.get(3) {
+            return PathBuf::from(path.trim_matches('"'));
+        }
+    }
+    PathBuf::from(&resolved.program)
+}
+
+/// Find the nearest changelog above an executable, resolving symlinks first so
+/// npm's `bin/pi` link lands in the installed package directory.
+fn changelog_near_executable(executable: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(executable).ok()?;
+    resolved
+        .ancestors()
+        .map(|ancestor| ancestor.join("CHANGELOG.md"))
+        .find(|path| path.is_file())
 }
 
 /// Derive a provisional thread title from the first user prompt (fixes
@@ -1840,6 +1870,7 @@ fn provisional_title_from_prompt(message: &str) -> Option<String> {
 mod tests {
     use super::provisional_title_from_prompt;
     use super::*;
+    use tempfile::TempDir;
 
     /// ACP `internalError` code (mapping asserted in the S8 tests).
     const ACP_INTERNAL_ERROR: i32 = -32603;
@@ -1923,5 +1954,25 @@ mod tests {
     fn provisional_title_empty_and_whitespace_only() {
         assert_eq!(provisional_title_from_prompt(""), None);
         assert_eq!(provisional_title_from_prompt("   \n\t "), None);
+    }
+
+    #[test]
+    fn changelog_lookup_walks_up_from_resolved_executable() {
+        let tmp = TempDir::new().unwrap();
+        let package = tmp.path().join("node_modules/pi-coding-agent");
+        let bin = package.join("bin/pi");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "mock executable").unwrap();
+        let changelog = package.join("CHANGELOG.md");
+        std::fs::write(&changelog, "changes").unwrap();
+
+        assert_eq!(changelog_near_executable(&bin), Some(changelog));
+    }
+
+    #[test]
+    fn explicit_pi_paths_do_not_use_global_fallback() {
+        assert!(!is_bare_pi_command("/opt/pi/bin/pi"));
+        assert!(!is_bare_pi_command("C:\\tools\\pi.cmd"));
+        assert!(is_bare_pi_command("pi"));
     }
 }

@@ -5,8 +5,9 @@
 //! compares them against a checked-in golden file (`tests/golden/acp-frames.golden`).
 //!
 //! This guards the two #70/D4 ordering properties from regressing:
-//! 1. the startup-info prelude (which carries the version-check notice) is
-//!    written **before** the `session/new` response frame, not after the turn;
+//! 1. the `session/new` response is written **before** the startup-info
+//!    prelude and `available_commands_update`, so clients can register the
+//!    session before handling session-scoped notifications;
 //! 2. all outbound frames leave through the single ordered connection in the
 //!    exact order the handlers produced them.
 //!
@@ -205,18 +206,41 @@ async fn acp_frame_sequence_matches_golden() {
     let golden = golden.replace("\r\n", "\n");
     assert_eq!(body, golden, "ACP frame sequence drifted from the golden file\n--- recorded ---\n{body}\n--- golden ---\n{golden}");
 
-    // The ordering property the golden guards, stated explicitly: the startup
-    // prelude (with the version-check notice) precedes the session/new
-    // response, and the prompt response precedes the cleanup response.
+    // The ordering property the golden guards, stated explicitly: the
+    // session/new response registers the session before its startup prelude
+    // and command list notifications, and the prompt response precedes the
+    // cleanup response.
     let lines: Vec<&str> = body.lines().collect();
-    let find = |needle: &str| lines.iter().position(|l| l.contains(needle));
-    let startup = find("pi v<VER>").expect("startup prelude frame");
-    // JSON-RPC responses do not echo the method name; identify them by payload.
-    let new_resp = find("configOptions").expect("session/new response frame");
-    let prompt_resp = find("stopReason").expect("session/prompt response frame");
+    let new_resp = lines
+        .iter()
+        .position(|l| l.contains("\"result\":{\"sessionId\":\"mock-session-id\""))
+        .expect("session/new response frame");
+    let startup = lines
+        .iter()
+        .position(|l| {
+            l.contains("\"method\":\"session/update\"")
+                && l.contains("\"sessionUpdate\":\"agent_message_chunk\"")
+                && l.contains("pi v<VER>")
+        })
+        .expect("startup prelude frame");
+    let commands = lines
+        .iter()
+        .position(|l| {
+            l.contains("\"method\":\"session/update\"")
+                && l.contains("\"sessionUpdate\":\"available_commands_update\"")
+        })
+        .expect("available_commands_update frame");
+    let prompt_resp = lines
+        .iter()
+        .position(|l| l.contains("\"result\":{\"stopReason\":\"end_turn\""))
+        .expect("session/prompt response frame");
     assert!(
-        startup < new_resp,
-        "startup prelude must precede session/new response (D4 / #70)"
+        new_resp < startup,
+        "session/new response must precede startup prelude (W-470 / #70)"
+    );
+    assert!(
+        startup < commands,
+        "startup prelude must precede available_commands_update"
     );
     assert!(
         new_resp < prompt_resp,

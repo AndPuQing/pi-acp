@@ -11,16 +11,18 @@
 //! - `initialize` — agent info, capabilities (load/list/delete, image prompts,
 //!   embedded context), terminal auth methods.
 //! - `session/new` — spawn pi, fetch state + models, configOptions (model +
-//!   thought_level selects) + modes, startup info prelude, `closeAllExcept`
-//!   policy, `available_commands_update` after the response.
+//!   thought_level selects) + modes, startup info metadata, `closeAllExcept`
+//!   policy, then post-response startup and `available_commands_update`
+//!   notifications.
 //! - `session/prompt` — restore-or-use session, expand file slash commands,
 //!   handle built-in slash commands headlessly, else run the turn through the
 //!   session queue. The handler **spawns** the turn and responds from the task
 //!   so the SDK dispatch loop stays free for `session/cancel` (the SDK's
 //!   dispatch loop blocks while a handler runs).
 //! - `session/cancel` — notification → session cancel.
-//! - `session/load` — restore a stored session (pi `--session`), replay
-//!   history, configOptions + modes, `available_commands_update`.
+//! - `session/load` — restore a stored session (pi `--session`), return
+//!   configOptions + modes, then replay history and publish
+//!   `available_commands_update`.
 //! - `session/list` / `session/delete` — pi session-file scanning, cwd filter,
 //!   cursor pagination, idempotent delete.
 //! - `session/set_mode` / `session/set_config_option` — thinking level / model,
@@ -124,6 +126,65 @@ struct ModeState {
     available_modes: Vec<SessionMode>,
 }
 
+/// Notifications that must be sent only after the `session/new` response is
+/// queued. ACP clients such as Zed ignore session updates for an id they have
+/// not registered yet.
+struct NewSessionPostResponse {
+    session: Arc<PiAcpSession>,
+    prelude_text: String,
+    enable_skill_commands: bool,
+    file_commands: Vec<FileSlashCommand>,
+}
+
+impl NewSessionPostResponse {
+    async fn send(self, cx: &ConnectionTo<Client>) {
+        let session_id = self.session.session_id().clone();
+        if !self.prelude_text.is_empty() {
+            send_text_chunk(cx, &session_id, &self.prelude_text).await;
+        }
+        advertise_commands(
+            cx,
+            &self.session,
+            self.enable_skill_commands,
+            &self.file_commands,
+        )
+        .await;
+    }
+}
+
+/// Notifications that must be sent only after the `session/load` response is
+/// queued. This keeps replay and command discovery attached to a known session.
+struct LoadSessionPostResponse {
+    session: Arc<PiAcpSession>,
+    history: Value,
+    title: Option<String>,
+    enable_skill_commands: bool,
+    file_commands: Vec<FileSlashCommand>,
+}
+
+impl LoadSessionPostResponse {
+    async fn send(self, cx: &ConnectionTo<Client>) {
+        let session_id = self.session.session_id().clone();
+        if let Some(title) = self.title {
+            let update = SessionInfoUpdate::new()
+                .title(title)
+                .updated_at(utc_now_iso8601());
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::SessionInfoUpdate(update),
+            ));
+        }
+        replay_history(cx, &self.session, &self.history).await;
+        advertise_commands(
+            cx,
+            &self.session,
+            self.enable_skill_commands,
+            &self.file_commands,
+        )
+        .await;
+    }
+}
+
 /// Cached startup version-check state (design D6: the npm registry probe runs
 /// at most once per agent process, so repeated `session/new` never re-hit the
 /// network). `Done(None)` means "checked, pi is up to date".
@@ -207,7 +268,14 @@ impl AcpAgent {
                     let agent = a_new.clone();
                     let result = agent.handle_new_session(&req, &cx).await;
                     match result {
-                        Ok(resp) => responder.respond(resp),
+                        Ok((resp, post_response)) => {
+                            responder.respond(resp)?;
+                            let cx_for_task = cx.clone();
+                            cx.spawn(async move {
+                                post_response.send(&cx_for_task).await;
+                                Ok(())
+                            })
+                        }
                         Err(e) => responder.respond_with_error(e),
                     }
                 },
@@ -244,7 +312,14 @@ impl AcpAgent {
                     let agent = a_load.clone();
                     let result = agent.handle_load_session(&req, &cx).await;
                     match result {
-                        Ok(resp) => responder.respond(resp),
+                        Ok((resp, post_response)) => {
+                            responder.respond(resp)?;
+                            let cx_for_task = cx.clone();
+                            cx.spawn(async move {
+                                post_response.send(&cx_for_task).await;
+                                Ok(())
+                            })
+                        }
                         Err(e) => responder.respond_with_error(e),
                     }
                 },
@@ -398,7 +473,7 @@ impl AcpAgent {
         &self,
         req: &NewSessionRequest,
         cx: &ConnectionTo<Client>,
-    ) -> std::result::Result<NewSessionResponse, AcpError> {
+    ) -> std::result::Result<(NewSessionResponse, NewSessionPostResponse), AcpError> {
         if !req.cwd.is_absolute() {
             return Err(invalid_params(&format!(
                 "cwd must be an absolute path: {}",
@@ -409,9 +484,9 @@ impl AcpAgent {
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
         // Kick off the npm update check as early as possible so it overlaps the
-        // session handshake below (design D6: async + cached; awaiting it
-        // before the response keeps the notice before `session/new`'s response,
-        // D4 / #70).
+        // session handshake below (design D6: async + cached). Await it before
+        // building the response so its startup metadata is ready; the matching
+        // notification is queued only after the response below.
         let mut notice_task: Option<tokio::task::JoinHandle<Option<String>>> = None;
         if self.cfg.enable_version_check {
             let pending = matches!(*self.version_check.lock().await, VersionCheck::Pending);
@@ -539,18 +614,16 @@ impl AcpAgent {
             .config_options(config_options.clone())
             .meta(meta);
 
-        // Send the startup info immediately after the response so it surfaces
-        // even before the first prompt (design D4 / #70 ordering).
-        if !prelude_text.is_empty() {
-            let _ = send_text_chunk(cx, &session_id, &prelude_text).await;
-        }
-
-        // Advertise slash commands after the response (clients ignore
-        // notifications for unknown session ids).
-        advertise_commands(cx, &session, enable_skill_commands, &file_commands).await;
-
         tracing::info!(session = %session_id, "session/new complete");
-        Ok(response)
+        Ok((
+            response,
+            NewSessionPostResponse {
+                session,
+                prelude_text,
+                enable_skill_commands,
+                file_commands,
+            },
+        ))
     }
 
     /// Close a failed `session/new`: dispose the session, remove its session
@@ -645,7 +718,7 @@ impl AcpAgent {
         &self,
         req: &LoadSessionRequest,
         cx: &ConnectionTo<Client>,
-    ) -> std::result::Result<LoadSessionResponse, AcpError> {
+    ) -> std::result::Result<(LoadSessionResponse, LoadSessionPostResponse), AcpError> {
         if !req.cwd.is_absolute() {
             return Err(invalid_params(&format!(
                 "cwd must be an absolute path: {}",
@@ -679,22 +752,12 @@ impl AcpAgent {
         self.store
             .upsert(&req.session_id.0, &stored_cwd, &stored_file);
 
-        // Replay full conversation history. Publish the thread title first —
-        // the same title `session/list` computed for this file (fixes #102/#24:
-        // the restored thread shows a real title instead of "New Agent Thread").
-        // `get_messages` failures surface as an explicit error (TS parity:
-        // `loadSession` throws; S8 "never swallow errors").
+        // Fetch full conversation history. It is replayed after the response so
+        // the client has registered the restored session first. Failures still
+        // surface as an explicit error (TS parity: `loadSession` throws; S8
+        // "never swallow errors").
         let data = session.get_messages().await.map_err(acp_error_from_pi)?;
-        if let Some(title) = title_from_session_file(std::path::Path::new(&stored_file)) {
-            let update = SessionInfoUpdate::new()
-                .title(title)
-                .updated_at(utc_now_iso8601());
-            let _ = cx.send_notification(SessionNotification::new(
-                req.session_id.clone(),
-                SessionUpdate::SessionInfoUpdate(update),
-            ));
-        }
-        replay_history(cx, &session, &data).await;
+        let title = title_from_session_file(std::path::Path::new(&stored_file));
 
         let (config_options, _models, modes) =
             get_session_configuration(&session, None, None).await;
@@ -703,10 +766,17 @@ impl AcpAgent {
             .modes(mode_state_to_acp(&modes))
             .config_options(config_options);
 
-        advertise_commands(cx, &session, enable_skill_commands, &file_commands).await;
-
         tracing::info!(session = %req.session_id, "session/load complete");
-        Ok(response)
+        Ok((
+            response,
+            LoadSessionPostResponse {
+                session,
+                history: data,
+                title,
+                enable_skill_commands,
+                file_commands,
+            },
+        ))
     }
 
     // -----------------------------------------------------------------------

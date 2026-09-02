@@ -21,8 +21,55 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Keep short-lived probes from creating a Tokio worker pool. These paths
+    // are used during every session handshake, so starting the runtime first
+    // needlessly raises the process/thread peak when pi is itself pi-acp.
+    if args.iter().any(|a| a == "--terminal-login") {
+        return terminal_login();
+    }
+    if args.iter().any(|a| a == "--version") {
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // The in-process mock is deliberately single-threaded. ACP integration
+    // tests nest a mock pi inside the adapter, and the mock only performs
+    // sequential stdin/stdout work; an extra worker pool needlessly raises
+    // the process/thread peak on Unix runners.
+    if is_mock_mode(&args) {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_mock_rpc());
+    }
+
+    // The adapter-side ACP fixture also sets `PI_ACP_MOCK`, even though it
+    // does not carry the `--mode` marker. Keep those short-lived test
+    // processes single-threaded too, so adjacent fixtures can be torn down
+    // without exhausting Unix runner process resources.
+    if std::env::var_os("PI_ACP_MOCK").is_some() {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async_main());
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+fn is_mock_mode(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--mock-rpc")
+        || (std::env::var_os("PI_ACP_MOCK").is_some() && args.iter().any(|a| a == "--mode"))
+}
+
+async fn async_main() -> Result<()> {
     // Structured logging (env-filter driven, e.g. RUST_LOG=pi_acp=debug).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -30,31 +77,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .try_init();
-
-    if std::env::args().skip(1).any(|a| a == "--terminal-login") {
-        return terminal_login();
-    }
-
-    // `pi --version` parity: print the version and exit (the startup prelude
-    // probes PI_ACP_PI_COMMAND with --version; when the adapter itself is the
-    // target, answer like pi does).
-    if std::env::args().skip(1).any(|a| a == "--version") {
-        println!("v{}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
-    // Hidden test fixture (see tests/pi_process.rs): a mock `pi --mode rpc`
-    // server so the RPC client can be tested without a real pi + LLM backend.
-    // Also triggered by `PI_ACP_MOCK=1` **when spawned with `--mode rpc`**
-    // (the ACP e2e drives the mock through `PI_ACP_PI_COMMAND` without argv —
-    // see tests/acp_agent.rs). The agent process itself must never take this
-    // branch, so the env trigger requires the `--mode` argv marker.
-    let is_mock = std::env::args().skip(1).any(|a| a == "--mock-rpc")
-        || (std::env::var_os("PI_ACP_MOCK").is_some()
-            && std::env::args().skip(1).any(|a| a == "--mode"));
-    if is_mock {
-        return run_mock_rpc().await;
-    }
 
     let cfg = Config::from_env();
     tracing::info!(pi_command = %cfg.pi_command, "pi-acp (Rust) starting");
@@ -156,6 +178,7 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-event-delay-ms <n>` sleep `n` ms before each scenario event
 /// - `--mock-command-log <path>`  append each received command type
 /// - `--mock-extension-log <path>` append each received `extension_ui_response`
+/// - `--mock-cwd-log <path>`      write the mock's startup cwd
 /// - `--mock-prompt-error <text>`   answer `prompt` with `success:false` and this
 ///   error text (auth/error-surfacing tests)
 /// - `--mock-models-error <text>`   answer `get_available_models` with
@@ -181,6 +204,7 @@ async fn run_mock_rpc() -> Result<()> {
     let mut event_delay_ms: u64 = 0;
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
+    let mut cwd_log: Option<PathBuf> = None;
     let mut prompt_error: Option<String> = None;
     let mut models_error: Option<String> = None;
     let mut prompt_count: usize = 0;
@@ -209,6 +233,7 @@ async fn run_mock_rpc() -> Result<()> {
             }
             "--mock-command-log" => command_log = args.next().map(PathBuf::from),
             "--mock-extension-log" => extension_log = args.next().map(PathBuf::from),
+            "--mock-cwd-log" => cwd_log = args.next().map(PathBuf::from),
             "--mock-prompt-error" => prompt_error = args.next(),
             "--mock-models-error" => models_error = args.next(),
             _ => {}
@@ -230,6 +255,12 @@ async fn run_mock_rpc() -> Result<()> {
         exit_after = std::env::var("PI_ACP_MOCK_EXIT_AFTER")
             .ok()
             .and_then(|v| v.parse().ok());
+    }
+
+    if let Some(log) = &cwd_log {
+        if let Ok(cwd) = std::env::current_dir() {
+            append_log(log, &cwd.to_string_lossy());
+        }
     }
 
     let mut stdout = tokio::io::stdout();

@@ -6,3 +6,4 @@
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"mock-session-id","update":{"sessionUpdate":"usage_update","used":15,"size":1000}}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"mock-session-id","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from mock"}}}}
 {"jsonrpc":"2.0","id":"<ID>","result":{"stopReason":"end_turn"}}
+{"jsonrpc":"2.0","id":"<ID>","result":{}}

@@ -857,6 +857,7 @@ dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
  "dirs",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

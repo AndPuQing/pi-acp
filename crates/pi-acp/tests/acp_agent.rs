@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -31,6 +31,15 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Everything the agent notified us, in order, keyed by session id.
 type NotifLog = Arc<Mutex<Vec<(String, SessionUpdate)>>>;
+
+static ACP_AGENT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+async fn acquire_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    ACP_AGENT_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await
+}
 
 fn prompt_for(session_id: &SessionId, s: &str) -> PromptRequest {
     PromptRequest::new(
@@ -129,6 +138,7 @@ fn write_pi_session(dir: &Path, id: &str, cwd: &str) -> PathBuf {
 /// Run the full method set against the mock pi.
 #[tokio::test]
 async fn full_method_set_against_mock_pi() {
+    let _test_guard = acquire_test_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
@@ -209,6 +219,22 @@ async fn full_method_set_against_mock_pi() {
                 .await?;
             let sid = new_session.session_id.clone();
             assert!(!sid.0.is_empty());
+
+            let session_map: Value = serde_json::from_str(
+                &fs::read_to_string(agent_dir.join("pi-acp/session-map.json"))
+                    .expect("session/new must persist its session mapping"),
+            )
+            .expect("session map must be valid JSON");
+            let stored = &session_map["sessions"]["mock-session-id"];
+            let cwd_string = cwd.to_string_lossy().into_owned();
+            assert_eq!(
+                stored.get("sessionId").and_then(Value::as_str),
+                Some("mock-session-id")
+            );
+            assert_eq!(
+                stored.get("cwd").and_then(Value::as_str),
+                Some(cwd_string.as_str())
+            );
 
             // configOptions: model select first, then thought_level select.
             let options = new_session.config_options.as_ref().expect("configOptions");
@@ -556,6 +582,7 @@ async fn full_method_set_against_mock_pi() {
 /// (the fallback handler declines nothing else).
 #[tokio::test]
 async fn set_session_model_unknown_session_errors() {
+    let _test_guard = acquire_test_lock().await;
     let agent = AcpAgent::new(
         AcpAgentConfig::new(BIN)
             .env("PI_ACP_MOCK", "1")
@@ -603,6 +630,7 @@ async fn set_session_model_unknown_session_errors() {
 /// invalidParams-style text.
 #[tokio::test]
 async fn unknown_config_option_errors() {
+    let _test_guard = acquire_test_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let agent = AcpAgent::new(
@@ -622,7 +650,7 @@ async fn unknown_config_option_errors() {
             let sid = new_session.session_id;
             let err = cx
                 .send_request(SetSessionConfigOptionRequest::new(
-                    sid,
+                    sid.clone(),
                     "not-a-real-option",
                     "x",
                 ))
@@ -630,6 +658,13 @@ async fn unknown_config_option_errors() {
                 .await
                 .expect_err("unknown config option must error");
             assert!(err.to_string().contains("Unknown config option"), "{err}");
+
+            // Close the live subprocess before the SDK tears down the outer
+            // adapter. This keeps the nested mock reaped on resource-limited
+            // CI runners instead of relying on forced process-group cleanup.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -649,6 +684,7 @@ async fn unknown_config_option_errors() {
 /// is the first prompt, which the mock answers by dying.
 #[tokio::test]
 async fn prompt_after_pi_death_returns_explicit_error() {
+    let _test_guard = acquire_test_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let agent = AcpAgent::new(
@@ -696,7 +732,7 @@ async fn prompt_after_pi_death_returns_explicit_error() {
             // session remembers the exit and never hangs or goes quiet.
             let err2 = cx
                 .send_request(PromptRequest::new(
-                    sid,
+                    sid.clone(),
                     vec![ContentBlock::Text(TextContent::new("again".to_string()))],
                 ))
                 .block_task()
@@ -715,6 +751,10 @@ async fn prompt_after_pi_death_returns_explicit_error() {
                 err2.data.as_ref().expect("error data")["errorType"],
                 "piExited"
             );
+
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -726,6 +766,7 @@ async fn prompt_after_pi_death_returns_explicit_error() {
 /// the client can offer terminal login (S8 / auth.rs keyword matching).
 #[tokio::test]
 async fn auth_looking_prompt_error_surfaces_auth_required() {
+    let _test_guard = acquire_test_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let agent = AcpAgent::new(
@@ -749,7 +790,7 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
                 .expect("session/new succeeds; the error comes from the prompt");
             let err = cx
                 .send_request(PromptRequest::new(
-                    new_session.session_id,
+                    new_session.session_id.clone(),
                     vec![ContentBlock::Text(TextContent::new("hi".to_string()))],
                 ))
                 .block_task()
@@ -769,6 +810,10 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
             assert_eq!(methods.len(), 1);
             assert_eq!(methods[0]["id"], "pi_terminal_login");
             assert_eq!(methods[0]["type"], "terminal");
+
+            cx.send_request(DeleteSessionRequest::new(new_session.session_id))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -780,6 +825,7 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
 /// first, then internalError).
 #[tokio::test]
 async fn auth_looking_models_error_on_new_surfaces_auth_required() {
+    let _test_guard = acquire_test_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let agent = AcpAgent::new(
@@ -817,6 +863,7 @@ async fn auth_looking_models_error_on_new_surfaces_auth_required() {
 /// `loadSession` throws on `getMessages`).
 #[tokio::test]
 async fn load_session_surfaces_get_messages_failure() {
+    let _test_guard = acquire_test_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let agent_dir = tmp.path().join("agent");
@@ -852,6 +899,10 @@ async fn load_session_surfaces_get_messages_failure() {
                 err.data.as_ref().expect("error data")["errorType"],
                 "piExited"
             );
+
+            cx.send_request(DeleteSessionRequest::new("stored-session"))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -869,6 +920,7 @@ async fn load_session_surfaces_get_messages_failure() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_triggers_graceful_shutdown() {
+    let _test_guard = acquire_test_lock().await;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command as TokioCommand;
 

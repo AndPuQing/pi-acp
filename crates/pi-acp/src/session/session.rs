@@ -248,6 +248,10 @@ struct Pump {
     pending_turn: Option<PendingTurn>,
     /// Maps abort semantics to the ACP stop reason for the running turn.
     cancel_requested: bool,
+    /// A turn failure leaves pi's event stream ambiguous (late settle events
+    /// have no turn id), so the session rejects later prompts until it is
+    /// disposed and recreated.
+    poisoned: bool,
     /// True while pi's agent loop is running (`agent_start` .. `agent_end`).
     in_agent_loop: bool,
     /// Deadline by which the in-flight turn's `agent_settled` must arrive
@@ -276,20 +280,38 @@ impl PiAcpSession {
     pub async fn spawn(params: SessionParams) -> Result<Arc<Self>> {
         let extra: Vec<&str> = params.extra_args.iter().map(String::as_str).collect();
         let session_path = params.session_path.as_deref();
-        let mut proc =
-            PiProcess::spawn_with_args(&params.pi_command, &extra, session_path, params.timeout)
-                .await?;
-        let state = proc.get_state().await?;
+        let mut proc = PiProcess::spawn_with_args_in_dir(
+            &params.pi_command,
+            &extra,
+            session_path,
+            &params.cwd,
+            params.timeout,
+        )
+        .await?;
+        let state = match proc.get_state().await {
+            Ok(state) => state,
+            Err(err) => {
+                // The process is owned locally until the pump is installed;
+                // dispose it here so a failed startup cannot orphan the pi
+                // child while the caller handles the handshake error.
+                proc.dispose().await;
+                return Err(err);
+            }
+        };
         let session_id = params
             .session_id_override
             .unwrap_or_else(|| state.session_id.clone().into());
         tracing::info!(session_id = %session_id.0, "pi session ready");
-        let event_rx = proc
-            .take_event_receiver()
-            .ok_or_else(|| AcpxError::RpcFailed {
-                command: "session".into(),
-                message: "pi event channel already taken".into(),
-            })?;
+        let event_rx = match proc.take_event_receiver() {
+            Some(event_rx) => event_rx,
+            None => {
+                proc.dispose().await;
+                return Err(AcpxError::RpcFailed {
+                    command: "session".into(),
+                    message: "pi event channel already taken".into(),
+                });
+            }
+        };
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (prompt_tx, prompt_rx) = mpsc::channel(4);
@@ -311,6 +333,7 @@ impl PiAcpSession {
             queue: VecDeque::new(),
             pending_turn: None,
             cancel_requested: false,
+            poisoned: false,
             in_agent_loop: false,
             settle_deadline: None,
             settle_timeout: params.settle_timeout,
@@ -648,12 +671,26 @@ async fn pump_loop(mut pump: Pump) {
 impl Pump {
     // --- commands ---
 
+    fn session_closed_error(&self) -> AcpxError {
+        AcpxError::SessionClosed(self.session_id.0.to_string())
+    }
+
+    fn fail_queued_turns(&mut self) {
+        while let Some(turn) = self.queue.pop_front() {
+            let _ = turn.resolve.send(Err(self.session_closed_error()));
+        }
+    }
+
     async fn on_prompt(
         &mut self,
         message: String,
         images: Vec<ImageContent>,
         respond: oneshot::Sender<Result<StopReason>>,
     ) {
+        if self.poisoned {
+            let _ = respond.send(Err(self.session_closed_error()));
+            return;
+        }
         let queued = QueuedTurn {
             message,
             images,
@@ -671,6 +708,15 @@ impl Pump {
     }
 
     async fn on_cancel(&mut self, respond: oneshot::Sender<Result<()>>) {
+        if self.poisoned {
+            let _ = respond.send(Err(self.session_closed_error()));
+            return;
+        }
+        if self.pending_turn.is_none() {
+            self.cancel_requested = false;
+            let _ = respond.send(Ok(()));
+            return;
+        }
         self.cancel_requested = true;
 
         // Clear the queue; each queued turn resolves as cancelled.
@@ -683,17 +729,28 @@ impl Pump {
             self.emit_queue_depth(self.pending_turn.is_some()).await;
         }
 
-        // Abort the in-flight turn (no-op when none is running). Runs in a
-        // spawned task so the pump keeps consuming events — pi settles after
-        // an abort, and that settle resolves the pending turn as cancelled.
-        let proc = self.proc.clone();
-        tokio::spawn(async move {
-            let result = {
-                let mut p = proc.lock().await;
-                p.abort().await
-            };
-            let _ = respond.send(result);
-        });
+        // Complete the abort before the pump handles another command/event.
+        // This keeps a delayed abort from acquiring the process mutex after a
+        // queued turn has already started. The resulting agent_settled event
+        // is buffered by the event channel while the RPC is in flight.
+        let result = {
+            let mut proc = self.proc.lock().await;
+            proc.abort().await
+        };
+        if result.is_err() {
+            // Without a confirmed abort, pi may still settle asynchronously;
+            // retire the session so that event cannot resolve a later turn.
+            self.poisoned = true;
+            self.cancel_requested = false;
+            if let Some(pending) = self.pending_turn.take() {
+                let _ = pending.resolve.send(Err(self.session_closed_error()));
+            }
+            self.fail_queued_turns();
+            self.in_agent_loop = false;
+            self.settle_deadline = None;
+            self.emit_queue_depth(false).await;
+        }
+        let _ = respond.send(result);
     }
 
     async fn on_extension_ui_response(&mut self, resp: ExtensionUiResponse) {
@@ -735,11 +792,9 @@ impl Pump {
             return; // already settled (defensive)
         };
         self.flush_outbound().await;
-        if self.cancel_requested {
-            let _ = pending.resolve.send(Ok(StopReason::Cancelled));
-        } else {
-            let _ = pending.resolve.send(Err(result));
-        }
+        let _ = pending.resolve.send(Err(result));
+        self.fail_queued_turns();
+        self.poisoned = true;
         self.in_agent_loop = false;
         self.emit_queue_depth(false).await;
     }
@@ -1018,6 +1073,9 @@ impl Pump {
         self.flush_outbound().await;
         let secs = self.settle_timeout.as_secs();
         let _ = pending.resolve.send(Err(AcpxError::SettleTimeout { secs }));
+        self.fail_queued_turns();
+        self.poisoned = true;
+        self.cancel_requested = false;
         self.in_agent_loop = false;
         self.emit_queue_depth(false).await;
 
@@ -1540,6 +1598,15 @@ impl ExtensionUiRequest {
             _ => None,
         }
     }
+
+    fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            ExtensionUiRequest::Select { timeout, .. }
+            | ExtensionUiRequest::Confirm { timeout, .. }
+            | ExtensionUiRequest::Input { timeout, .. } => *timeout,
+            _ => None,
+        }
+    }
 }
 
 /// Handle one extension UI request and return the answer to send back to pi
@@ -1676,7 +1743,17 @@ async fn request_permission(
             command: "request_permission".into(),
             message: "outbound sink closed".into(),
         })?;
-    let response = rx.await.map_err(|_| AcpxError::RpcFailed {
+    let response = if let Some(timeout_ms) = req.timeout_ms() {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .map_err(|_| AcpxError::RpcFailed {
+                command: "request_permission".into(),
+                message: format!("client did not respond within {timeout_ms}ms"),
+            })?
+    } else {
+        rx.await
+    }
+    .map_err(|_| AcpxError::RpcFailed {
         command: "request_permission".into(),
         message: "permission responder dropped".into(),
     })??;
@@ -1883,6 +1960,63 @@ mod tests {
         assert_eq!(input["method"], "input");
         assert_eq!(input["placeholder"], "hint");
         assert!(input.get("options").is_none());
+    }
+
+    #[test]
+    fn extension_ui_timeout_is_read_from_interactive_requests() {
+        let select: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-1",
+            "method": "select",
+            "title": "Pick",
+            "options": ["a"],
+            "timeout": 250
+        }))
+        .unwrap();
+        assert_eq!(select.timeout_ms(), Some(250));
+
+        let notify: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-2",
+            "method": "notify",
+            "message": "hello"
+        }))
+        .unwrap();
+        assert_eq!(notify.timeout_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn request_permission_honors_extension_timeout() {
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        let session_id: SessionId = "session".into();
+        let request: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-1",
+            "method": "select",
+            "title": "Pick",
+            "options": ["a"],
+            "timeout": 10
+        }))
+        .unwrap();
+
+        let permission =
+            request_permission(&session_id, "ui-1", "Pick", &request, Vec::new(), &outbound);
+        let (_, result) = tokio::join!(
+            async {
+                let Some(OutboundMessage::RequestPermission(_, _responder)) =
+                    outbound_rx.recv().await
+                else {
+                    panic!("permission request was not sent");
+                };
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            },
+            permission,
+        );
+
+        match result {
+            Err(AcpxError::RpcFailed { command, message }) => {
+                assert_eq!(command, "request_permission");
+                assert!(message.contains("10ms"), "{message}");
+            }
+            other => panic!("expected permission timeout, got {other:?}"),
+        }
     }
 
     #[test]

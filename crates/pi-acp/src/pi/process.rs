@@ -50,8 +50,11 @@ pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
 /// How long [`PiProcess::dispose`] waits after SIGTERM before escalating to
 /// SIGKILL (pi runs a graceful shutdown handler on SIGTERM).
 const SIGTERM_GRACE: Duration = Duration::from_secs(3);
-/// How long [`PiProcess::Drop`]'s off-thread SIGTERM→SIGKILL escalation waits.
-const DROP_ESCALATION_DELAY: Duration = Duration::from_millis(250);
+/// A just-exited process can briefly keep the runner from accepting another
+/// child (`EAGAIN`, especially on Unix). Retry only that transient condition;
+/// permanent spawn failures still surface immediately.
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(25);
+const SPAWN_RETRY_ATTEMPTS: usize = 120;
 /// Bounded event channel capacity. The reader task awaits sends (backpressure),
 /// so a slow event pump stalls the stream rather than unboundedly buffering.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -105,7 +108,7 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, &[], session_path, timeout).await
+        Self::spawn_inner(pi_command, &[], session_path, None, timeout).await
     }
 
     /// [`PiProcess::spawn_with_session`] with extra pi CLI flags appended after
@@ -116,13 +119,27 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, extra_args, session_path, timeout).await
+        Self::spawn_inner(pi_command, extra_args, session_path, None, timeout).await
+    }
+
+    /// [`PiProcess::spawn_with_args`] with an explicit working directory for
+    /// the child process. Session tools and pi's session header must observe
+    /// the same cwd that the ACP client supplied to `session/new`/`session/load`.
+    pub async fn spawn_with_args_in_dir(
+        pi_command: &str,
+        extra_args: &[&str],
+        session_path: Option<&Path>,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::spawn_inner(pi_command, extra_args, session_path, Some(cwd), timeout).await
     }
 
     async fn spawn_inner(
         pi_command: &str,
         extra_args: &[&str],
         session_path: Option<&Path>,
+        cwd: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
         // Resolve the configured command to a launchable program. On Windows
@@ -141,14 +158,39 @@ impl PiProcess {
             .stdout(Stdio::piped())
             // pi writes diagnostics to stderr; keep it out of the JSONL stream.
             .stderr(Stdio::null());
-        // Put pi in its own process group so teardown can signal the whole tree
-        // (wrapper launchers like pi.cmd may spawn grandchildren).
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        // Put real pi in its own process group so teardown can signal the whole
+        // tree (wrapper launchers like pi.cmd may spawn grandchildren). The
+        // ACP integration fixture nests a mock pi inside an externally-managed
+        // adapter process; sharing that test-only process group lets the SDK's
+        // outer teardown reap both levels instead of orphaning the mock.
         #[cfg(unix)]
-        cmd.process_group(0);
+        if std::env::var_os("PI_ACP_MOCK").is_none() {
+            cmd.process_group(0);
+        }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AcpxError::PiSpawn(spawn_error(pi_command, &resolved, e)))?;
+        let mut attempts = 0;
+        let mut child = loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) && attempts < SPAWN_RETRY_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(AcpxError::PiSpawn(spawn_error(
+                        pi_command, &resolved, error,
+                    )))
+                }
+            }
+        };
 
         let stdin = child
             .stdin
@@ -515,16 +557,13 @@ impl PiProcess {
 impl Drop for PiProcess {
     /// Sync emergency teardown (used when `dispose()` was not called, e.g.
     /// panic unwinding or session-map eviction without an async context).
-    /// SIGTERM immediately, then an off-thread SIGKILL escalation — `Drop`
-    /// cannot await, so the grace period happens on a detached thread. The
-    /// watcher task still owns the `Child` and reaps it.
+    /// `Drop` cannot await a graceful shutdown, so terminate the whole process
+    /// group immediately. The watcher task still owns the `Child` and reaps it
+    /// while the runtime is alive. A detached delayed killer would both leave
+    /// a resource window and risk signaling a reused PID.
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            signal_pi(pid, /* term */ true);
-            std::thread::spawn(move || {
-                std::thread::sleep(DROP_ESCALATION_DELAY);
-                signal_pi(pid, /* term */ false);
-            });
+        if let Some(pid) = self.pid.take() {
+            signal_pi(pid, /* term */ false);
         }
     }
 }
@@ -538,13 +577,19 @@ impl Drop for PiProcess {
 /// Windows: no SIGTERM exists; `taskkill /T /F` force-terminates the tree.
 #[cfg(unix)]
 fn signal_pi(pid: u32, term: bool) {
-    let sig = if term { "TERM" } else { "KILL" };
-    for target in [format!("-{pid}"), pid.to_string()] {
-        let _ = std::process::Command::new("kill")
-            .arg(format!("-{sig}"))
-            .arg(&target)
-            .output();
-    }
+    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+        return;
+    };
+    let signal = if term {
+        rustix::process::Signal::TERM
+    } else {
+        rustix::process::Signal::KILL
+    };
+
+    // Use direct syscalls so cleanup still works when the process limit is
+    // the very resource that prevented another `kill` helper from spawning.
+    let _ = rustix::process::kill_process_group(pid, signal);
+    let _ = rustix::process::kill_process(pid, signal);
 }
 
 #[cfg(windows)]

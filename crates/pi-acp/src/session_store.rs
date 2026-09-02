@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,8 @@ use serde_json::Value;
 
 use crate::settings::agent_dir;
 use crate::time::utc_now_iso8601;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// One stored session entry (mirrors TS `StoredSession`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,9 +92,18 @@ impl SessionStore {
         loaded
     }
 
-    fn save(&self, db: &SessionMapFile) {
-        atomic_write_json(&self.path, db);
-        *self.cache.lock().expect("session store cache poisoned") = Some(db.clone());
+    fn update<F>(&self, update: F)
+    where
+        F: FnOnce(&mut SessionMapFile) -> bool,
+    {
+        // Keep the cache lock across load, mutation, and atomic replacement.
+        // The store is used by concurrent ACP handlers, so separating load()
+        // and save() would allow two read-modify-write operations to lose data.
+        let mut cache = self.cache.lock().expect("session store cache poisoned");
+        let mut db = cache.clone().unwrap_or_else(|| load_file(&self.path));
+        if update(&mut db) && atomic_write_json(&self.path, &db) {
+            *cache = Some(db);
+        }
     }
 
     /// The stored entry for a session id, if any.
@@ -101,26 +113,23 @@ impl SessionStore {
 
     /// Insert or refresh an entry (updates `updatedAt` to now).
     pub fn upsert(&self, session_id: &str, cwd: &str, session_file: &str) {
-        let mut db = self.load();
-        db.sessions.insert(
-            session_id.to_string(),
-            StoredSession {
-                session_id: session_id.to_string(),
-                cwd: cwd.to_string(),
-                session_file: session_file.to_string(),
-                updated_at: utc_now_iso8601(),
-            },
-        );
-        self.save(&db);
+        self.update(|db| {
+            db.sessions.insert(
+                session_id.to_string(),
+                StoredSession {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.to_string(),
+                    session_file: session_file.to_string(),
+                    updated_at: utc_now_iso8601(),
+                },
+            );
+            true
+        });
     }
 
     /// Remove an entry; no-op when absent.
     pub fn delete(&self, session_id: &str) {
-        let mut db = self.load();
-        if db.sessions.remove(session_id).is_none() {
-            return;
-        }
-        self.save(&db);
+        self.update(|db| db.sessions.remove(session_id).is_some());
     }
 }
 
@@ -137,13 +146,13 @@ fn load_file(path: &Path) -> SessionMapFile {
 }
 
 /// Write the map file atomically: temp file in the same directory + rename.
-fn atomic_write_json(path: &Path, db: &SessionMapFile) {
+fn atomic_write_json(path: &Path, db: &SessionMapFile) -> bool {
     let Some(parent) = path.parent() else {
-        return;
+        return false;
     };
     if let Err(e) = fs::create_dir_all(parent) {
         tracing::warn!(error = %e, ?path, "failed to create session-map parent dir");
-        return;
+        return false;
     }
     let body = serde_json::to_string_pretty(db)
         .map(|mut s| {
@@ -151,9 +160,17 @@ fn atomic_write_json(path: &Path, db: &SessionMapFile) {
             s
         })
         .unwrap_or_else(|_| "{}\n".to_string());
-    let tmp = parent.join(format!(".session-map.{}.tmp", std::process::id()));
+    let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".session-map.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
     let write = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
         fs::rename(&tmp, path)?;
@@ -162,6 +179,9 @@ fn atomic_write_json(path: &Path, db: &SessionMapFile) {
     if let Err(e) = write {
         tracing::warn!(error = %e, ?path, "failed to write session-map");
         let _ = fs::remove_file(&tmp);
+        false
+    } else {
+        true
     }
 }
 
@@ -228,6 +248,30 @@ mod tests {
         // And a subsequent write repairs the file.
         store.upsert("x", "/w", "/f");
         assert_eq!(SessionStore::at(path).get("x").unwrap().cwd, "/w");
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_all_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("map.json");
+        let store = std::sync::Arc::new(SessionStore::at(path.clone()));
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let id = format!("session-{i}");
+                    store.upsert(&id, "/work", &format!("/tmp/{id}.jsonl"));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let fresh = SessionStore::at(path);
+        for i in 0..16 {
+            assert!(fresh.get(&format!("session-{i}")).is_some());
+        }
     }
 
     #[test]

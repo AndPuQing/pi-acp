@@ -134,11 +134,30 @@ enum VersionCheck {
     Done(Option<Arc<str>>),
 }
 
+/// Await startup probes that were launched before a session handshake. Error
+/// paths must join them too: dropping a Tokio `JoinHandle` detaches its task,
+/// which can otherwise leave a short-lived probe child running into the next
+/// process-backed ACP fixture.
+async fn drain_startup_tasks(
+    notice_task: Option<tokio::task::JoinHandle<Option<String>>>,
+    version_task: Option<tokio::task::JoinHandle<Option<String>>>,
+) {
+    if let Some(task) = notice_task {
+        let _ = task.await;
+    }
+    if let Some(task) = version_task {
+        let _ = task.await;
+    }
+}
+
 /// The per-connection agent: shared state behind every handler.
 pub struct AcpAgent {
     cfg: Config,
     sessions: SessionManager,
     store: SessionStore,
+    /// Serializes session replacement policies (`new`/`load`) so concurrent
+    /// requests cannot close each other's freshly-created subprocess.
+    session_lifecycle: Mutex<()>,
     /// Most recent session cwd, used as the default `session/list` filter
     /// (TS parity: Zed sends `{}` and expects the project-scoped picker).
     last_session_cwd: Mutex<Option<PathBuf>>,
@@ -152,6 +171,7 @@ impl AcpAgent {
             cfg,
             sessions: SessionManager::new(),
             store: SessionStore::new(),
+            session_lifecycle: Mutex::new(()),
             last_session_cwd: Mutex::new(None),
             version_check: Mutex::new(VersionCheck::Pending),
         }
@@ -385,6 +405,7 @@ impl AcpAgent {
                 req.cwd.display()
             )));
         }
+        let _lifecycle = self.session_lifecycle.lock().await;
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
         // Kick off the npm update check as early as possible so it overlaps the
@@ -419,9 +440,16 @@ impl AcpAgent {
             ));
         }
 
-        let session = self
+        let session = match self
             .spawn_session(Some(&req.cwd), None, None, cx, file_commands.clone())
-            .await?;
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                drain_startup_tasks(notice_task.take(), version_task.take()).await;
+                return Err(err);
+            }
+        };
         let session_id = session.session_id().clone();
 
         // Fetch state + models once (parallel) to reduce startup latency.
@@ -436,21 +464,25 @@ impl AcpAgent {
             if maybe_auth_required_error(&err.to_string()).is_some() {
                 self.cleanup_failed_new_session(&session, state.as_ref())
                     .await;
+                drain_startup_tasks(notice_task.take(), version_task.take()).await;
                 return Err(auth_required());
             }
             self.cleanup_failed_new_session(&session, state.as_ref())
                 .await;
+            drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(AcpError::new(ACP_INTERNAL_ERROR, err.to_string()));
         }
         let raw_models_count = available_models.as_ref().map(Vec::len).unwrap_or(0);
         if raw_models_count == 0 {
             self.cleanup_failed_new_session(&session, state.as_ref())
                 .await;
+            drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(auth_required());
         }
         if let Some(err) = state_res.as_ref().err() {
             if maybe_auth_required_error(&err.to_string()).is_some() {
                 self.cleanup_failed_new_session(&session, None).await;
+                drain_startup_tasks(notice_task.take(), version_task.take()).await;
                 return Err(auth_required());
             }
         }
@@ -458,7 +490,16 @@ impl AcpAgent {
         let (config_options, _models, modes) =
             get_session_configuration(&session, state.as_ref(), available_models.as_ref()).await;
 
-        let update_notice = if let Some(task) = notice_task {
+        if let Some(session_file) = state
+            .as_ref()
+            .and_then(|s| s.session_file.as_deref())
+            .filter(|path| !path.trim().is_empty())
+        {
+            self.store
+                .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
+        }
+
+        let update_notice = if let Some(task) = notice_task.take() {
             // The check has been running in parallel with the handshake; await
             // it (its internal timeouts bound the wait) and cache the result.
             let notice = task.await.unwrap_or(None);
@@ -471,7 +512,7 @@ impl AcpAgent {
             }
         };
         let prelude_text = {
-            let pi_version = match version_task {
+            let pi_version = match version_task.take() {
                 Some(task) => task.await.unwrap_or(None),
                 None => None,
             };
@@ -612,9 +653,14 @@ impl AcpAgent {
             )));
         }
 
-        // Re-loading an active session: tear down the existing pi subprocess
-        // so we start fresh and re-advertise commands reliably.
+        let _lifecycle = self.session_lifecycle.lock().await;
+
+        // Tear down every live pi before spawning the replacement. Besides
+        // making the one-live-session policy explicit, this keeps session
+        // replacement below the runner's process limit when nested ACP
+        // fixtures are used.
         self.sessions.close(&req.session_id).await;
+        self.sessions.close_all_except(&req.session_id).await;
 
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
@@ -630,7 +676,6 @@ impl AcpAgent {
             .restore_session(&req.session_id, Some(&req.cwd), cx)
             .await?;
 
-        self.sessions.close_all_except(&req.session_id).await;
         self.store
             .upsert(&req.session_id.0, &stored_cwd, &stored_file);
 
@@ -1132,7 +1177,7 @@ impl AcpAgent {
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
             }
             "changelog" => {
-                let text = match find_changelog().await {
+                let text = match find_changelog(&self.cfg.pi_command).await {
                     Some(path) => match std::fs::read_to_string(&path) {
                         Ok(mut text) => {
                             const MAX_CHARS: usize = 20_000;
@@ -1722,36 +1767,34 @@ async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, 
     }
 }
 
-/// Locate pi's installed `CHANGELOG.md` (TS `findChangelog`): resolve the `pi`
-/// executable and walk up to its package root, else the npm global root.
-async fn find_changelog() -> Option<PathBuf> {
-    // 1) `which pi` (or `where` on Windows) → realpath → pkg root → CHANGELOG.md
-    let which_cmd = if cfg!(windows) { "where" } else { "which" };
-    let which = tokio::process::Command::new(which_cmd)
-        .arg("pi")
-        .output()
-        .await
-        .ok()?;
-    let first_line = String::from_utf8_lossy(&which.stdout)
-        .lines()
-        .next()
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    if !first_line.is_empty() {
-        let resolved = std::fs::canonicalize(&first_line).ok()?;
-        let pkg_root = resolved.parent()?.parent()?;
-        let p = pkg_root.join("CHANGELOG.md");
-        if p.exists() {
-            return Some(p);
-        }
+/// Locate pi's installed `CHANGELOG.md` (TS `findChangelog`): resolve the
+/// configured executable and walk its ancestors, else query the npm global
+/// root when the configuration uses the default bare `pi` command.
+async fn find_changelog(pi_command: &str) -> Option<PathBuf> {
+    let resolved = crate::pi::resolve::resolve_current_env(pi_command);
+    if let Some(path) = changelog_near_executable(&changelog_executable(&resolved)) {
+        return Some(path);
     }
-    // 2) Fallback: npm global root.
-    let npm_root = tokio::process::Command::new("npm")
-        .args(["root", "-g"])
-        .output()
-        .await
-        .ok()?;
+
+    // An explicit command path is authoritative. Searching npm in that case
+    // can find an unrelated global installation and needlessly spawns a child
+    // process (which is especially costly for nested ACP fixtures).
+    if !is_bare_pi_command(pi_command) {
+        return None;
+    }
+
+    // Fallback: npm global root. Bound the probe and make cancellation kill the
+    // child so a slow/broken npm cannot leak into the next ACP operation.
+    let npm_root = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        tokio::process::Command::new("npm")
+            .args(["root", "-g"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let root = String::from_utf8_lossy(&npm_root.stdout).trim().to_string();
     if root.is_empty() {
         return None;
@@ -1761,6 +1804,38 @@ async fn find_changelog() -> Option<PathBuf> {
         .join("pi-coding-agent")
         .join("CHANGELOG.md");
     p.exists().then_some(p)
+}
+
+/// Return whether `pi_command` is the default-style bare command name rather
+/// than an explicit path or wrapper filename.
+fn is_bare_pi_command(pi_command: &str) -> bool {
+    let command = pi_command.trim();
+    !command.is_empty()
+        && !command.contains('/')
+        && !command.contains('\\')
+        && Path::new(command).extension().is_none()
+}
+
+/// Extract the actual pi executable from a resolved launch command. On Windows
+/// a `.cmd`/`.bat` wrapper is launched through `cmd.exe`, so the fourth command
+/// argument carries the path that should be searched for its package root.
+fn changelog_executable(resolved: &crate::pi::resolve::ResolvedPi) -> PathBuf {
+    if cfg!(windows) && resolved.program.eq_ignore_ascii_case("cmd.exe") {
+        if let Some(path) = resolved.cmd_args.get(3) {
+            return PathBuf::from(path.trim_matches('"'));
+        }
+    }
+    PathBuf::from(&resolved.program)
+}
+
+/// Find the nearest changelog above an executable, resolving symlinks first so
+/// npm's `bin/pi` link lands in the installed package directory.
+fn changelog_near_executable(executable: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(executable).ok()?;
+    resolved
+        .ancestors()
+        .map(|ancestor| ancestor.join("CHANGELOG.md"))
+        .find(|path| path.is_file())
 }
 
 /// Derive a provisional thread title from the first user prompt (fixes
@@ -1795,6 +1870,7 @@ fn provisional_title_from_prompt(message: &str) -> Option<String> {
 mod tests {
     use super::provisional_title_from_prompt;
     use super::*;
+    use tempfile::TempDir;
 
     /// ACP `internalError` code (mapping asserted in the S8 tests).
     const ACP_INTERNAL_ERROR: i32 = -32603;
@@ -1878,5 +1954,28 @@ mod tests {
     fn provisional_title_empty_and_whitespace_only() {
         assert_eq!(provisional_title_from_prompt(""), None);
         assert_eq!(provisional_title_from_prompt("   \n\t "), None);
+    }
+
+    #[test]
+    fn changelog_lookup_walks_up_from_resolved_executable() {
+        let tmp = TempDir::new().unwrap();
+        let package = tmp.path().join("node_modules/pi-coding-agent");
+        let bin = package.join("bin/pi");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "mock executable").unwrap();
+        let changelog = package.join("CHANGELOG.md");
+        std::fs::write(&changelog, "changes").unwrap();
+
+        assert_eq!(
+            changelog_near_executable(&bin),
+            Some(std::fs::canonicalize(changelog).unwrap())
+        );
+    }
+
+    #[test]
+    fn explicit_pi_paths_do_not_use_global_fallback() {
+        assert!(!is_bare_pi_command("/opt/pi/bin/pi"));
+        assert!(!is_bare_pi_command("C:\\tools\\pi.cmd"));
+        assert!(is_bare_pi_command("pi"));
     }
 }

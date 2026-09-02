@@ -247,6 +247,7 @@ mod tests {
         assert!(r.cmd_args.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn bare_name_unix_picks_existing_path_entry() {
         // Use a real, existing file path as a stand-in directory entry so the
@@ -285,7 +286,10 @@ mod tests {
         assert_eq!(r.program, "cmd.exe");
         let joined = r.cmd_args.join(" ");
         assert!(joined.starts_with("/d /s /c "), "cmd_args: {joined}");
-        assert!(joined.ends_with("pi.cmd"), "cmd_args: {joined}");
+        assert!(
+            joined.to_ascii_lowercase().ends_with("pi.cmd"),
+            "cmd_args: {joined}"
+        );
     }
 
     #[test]
@@ -298,7 +302,11 @@ mod tests {
         // native binary wins (no shell needed).
         let r = resolve_pi_command("pi", win(), Some(&dir), Some(".EXE;.CMD"));
         assert!(r.cmd_args.is_empty(), "should not shell-wrap: {r:?}");
-        assert!(r.program.ends_with("pi.exe"), "program: {}", r.program);
+        assert!(
+            r.program.to_ascii_lowercase().ends_with("pi.exe"),
+            "program: {}",
+            r.program
+        );
     }
 
     #[test]

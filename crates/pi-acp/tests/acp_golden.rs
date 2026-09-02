@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionNotification,
-    TextContent,
+    ContentBlock, DeleteSessionRequest, InitializeRequest, NewSessionRequest, PromptRequest,
+    SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -76,7 +76,9 @@ fn normalize_frame(raw: &str, cwd: &str) -> Option<String> {
 fn normalize_value(v: &mut Value, cwd: &str) {
     match v {
         Value::String(s) => {
-            *s = s.replace(cwd, "<CWD>");
+            // Keep the checked-in golden independent of both path separators
+            // and the temp directory representation used by the host OS.
+            *s = s.replace(cwd, "<CWD>").replace('\\', "/");
             *s = normalize_pi_version(s);
         }
         Value::Object(map) => {
@@ -160,11 +162,16 @@ async fn capture_frames() -> (Vec<String>, String) {
                 .await?;
             let sid = new_session.session_id;
             cx.send_request(PromptRequest::new(
-                sid,
+                sid.clone(),
                 vec![ContentBlock::Text(TextContent::new("hello".to_string()))],
             ))
             .block_task()
             .await?;
+            // Dispose the nested pi before the ACP SDK tears down the outer
+            // adapter, keeping this process-backed fixture reaped on CI.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
             Ok(())
         })
         .await;
@@ -195,11 +202,12 @@ async fn acp_frame_sequence_matches_golden() {
     let golden = fs::read_to_string(&golden_path).unwrap_or_else(|_| {
         panic!("golden file missing at {GOLDEN}; run with UPDATE_GOLDEN=1 to create it")
     });
+    let golden = golden.replace("\r\n", "\n");
     assert_eq!(body, golden, "ACP frame sequence drifted from the golden file\n--- recorded ---\n{body}\n--- golden ---\n{golden}");
 
     // The ordering property the golden guards, stated explicitly: the startup
     // prelude (with the version-check notice) precedes the session/new
-    // response, and the prompt response is last.
+    // response, and the prompt response precedes the cleanup response.
     let lines: Vec<&str> = body.lines().collect();
     let find = |needle: &str| lines.iter().position(|l| l.contains(needle));
     let startup = find("pi v<VER>").expect("startup prelude frame");
@@ -264,4 +272,8 @@ fn normalization_is_stable() {
     assert!(out.contains("<CWD>/AGENTS.md"), "{out}");
     assert!(out.contains("\"updatedAt\":\"<TS>\""), "{out}");
     assert!(!out.contains("/tmp/x"), "{out}");
+
+    let mut windows = serde_json::json!({ "path": "C:\\tmp\\x\\AGENTS.md" });
+    normalize_value(&mut windows, "C:\\tmp\\x");
+    assert_eq!(windows["path"], "<CWD>/AGENTS.md");
 }

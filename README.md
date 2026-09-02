@@ -26,7 +26,16 @@ pi --version
 
 ### 2. Install pi-acp
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/AndPuQing/pi-acp/releases).
+The easiest option is the npm package, which selects the native binary for the
+current platform:
+
+```bash
+npm install --global @earendil-works/pi-acp
+pi-acp --version
+```
+
+You can also download the latest standalone release for your platform from
+[GitHub Releases](https://github.com/AndPuQing/pi-acp/releases).
 
 | Platform | Release asset |
 | --- | --- |

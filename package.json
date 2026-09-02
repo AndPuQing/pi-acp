@@ -1,0 +1,35 @@
+{
+  "name": "@earendil-works/pi-acp",
+  "version": "0.1.0",
+  "description": "ACP adapter for the pi coding agent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndPuQing/pi-acp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "pi-acp": "npm/bin/pi-acp.js"
+  },
+  "files": [
+    "npm/bin",
+    "npm/lib",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@earendil-works/pi-acp-linux-x64": "0.1.0",
+    "@earendil-works/pi-acp-linux-arm64": "0.1.0",
+    "@earendil-works/pi-acp-darwin-x64": "0.1.0",
+    "@earendil-works/pi-acp-darwin-arm64": "0.1.0",
+    "@earendil-works/pi-acp-win32-x64": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "node npm/scripts/check-package.mjs",
+    "test": "node --test npm/test/platform.test.js"
+  }
+}

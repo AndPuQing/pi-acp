@@ -4,6 +4,7 @@
 
 # Release staging (populated by CI / local packaging, never committed)
 /dist
+/npm-dist
 
 # Editor / OS
 .idea/

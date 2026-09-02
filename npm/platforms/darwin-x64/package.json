@@ -1,0 +1,22 @@
+{
+  "name": "@earendil-works/pi-acp-darwin-x64",
+  "version": "0.1.0",
+  "description": "macOS x64 binary for pi-acp",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndPuQing/pi-acp.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

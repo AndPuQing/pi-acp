@@ -187,6 +187,19 @@ fn text_chunks(recorded: &[Recorded]) -> Vec<String> {
         .collect()
 }
 
+fn thought_chunks(recorded: &[Recorded]) -> Vec<String> {
+    recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::Notify(SessionUpdate::AgentThoughtChunk(c)) => match &c.content {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 fn queue_depths(recorded: &[Recorded]) -> Vec<(u64, bool)> {
     recorded
         .iter()
@@ -240,6 +253,35 @@ fn read_log(path: &Path) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Turn queueing
 // ---------------------------------------------------------------------------
+
+/// The original TypeScript adapter forwards a thinking delta even when the
+/// event omits accounting and content-index fields. Keep that compatibility
+/// in the typed Rust RPC path.
+#[tokio::test]
+async fn forwards_thinking_delta_without_optional_wire_fields() {
+    let fx = fixture(&[]).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "thinking_delta",
+                    "delta": "thinking..."
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "hello").await.unwrap(),
+        StopReason::EndTurn
+    );
+    let recorded = fx.recorded.lock().await.clone();
+    assert_eq!(thought_chunks(&recorded), vec!["thinking...".to_string()]);
+}
 
 /// Two prompts: the second is queued while the first streams; the queue drains
 /// one-at-a-time, each turn completing on `agent_settled` (never `agent_end`).

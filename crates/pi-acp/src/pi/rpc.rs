@@ -321,6 +321,10 @@ pub enum RpcEvent {
         message: Value,
     },
     MessageUpdate {
+        // Older pi-compatible producers and the original adapter's test
+        // doubles omit usage. It is accounting-only and must not prevent the
+        // assistant delta from reaching the session pump.
+        #[serde(default)]
         usage: Usage,
         #[serde(rename = "assistantMessageEvent")]
         assistant_message_event: AssistantMessageEvent,
@@ -458,52 +462,52 @@ pub enum RpcEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantMessageEvent {
     Start {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
     },
     TextStart {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
     },
     /// Streaming assistant text arrives here, chunk by chunk (S2 constraint 3).
     TextDelta {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
         delta: String,
     },
     TextEnd {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
         content: String,
     },
     ThinkingStart {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
     },
     ThinkingDelta {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
         delta: String,
     },
     ThinkingEnd {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
         content: String,
     },
     ToolcallStart {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
         id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
     },
     ToolcallDelta {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
         delta: String,
     },
     ToolcallEnd {
-        #[serde(rename = "contentIndex")]
+        #[serde(rename = "contentIndex", default)]
         content_index: u32,
         #[serde(rename = "toolCall")]
         tool_call: Value,
@@ -663,6 +667,27 @@ mod tests {
                 assert_eq!(usage.total_tokens, 0);
                 assert_eq!(assistant_message_event.text_delta(), Some("pong"));
                 assert_eq!(assistant_message_event.content_index(), 1);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_deltas_without_usage_or_content_index() {
+        let ev = parse_event(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking..."}}"#,
+        );
+        match ev {
+            RpcEvent::MessageUpdate {
+                usage,
+                assistant_message_event,
+            } => {
+                assert_eq!(usage.total_tokens, 0);
+                assert_eq!(assistant_message_event.content_index(), 0);
+                assert!(matches!(
+                    assistant_message_event,
+                    AssistantMessageEvent::ThinkingDelta { delta, .. } if delta == "thinking..."
+                ));
             }
             other => panic!("unexpected event: {other:?}"),
         }

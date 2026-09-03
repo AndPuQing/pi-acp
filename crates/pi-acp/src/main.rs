@@ -192,9 +192,10 @@ fn terminal_login() -> Result<()> {
 ///
 /// Default: respond `success: true` to every command (with a fixed `get_state`
 /// payload), and after a `prompt` command emit a `text_delta` message_update
-/// (carrying token usage) followed by `agent_settled` (mirroring pi's
-/// early-response + settled-event semantics, S2 constraint 2). After an
-/// `abort`, emit `agent_settled` (pi settles once the aborted turn unwinds).
+/// with an empty usage snapshot, the final assistant `message_end` with token
+/// usage, and then `agent_settled` (mirroring pi's early-response + settled-
+/// event semantics, S2 constraint 2). After an `abort`, emit `agent_settled`
+/// (pi settles once the aborted turn unwinds).
 async fn run_mock_rpc() -> Result<()> {
     use std::path::PathBuf;
 
@@ -574,12 +575,13 @@ fn persist_mock_session_file(path: &Path, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The default post-prompt event sequence: a `text_delta` message_update
-/// (carrying token usage) followed by `agent_settled`.
+/// The default post-prompt event sequence: a `text_delta` message_update with
+/// an empty usage snapshot, the final assistant `message_end` with token
+/// usage, and `agent_settled`.
 async fn emit_default_prompt_response(stdout: &mut tokio::io::Stdout) -> Result<()> {
     let update = serde_json::json!({
         "type": "message_update",
-        "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15},
+        "usage": {},
         "assistantMessageEvent": {
             "type": "text_delta",
             "contentIndex": 0,
@@ -587,6 +589,15 @@ async fn emit_default_prompt_response(stdout: &mut tokio::io::Stdout) -> Result<
         }
     });
     mock_write_line(stdout, update.to_string().as_bytes()).await?;
+    let end = serde_json::json!({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello from mock"}],
+            "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15}
+        }
+    });
+    mock_write_line(stdout, end.to_string().as_bytes()).await?;
     mock_write_line(stdout, b"{\"type\":\"agent_settled\"}").await?;
     Ok(())
 }

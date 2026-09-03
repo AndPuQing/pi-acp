@@ -243,7 +243,9 @@ pub struct Model {
     pub input: Option<Vec<String>>,
 }
 
-/// Token/cost accounting carried by `message_update` events (`Usage` from pi-ai).
+/// Token/cost accounting carried by pi assistant messages (`Usage` from
+/// pi-ai). Streaming `message_update` snapshots may be empty; the final
+/// `message_end` message carries the authoritative values.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {

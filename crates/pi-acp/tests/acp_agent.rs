@@ -336,8 +336,8 @@ async fn full_method_set_against_mock_pi() {
             })
             .await;
             let _ = chunk;
-            // usage_update (decision 3): used=15 from the mock's message_update,
-            // size=1000 from the mock model's contextWindow.
+            // usage_update (decision 3): used=15 from the final assistant
+            // message_end, size=1000 from the mock model's contextWindow.
             let usage = wait_for(&log, |u| {
                 matches!(u, SessionUpdate::UsageUpdate(uu) if uu.used == 15)
             })

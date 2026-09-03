@@ -1116,6 +1116,43 @@ async fn settle_timeout_fails_queue_and_poison_session() {
     fx.session.dispose().await;
 }
 
+/// Restoring a file under one ACP id must fail when pi reports a different
+/// native id, and the rejected spawn must not leave its mock child running.
+#[tokio::test]
+async fn session_id_override_mismatch_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_file = tmp.path().join("native.jsonl");
+    let header = json!({
+        "type": "session",
+        "id": "native-session-id",
+        "cwd": tmp.path().to_string_lossy(),
+    });
+    fs::write(&session_file, format!("{header}\n")).unwrap();
+    let (outbound_tx, _outbound_rx) = mpsc::channel(16);
+
+    let result = PiAcpSession::spawn(SessionParams {
+        pi_command: BIN.to_string(),
+        extra_args: vec!["--mock-rpc".to_string()],
+        timeout: TIMEOUT,
+        settle_timeout: Duration::ZERO,
+        cwd: tmp.path().to_path_buf(),
+        outbound: outbound_tx,
+        session_path: Some(session_file),
+        session_id_override: Some("requested-session-id".into()),
+        file_commands: vec![],
+    })
+    .await;
+
+    match result {
+        Err(AcpxError::SessionIdMismatch { expected, actual }) => {
+            assert_eq!(expected, "requested-session-id");
+            assert_eq!(actual, "native-session-id");
+        }
+        Ok(_) => panic!("mismatched native session id must be rejected"),
+        Err(other) => panic!("expected SessionIdMismatch, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SessionManager
 // ---------------------------------------------------------------------------

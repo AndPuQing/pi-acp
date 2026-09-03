@@ -220,20 +220,10 @@ async fn full_method_set_against_mock_pi() {
             let sid = new_session.session_id.clone();
             assert!(!sid.0.is_empty());
 
-            let session_map: Value = serde_json::from_str(
-                &fs::read_to_string(agent_dir.join("pi-acp/session-map.json"))
-                    .expect("session/new must persist its session mapping"),
-            )
-            .expect("session map must be valid JSON");
-            let stored = &session_map["sessions"]["mock-session-id"];
-            let cwd_string = cwd.to_string_lossy().into_owned();
-            assert_eq!(
-                stored.get("sessionId").and_then(Value::as_str),
-                Some("mock-session-id")
-            );
-            assert_eq!(
-                stored.get("cwd").and_then(Value::as_str),
-                Some(cwd_string.as_str())
+            let session_map_path = agent_dir.join("pi-acp/session-map.json");
+            assert!(
+                !session_map_path.exists(),
+                "an empty new session must not be persisted before its file is flushed"
             );
 
             // configOptions: model select first, then thought_level select.
@@ -576,6 +566,137 @@ async fn full_method_set_against_mock_pi() {
             "mock command log missing {expected}: {cmds}"
         );
     }
+}
+
+/// A new pi session reports a session-file path before the file is durable;
+/// the map entry is written only after the first successful prompt flushes it.
+#[tokio::test]
+async fn new_session_map_waits_for_persisted_session_file() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    let session_file = tmp.path().join("sessions/mock-session.jsonl");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+            .env("PI_ACP_MOCK_SESSION_FILE", session_file.to_str().unwrap()),
+    );
+
+    let result = Client
+        .builder()
+        .name("s6-session-persistence-client")
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd.clone()))
+                .block_task()
+                .await?;
+            assert_eq!(new_session.session_id.0.as_ref(), "mock-session-id");
+            assert!(
+                !session_file.exists(),
+                "mock new session must start without a persisted file"
+            );
+            assert!(
+                !agent_dir.join("pi-acp/session-map.json").exists(),
+                "session/new must not write a mapping for an unpersisted file"
+            );
+
+            let prompt = cx
+                .send_request(PromptRequest::new(
+                    new_session.session_id.clone(),
+                    vec![ContentBlock::Text(TextContent::new("persist".to_string()))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+
+            let map: Value = serde_json::from_str(
+                &fs::read_to_string(agent_dir.join("pi-acp/session-map.json"))
+                    .expect("first prompt must persist the session mapping"),
+            )
+            .expect("session map must be valid JSON");
+            let stored = &map["sessions"]["mock-session-id"];
+            assert_eq!(stored["sessionId"], "mock-session-id");
+            assert_eq!(stored["cwd"], cwd.to_string_lossy().as_ref());
+            assert_eq!(
+                stored["sessionFile"],
+                session_file.to_string_lossy().as_ref()
+            );
+            let header: Value = serde_json::from_str(
+                fs::read_to_string(&session_file)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(header["id"], "mock-session-id");
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
+/// A session/new that never reaches a persisted turn must not become
+/// loadable after the ACP process is restarted.
+#[tokio::test]
+async fn unpersisted_new_session_is_unknown_after_restart() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    let session_file = tmp.path().join("sessions/never-persisted.jsonl");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+
+    let make_agent = || {
+        AcpAgent::new(
+            AcpAgentConfig::new(BIN)
+                .env("PI_ACP_MOCK", "1")
+                .env("PI_ACP_PI_COMMAND", BIN)
+                .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+                .env("PI_ACP_MOCK_SESSION_FILE", session_file.to_str().unwrap()),
+        )
+    };
+
+    let first = Client
+        .builder()
+        .name("s6-session-restart-create-client")
+        .connect_with(make_agent(), async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd.clone()))
+                .block_task()
+                .await?;
+            assert_eq!(new_session.session_id.0.as_ref(), "mock-session-id");
+            assert!(!session_file.exists());
+            assert!(!agent_dir.join("pi-acp/session-map.json").exists());
+            Ok(())
+        })
+        .await;
+    first.expect("initial connection should complete");
+
+    let second = Client
+        .builder()
+        .name("s6-session-restart-load-client")
+        .connect_with(make_agent(), async |cx| {
+            let err = cx
+                .send_request(LoadSessionRequest::new(
+                    "mock-session-id".to_string(),
+                    cwd.clone(),
+                ))
+                .block_task()
+                .await
+                .expect_err("an unpersisted new session must not be loadable");
+            assert!(err.message.contains("Unknown sessionId"), "{err}");
+            Ok(())
+        })
+        .await;
+    second.expect("restart connection should complete");
 }
 
 /// session/set_model with an unknown session must produce a JSON-RPC error

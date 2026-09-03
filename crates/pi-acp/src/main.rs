@@ -187,6 +187,8 @@ fn terminal_login() -> Result<()> {
 ///   response until its scenario events have been emitted (channel-order tests)
 /// - `--mock-models-error <text>`   answer `get_available_models` with
 ///   `success:false` and this error text (authRequired-on-new tests)
+/// - `PI_ACP_MOCK_SESSION_FILE`     session file path for a new mock session;
+///   the mock writes a valid session header after the first successful prompt
 ///
 /// Default: respond `success: true` to every command (with a fixed `get_state`
 /// payload), and after a `prompt` command emit a `text_delta` message_update
@@ -213,6 +215,8 @@ async fn run_mock_rpc() -> Result<()> {
     let mut prompt_hang = false;
     let mut prompt_response_after_events_ms: u64 = 0;
     let mut models_error: Option<String> = None;
+    let env_session_file = std::env::var_os("PI_ACP_MOCK_SESSION_FILE").map(PathBuf::from);
+    let mut session_arg: Option<PathBuf> = None;
     let mut prompt_count: usize = 0;
     // Stateful mock: real pi keeps these across RPC calls, and the agent's
     // config-option / slash-command handlers read them back via get_state.
@@ -247,6 +251,7 @@ async fn run_mock_rpc() -> Result<()> {
                     args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
             }
             "--mock-models-error" => models_error = args.next(),
+            "--session" => session_arg = args.next().map(PathBuf::from),
             _ => {}
         }
     }
@@ -267,6 +272,16 @@ async fn run_mock_rpc() -> Result<()> {
             .ok()
             .and_then(|v| v.parse().ok());
     }
+
+    let mock_session_file = session_arg
+        .clone()
+        .or_else(|| env_session_file.clone())
+        .unwrap_or_else(|| PathBuf::from("/tmp/mock-session.jsonl"));
+    let mock_session_id = session_arg
+        .as_deref()
+        .and_then(read_mock_session_id)
+        .unwrap_or_else(|| "mock-session-id".to_string());
+    let persist_new_session = session_arg.is_none() && env_session_file.is_some();
 
     if let Some(log) = &cwd_log {
         if let Ok(cwd) = std::env::current_dir() {
@@ -365,8 +380,8 @@ async fn run_mock_rpc() -> Result<()> {
                 "isCompacting": false,
                 "steeringMode": mock_steering_mode,
                 "followUpMode": mock_follow_up_mode,
-                "sessionFile": "/tmp/mock-session.jsonl",
-                "sessionId": "mock-session-id",
+                "sessionFile": mock_session_file.to_string_lossy(),
+                "sessionId": mock_session_id,
                 "sessionName": mock_session_name,
                 "autoCompactionEnabled": mock_auto_compaction,
                 "messageCount": 3,
@@ -387,8 +402,8 @@ async fn run_mock_rpc() -> Result<()> {
                 "summary": "The conversation was summarized."
             }),
             "get_session_stats" => serde_json::json!({
-                "sessionId": "mock-session-id",
-                "sessionFile": "/tmp/mock-session.jsonl",
+                "sessionId": mock_session_id,
+                "sessionFile": mock_session_file.to_string_lossy(),
                 "totalMessages": 3,
                 "cost": 0.0123,
                 "tokens": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "total": 165}
@@ -513,12 +528,49 @@ async fn run_mock_rpc() -> Result<()> {
                 .await;
                 mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
             }
+            if persist_new_session {
+                persist_mock_session_file(&mock_session_file, &mock_session_id)?;
+            }
         } else if success && ty == "abort" {
             // pi settles once an aborted turn unwinds.
             mock_write_line(&mut stdout, b"{\"type\":\"agent_settled\"}").await?;
         }
     }
 
+    Ok(())
+}
+
+/// Read the native id from a persisted pi session header. A missing or
+/// malformed file intentionally falls back to the default mock id, which lets
+/// restore tests exercise the adapter's mismatch check.
+fn read_mock_session_id(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let first = raw.lines().next()?.trim();
+    let value: serde_json::Value = serde_json::from_str(first).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session") {
+        return None;
+    }
+    let id = value.get("id").and_then(serde_json::Value::as_str)?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Simulate pi flushing a new session after its first successful turn. The
+/// caller can still use a scenario directive to provide richer file content;
+/// an existing file is therefore left untouched.
+fn persist_mock_session_file(path: &Path, session_id: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cwd = std::env::current_dir()?;
+    let header = serde_json::json!({
+        "type": "session",
+        "id": session_id,
+        "cwd": cwd.to_string_lossy(),
+    });
+    std::fs::write(path, format!("{header}\n"))?;
     Ok(())
 }
 

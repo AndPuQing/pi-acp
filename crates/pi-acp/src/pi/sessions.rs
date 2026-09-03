@@ -120,6 +120,16 @@ fn parse_session_header(first_line: &str) -> Option<(String, String)> {
     Some((session_id.to_string(), cwd.to_string()))
 }
 
+/// Return whether `path` is a persisted pi session whose header has
+/// `expected_id`. A session path from `get_state` can exist before pi has
+/// flushed the first assistant response, so callers must check the file rather
+/// than treating the reported path as durable.
+pub fn session_file_matches_id(path: &Path, expected_id: &str) -> bool {
+    read_first_line(path)
+        .and_then(|first| parse_session_header(&first))
+        .is_some_and(|(session_id, _)| session_id == expected_id)
+}
+
 /// Latest `session_info.name` in the tail (scanned backwards).
 fn pick_title_from_tail(tail: &str) -> Option<String> {
     for line in tail.lines().rev() {
@@ -523,6 +533,23 @@ mod tests {
             parse_session_header(r#"{"type":"session","id":"","cwd":"/x"}"#),
             None
         );
+    }
+
+    #[test]
+    fn session_file_matches_id_requires_a_valid_persisted_header() {
+        let dir = TempDir::new().unwrap();
+        let valid = dir.path().join("valid.jsonl");
+        fs::write(&valid, format!("{}\n", header("s1", "/work"))).unwrap();
+        assert!(session_file_matches_id(&valid, "s1"));
+        assert!(!session_file_matches_id(&valid, "other"));
+
+        let invalid = dir.path().join("invalid.jsonl");
+        fs::write(&invalid, message_line("user", "2026-08-01T10:00:00.000Z")).unwrap();
+        assert!(!session_file_matches_id(&invalid, "s1"));
+        assert!(!session_file_matches_id(
+            &dir.path().join("missing.jsonl"),
+            "s1"
+        ));
     }
 
     #[test]

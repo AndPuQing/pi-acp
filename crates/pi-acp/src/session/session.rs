@@ -126,8 +126,9 @@ pub struct SessionParams {
     /// Optional pi session file to resume (`--session <path>`; used by
     /// `session/load`).
     pub session_path: Option<PathBuf>,
-    /// Optional ACP session id override (used by `session/load`: the session
-    /// is registered under the requested id, not the spawned pi's own).
+    /// Optional ACP session id override (used by `session/load`). It must match
+    /// the id reported by pi for `session_path`; it is only an ACP registration
+    /// value, never a replacement for pi's native/provider session id.
     pub session_id_override: Option<SessionId>,
     /// File-based slash commands to expand in `prompt` (pi RPC mode disables
     /// its own slash expansion, so pi-acp does it — TS `session.ts`).
@@ -324,9 +325,23 @@ impl PiAcpSession {
                 return Err(err);
             }
         };
-        let session_id = params
-            .session_id_override
-            .unwrap_or_else(|| state.session_id.clone().into());
+        let session_id = match params.session_id_override {
+            Some(expected) => {
+                if expected.0.as_ref() != state.session_id.as_str() {
+                    let expected_id = expected.0.to_string();
+                    let actual_id = state.session_id.clone();
+                    // Do not leave a pi child running after rejecting a stale
+                    // map entry or a missing session file.
+                    proc.dispose().await;
+                    return Err(AcpxError::SessionIdMismatch {
+                        expected: expected_id,
+                        actual: actual_id,
+                    });
+                }
+                expected
+            }
+            None => state.session_id.clone().into(),
+        };
         tracing::info!(session_id = %session_id.0, "pi session ready");
         let rpc = proc.request_client();
         let event_rx = match proc.take_event_receiver() {

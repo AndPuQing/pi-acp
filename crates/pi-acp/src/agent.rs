@@ -66,7 +66,9 @@ use crate::commands::{self, FileSlashCommand};
 use crate::config::Config;
 use crate::error::{AcpxError, Result};
 use crate::pi::rpc::{ImageContent, Model, QueueMode, RpcSessionState, ThinkingLevel};
-use crate::pi::sessions::{find_pi_session, list_pi_sessions, title_from_session_file};
+use crate::pi::sessions::{
+    find_pi_session, list_pi_sessions, session_file_matches_id, title_from_session_file,
+};
 use crate::session::{
     spawn_outbound_connector, PiAcpSession, SessionManager, SessionParams,
     StopReason as SessionStopReason,
@@ -570,8 +572,17 @@ impl AcpAgent {
             .and_then(|s| s.session_file.as_deref())
             .filter(|path| !path.trim().is_empty())
         {
-            self.store
-                .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
+            let path = resolve_session_file_path(&req.cwd, session_file);
+            if session_file_matches_id(&path, &session_id.0) {
+                self.store
+                    .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
+            } else {
+                tracing::debug!(
+                    session = %session_id,
+                    ?path,
+                    "session file is not persisted yet; delaying session-map entry"
+                );
+            }
         }
 
         let update_notice = if let Some(task) = notice_task.take() {
@@ -648,6 +659,56 @@ impl AcpAgent {
         self.store.delete(&session_id.0);
     }
 
+    /// Persist a new session's map entry after pi has had a chance to flush
+    /// its first assistant response. pi intentionally keeps an empty new
+    /// session in memory, so `get_state.sessionFile` alone is not proof that
+    /// the path can be restored after this process exits.
+    async fn persist_session_if_ready(&self, session: &Arc<PiAcpSession>) {
+        let state = match session.get_state().await {
+            Ok(state) => state,
+            Err(err) => {
+                // The prompt already settled; a late process exit should not
+                // turn a successful turn into a persistence error.
+                tracing::debug!(
+                    session = %session.session_id(),
+                    error = %err,
+                    "could not refresh session state for persistence"
+                );
+                return;
+            }
+        };
+        let Some(session_file) = state
+            .session_file
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        else {
+            return;
+        };
+
+        let path = resolve_session_file_path(session.cwd(), session_file);
+        if state.session_id != session.session_id().0.as_ref() {
+            tracing::warn!(
+                expected = %session.session_id(),
+                actual = %state.session_id,
+                "pi session id changed unexpectedly; refusing to persist session map entry"
+            );
+            return;
+        }
+        if session_file_matches_id(&path, &state.session_id) {
+            self.store.upsert(
+                session.session_id().0.as_ref(),
+                &session.cwd().to_string_lossy(),
+                session_file,
+            );
+        } else {
+            tracing::debug!(
+                session = %session.session_id(),
+                ?path,
+                "session file is still not persisted; leaving session-map unchanged"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // session/prompt
     // -----------------------------------------------------------------------
@@ -693,6 +754,7 @@ impl AcpAgent {
             .prompt(pi_prompt.message, to_pi_images(pi_prompt.images))
             .await
             .map_err(acp_error_from_pi)?;
+        self.persist_session_if_ready(&session).await;
         let stop_reason = acp_stop_reason(reason);
         tracing::info!(session = %session_id, ?stop_reason, "prompt turn settled");
         Ok(PromptResponse::new(stop_reason))
@@ -1414,6 +1476,17 @@ fn acp_stop_reason(reason: SessionStopReason) -> StopReason {
     match reason {
         SessionStopReason::EndTurn => StopReason::EndTurn,
         SessionStopReason::Cancelled => StopReason::Cancelled,
+    }
+}
+
+/// Resolve a session file the same way pi does when it receives a relative
+/// `--session` path while running in the session cwd.
+fn resolve_session_file_path(cwd: &Path, session_file: &str) -> PathBuf {
+    let path = Path::new(session_file);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
     }
 }
 

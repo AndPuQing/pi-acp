@@ -1046,6 +1046,71 @@ async fn unknown_events_do_not_break_the_turn() {
     assert_eq!(text_chunks(&recorded), vec!["still works".to_string()]);
 }
 
+/// pi-initiated `thinking_level_changed` pushes both selectors so Zed's mode
+/// picker and thinking dropdown follow (W-475).
+#[tokio::test]
+async fn thinking_level_changed_pushes_mode_and_config_updates() {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+    let fx = fixture(&[]).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({"type":"thinking_level_changed","level":"high"}),
+            json!({"type":"message_update","usage":{},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"ok"}}),
+        ],
+    );
+    assert_eq!(prompt_turn(&fx, "hi").await.unwrap(), StopReason::EndTurn);
+    wait_until(&fx, |rec| {
+        rec.iter()
+            .any(|r| matches!(r, Recorded::Notify(SessionUpdate::ConfigOptionUpdate(_))))
+    })
+    .await;
+    let recorded = fx.recorded.lock().await.clone();
+    assert!(
+        recorded.iter().any(|r| matches!(
+            r,
+            Recorded::Notify(SessionUpdate::CurrentModeUpdate(u))
+                if u.current_mode_id.0.as_ref() == "high"
+        )),
+        "mode picker must follow the pi-initiated change: {recorded:?}"
+    );
+    let update = recorded
+        .iter()
+        .rev()
+        .filter_map(|r| match r {
+            Recorded::Notify(SessionUpdate::ConfigOptionUpdate(u)) => Some(u),
+            _ => None,
+        })
+        .next()
+        .expect("config_option_update");
+    let thought = update
+        .config_options
+        .iter()
+        .find(|o| o.id.0.as_ref() == "thought_level")
+        .expect("thought_level option");
+    if let SessionConfigKind::Select(sel) = &thought.kind {
+        assert_eq!(sel.current_value.0.as_ref(), "high");
+        if let SessionConfigSelectOptions::Ungrouped(options) = &sel.options {
+            let ids: Vec<&str> = options.iter().map(|o| o.value.0.as_ref()).collect();
+            assert_eq!(
+                ids,
+                vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert!(
+                options
+                    .iter()
+                    .all(|o| !o.name.is_empty() && o.description.is_some()),
+                "every level needs a label + description for Zed"
+            );
+        } else {
+            panic!("thought_level options must be ungrouped");
+        }
+    } else {
+        panic!("thought_level option must be a select");
+    }
+}
+
 /// A dead pi fails the in-flight turn with `PiExited` instead of a silent
 /// empty end_turn (fixes #82). `--mock-exit-after 2` lets the mock answer the
 /// session handshake `get_state` (command 1) and die on the `prompt` (2).

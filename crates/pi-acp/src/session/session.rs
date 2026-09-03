@@ -41,10 +41,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Cost, Diff, PermissionOption, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionInfoUpdate, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, CurrentModeUpdate, Diff,
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::{json, Value};
@@ -54,7 +55,7 @@ use crate::error::{AcpxError, Result};
 use crate::pi::process::{PiProcess, RpcClient};
 use crate::pi::rpc::{
     AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
-    RpcCommand, RpcEvent, Usage,
+    Model, RpcCommand, RpcEvent, RpcSessionState, ThinkingLevel, Usage,
 };
 use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
@@ -1046,6 +1047,67 @@ impl Pump {
 
     // --- pi events ---
 
+    /// Forward pi's `thinking_level_changed` to the client so Zed's thinking
+    /// selectors follow pi-initiated changes (e.g. alongside a model switch).
+    ///
+    /// The mode update is authoritative from the event and always emitted.
+    /// The config-option refresh re-reads pi state (best-effort): a failed
+    /// round-trip must not turn an informational event into a turn failure,
+    /// so the mode update still stands on its own.
+    async fn on_thinking_level_changed(&mut self, level: ThinkingLevel) {
+        self.emit(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+            level.id(),
+        )))
+        .await;
+        let (state_res, models_res) = tokio::join!(
+            self.rpc.request(&RpcCommand::GetState),
+            self.rpc.request(&RpcCommand::GetAvailableModels),
+        );
+        let (Ok(state_data), Ok(models_data)) = (state_res, models_res) else {
+            return;
+        };
+        let current_model = serde_json::from_value::<RpcSessionState>(state_data)
+            .ok()
+            .and_then(|s| s.model)
+            .and_then(|m| {
+                let provider = m.provider.trim();
+                let id = m.id.trim();
+                if provider.is_empty() || id.is_empty() {
+                    None
+                } else {
+                    Some(format!("{provider}/{id}"))
+                }
+            });
+        let available: Vec<(String, String)> = models_data
+            .get("models")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<Model>>(v).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                let provider = m.provider.trim();
+                let id = m.id.trim();
+                if provider.is_empty() || id.is_empty() {
+                    None
+                } else {
+                    Some((format!("{provider}/{id}"), format!("{provider}/{}", m.name)))
+                }
+            })
+            .collect();
+        let mut options = vec![crate::agent::thought_level_config_option(level.id())];
+        let current_model_id = current_model
+            .or_else(|| available.first().map(|(id, _)| id.clone()))
+            .unwrap_or_default();
+        if let Some(model_option) = crate::agent::model_config_option(&current_model_id, &available)
+        {
+            options.insert(0, model_option);
+        }
+        self.emit(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+            options,
+        )))
+        .await;
+    }
+
     async fn on_event(&mut self, ev: RpcEvent) {
         match ev {
             RpcEvent::MessageUpdate {
@@ -1143,9 +1205,14 @@ impl Pump {
                     self.emit(SessionUpdate::SessionInfoUpdate(update)).await;
                 }
             }
-            // Not wired (logged): QueueUpdate / ThinkingLevelChanged /
-            // EntryAppended / UnmatchedResponse / ExtensionError /
-            // summarization retries / unknown future events.
+            // pi changed the thinking level itself: push both selectors so
+            // Zed's mode picker and thinking dropdown follow.
+            RpcEvent::ThinkingLevelChanged { level } => {
+                self.on_thinking_level_changed(level).await;
+            }
+            // Not wired (logged): QueueUpdate / EntryAppended /
+            // UnmatchedResponse / ExtensionError / summarization retries /
+            // unknown future events.
             other => {
                 tracing::trace!(?other, "unhandled pi event");
             }

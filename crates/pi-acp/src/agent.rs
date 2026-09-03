@@ -121,7 +121,7 @@ struct ModelState {
     current_model_id: String,
 }
 
-/// Thought-level mode state (the fixed `off..xhigh` ladder).
+/// Thought-level mode state (the fixed `off..max` ladder).
 #[derive(Debug, Clone)]
 struct ModeState {
     current_mode_id: String,
@@ -932,7 +932,7 @@ impl AcpAgent {
     ) -> std::result::Result<SetSessionModeResponse, AcpError> {
         let session = self.restore_session(&req.session_id, None, cx).await?;
         let mode = req.mode_id.0.as_ref();
-        let level = parse_thinking_level(mode)
+        let level = ThinkingLevel::parse(mode)
             .ok_or_else(|| invalid_params(&format!("Unknown modeId: {mode}")))?;
 
         session
@@ -972,7 +972,7 @@ impl AcpAgent {
                     .map_err(acp_error_from_pi)?;
             }
             THOUGHT_LEVEL_CONFIG_ID => {
-                let level = parse_thinking_level(&value)
+                let level = ThinkingLevel::parse(&value)
                     .ok_or_else(|| invalid_params(&format!("Unknown thinking level: {value}")))?;
                 session
                     .set_thinking_level(level)
@@ -1694,15 +1694,19 @@ async fn get_mode_state(
     };
     let current = state
         .as_ref()
-        .and_then(|s| thinking_level_str(s.thinking_level))
+        .map(|s| s.thinking_level.id())
         .unwrap_or("medium");
 
     ModeState {
         current_mode_id: current.to_string(),
-        available_modes: THINKING_LEVELS
+        available_modes: ThinkingLevel::all()
             .iter()
-            .map(|(id, name)| {
-                SessionMode::new(SessionModeId::new(*id), format!("Thinking: {name}"))
+            .map(|level| {
+                SessionMode::new(
+                    SessionModeId::new(level.id()),
+                    format!("Thinking: {}", level.label()),
+                )
+                .description(level.description().to_string())
             })
             .collect(),
     }
@@ -1712,41 +1716,64 @@ fn build_config_options(
     models: Option<&ModelState>,
     modes: &ModeState,
 ) -> Vec<SessionConfigOption> {
-    let thought_level_options: Vec<SessionConfigSelectOption> = modes
-        .available_modes
-        .iter()
-        .map(|m| SessionConfigSelectOption::new(m.id.0.as_ref().to_string(), m.name.clone()))
-        .collect();
-    let mut options = vec![SessionConfigOption::select(
-        THOUGHT_LEVEL_CONFIG_ID,
-        "Thinking",
-        modes.current_mode_id.clone(),
-        thought_level_options,
-    )
-    .description("Set the reasoning effort for this session")
-    .category(SessionConfigOptionCategory::ThoughtLevel)];
+    let mut options = vec![thought_level_config_option(&modes.current_mode_id)];
 
     if let Some(models) = models {
-        if !models.available_models.is_empty() {
-            let model_options: Vec<SessionConfigSelectOption> = models
-                .available_models
-                .iter()
-                .map(|m| SessionConfigSelectOption::new(m.model_id.clone(), m.name.clone()))
-                .collect();
-            options.insert(
-                0,
-                SessionConfigOption::select(
-                    MODEL_CONFIG_ID,
-                    "Model",
-                    models.current_model_id.clone(),
-                    model_options,
-                )
-                .description("Select the model for this session")
-                .category(SessionConfigOptionCategory::Model),
-            );
+        let available: Vec<(String, String)> = models
+            .available_models
+            .iter()
+            .map(|m| (m.model_id.clone(), m.name.clone()))
+            .collect();
+        if let Some(model_option) = model_config_option(&models.current_model_id, &available) {
+            options.insert(0, model_option);
         }
     }
     options
+}
+
+/// Build the `thought_level` config option for `current_level_id` (shared
+/// with the session pump's `thinking_level_changed` handler so the ACP
+/// thinking dropdown and the mode picker always describe the same ladder).
+pub(crate) fn thought_level_config_option(current_level_id: &str) -> SessionConfigOption {
+    let options: Vec<SessionConfigSelectOption> = ThinkingLevel::all()
+        .iter()
+        .map(|level| {
+            SessionConfigSelectOption::new(level.id().to_string(), level.label().to_string())
+                .description(level.description().to_string())
+        })
+        .collect();
+    SessionConfigOption::select(
+        THOUGHT_LEVEL_CONFIG_ID,
+        "Thinking",
+        current_level_id.to_string(),
+        options,
+    )
+    .description("Set the reasoning effort for this session")
+    .category(SessionConfigOptionCategory::ThoughtLevel)
+}
+
+/// Build the `model` config option (`None` when no models are advertised).
+pub(crate) fn model_config_option(
+    current_model_id: &str,
+    available: &[(String, String)],
+) -> Option<SessionConfigOption> {
+    if available.is_empty() {
+        return None;
+    }
+    let options: Vec<SessionConfigSelectOption> = available
+        .iter()
+        .map(|(id, name)| SessionConfigSelectOption::new(id.clone(), name.clone()))
+        .collect();
+    Some(
+        SessionConfigOption::select(
+            MODEL_CONFIG_ID,
+            "Model",
+            current_model_id.to_string(),
+            options,
+        )
+        .description("Select the model for this session")
+        .category(SessionConfigOptionCategory::Model),
+    )
 }
 
 /// Resolve `provider/model` (or bare `model` via the available-model list) and
@@ -1779,39 +1806,6 @@ async fn set_session_model(
         }),
     }
 }
-
-fn parse_thinking_level(s: &str) -> Option<ThinkingLevel> {
-    match s {
-        "off" => Some(ThinkingLevel::Off),
-        "minimal" => Some(ThinkingLevel::Minimal),
-        "low" => Some(ThinkingLevel::Low),
-        "medium" => Some(ThinkingLevel::Medium),
-        "high" => Some(ThinkingLevel::High),
-        "xhigh" => Some(ThinkingLevel::XHigh),
-        _ => None,
-    }
-}
-
-fn thinking_level_str(level: ThinkingLevel) -> Option<&'static str> {
-    match level {
-        ThinkingLevel::Off => Some("off"),
-        ThinkingLevel::Minimal => Some("minimal"),
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-        ThinkingLevel::XHigh => Some("xhigh"),
-    }
-}
-
-/// The fixed thought-level ladder (id, display name).
-const THINKING_LEVELS: [(&str, &str); 6] = [
-    ("off", "off"),
-    ("minimal", "minimal"),
-    ("low", "low"),
-    ("medium", "medium"),
-    ("high", "high"),
-    ("xhigh", "xhigh"),
-];
 
 /// Replay a session's message history as ACP notifications (TS `loadSession`).
 async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, data: &Value) {

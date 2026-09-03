@@ -278,6 +278,15 @@ async fn full_method_set_against_mock_pi() {
                 assert!(names.contains(&builtin), "builtin /{builtin} advertised: {names:?}");
             }
 
+            // A new session has no pi usage event yet. The adapter still
+            // publishes the model's context window so Zed can render its
+            // context indicator before the first real turn.
+            let initial_usage = wait_for(&log, |u| {
+                matches!(u, SessionUpdate::UsageUpdate(uu) if uu.used == 0 && uu.size == 1000)
+            })
+            .await;
+            assert!(matches!(initial_usage, SessionUpdate::UsageUpdate(_)));
+
             // ---------------------------------------------------------------
             // 6. cancel (through the full ACP path, mid-turn)
             // ---------------------------------------------------------------
@@ -329,7 +338,10 @@ async fn full_method_set_against_mock_pi() {
             let _ = chunk;
             // usage_update (decision 3): used=15 from the mock's message_update,
             // size=1000 from the mock model's contextWindow.
-            let usage = wait_for(&log, |u| matches!(u, SessionUpdate::UsageUpdate(_))).await;
+            let usage = wait_for(&log, |u| {
+                matches!(u, SessionUpdate::UsageUpdate(uu) if uu.used == 15)
+            })
+            .await;
             let SessionUpdate::UsageUpdate(uu) = usage else {
                 unreachable!()
             };

@@ -272,6 +272,10 @@ impl AcpAgent {
                     match result {
                         Ok((resp, post_response)) => {
                             responder.respond(resp)?;
+                            // Publish the empty context state before the
+                            // handler returns, so a client cannot race the
+                            // post-response task with its first prompt.
+                            let _ = post_response.session.publish_initial_usage().await;
                             let cx_for_task = cx.clone();
                             cx.spawn(async move {
                                 post_response.send(&cx_for_task).await;

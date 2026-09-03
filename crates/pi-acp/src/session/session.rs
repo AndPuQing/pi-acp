@@ -994,8 +994,8 @@ impl Pump {
         self.emit(update).await;
     }
 
-    /// Emit an ACP `usage_update` from pi's `message_update.usage` (decision 3:
-    /// first release includes the standard notification, aligning #106).
+    /// Emit an ACP `usage_update` from pi's assistant-message usage (decision
+    /// 3: first release includes the standard notification, aligning #106).
     ///
     /// `used` = pi's cumulative context token count (`totalTokens`, falling
     /// back to the component sum); `size` = the active model's context window;
@@ -1034,6 +1034,16 @@ impl Pump {
             .await;
     }
 
+    /// pi's streaming `message_update` can carry an empty usage snapshot. The
+    /// final assistant `message_end` contains the authoritative usage, so only
+    /// extract usage from assistant messages here.
+    fn usage_from_assistant_message(message: &Value) -> Option<Usage> {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            return None;
+        }
+        serde_json::from_value(message.get("usage")?.clone()).ok()
+    }
+
     // --- pi events ---
 
     async fn on_event(&mut self, ev: RpcEvent) {
@@ -1044,6 +1054,11 @@ impl Pump {
             } => {
                 self.emit_usage_update(&usage).await;
                 self.on_message_update(&assistant_message_event).await;
+            }
+            RpcEvent::MessageEnd { message } => {
+                if let Some(usage) = Self::usage_from_assistant_message(&message) {
+                    self.emit_usage_update(&usage).await;
+                }
             }
             RpcEvent::ToolExecutionStart {
                 tool_call_id,

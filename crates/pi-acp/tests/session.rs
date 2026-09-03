@@ -203,6 +203,18 @@ fn queue_depths(recorded: &[Recorded]) -> Vec<(u64, bool)> {
         .collect()
 }
 
+fn usage_updates(recorded: &[Recorded]) -> Vec<(u64, u64)> {
+    recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::Notify(SessionUpdate::UsageUpdate(update)) => {
+                Some((update.used, update.size))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Tool call status updates for one tool call id, in order.
 fn tool_statuses(recorded: &[Recorded], id: &str) -> Vec<ToolCallStatus> {
     recorded
@@ -240,6 +252,57 @@ fn read_log(path: &Path) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Turn queueing
 // ---------------------------------------------------------------------------
+
+/// pi's streaming usage can be empty; the final assistant message carries the
+/// value that must replace the initial zero-use context update.
+#[tokio::test]
+async fn final_assistant_message_usage_updates_context() {
+    let fx = fixture(&[]).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "usage": {},
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "hello"
+                }
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "usage": {
+                        "input": 21,
+                        "output": 9,
+                        "cacheRead": 3,
+                        "cacheWrite": 0,
+                        "totalTokens": 33,
+                        "cost": {"input": 0.01, "output": 0.02, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.03}
+                    }
+                }
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "toolResult",
+                    "usage": {"totalTokens": 999}
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "hello").await.unwrap(),
+        StopReason::EndTurn
+    );
+    let recorded = fx.recorded.lock().await.clone();
+    assert_eq!(usage_updates(&recorded), vec![(33, 1000)]);
+}
 
 /// Two prompts: the second is queued while the first streams; the queue drains
 /// one-at-a-time, each turn completing on `agent_settled` (never `agent_end`).

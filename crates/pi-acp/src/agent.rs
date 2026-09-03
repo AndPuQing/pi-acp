@@ -35,7 +35,7 @@
 //! - `authenticate` — no-op (terminal auth runs out-of-band).
 //!
 //! ACP `usage_update` notifications (decision 3 / #106) are emitted by the
-//! session pump from pi's `message_update.usage` (see [`PiAcpSession`]).
+//! session pump from pi's assistant-message usage (see [`PiAcpSession`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

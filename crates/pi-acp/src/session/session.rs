@@ -181,6 +181,9 @@ enum SessionCommand {
         window: Option<u64>,
         respond: oneshot::Sender<()>,
     },
+    /// Publish the empty initial context usage once the ACP session is known
+    /// to the client (`session/new` response has been sent).
+    PublishInitialUsage { respond: oneshot::Sender<()> },
     /// Graceful teardown: dispose the pi process, then signal completion.
     Shutdown { done: oneshot::Sender<()> },
 }
@@ -534,6 +537,20 @@ impl PiAcpSession {
         Ok(())
     }
 
+    /// Publish an empty ACP context usage update for a newly-created session.
+    ///
+    /// pi only reports usage after a model turn. Zed needs the model's context
+    /// window before that first turn to render its context indicator.
+    pub async fn publish_initial_usage(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::PublishInitialUsage { respond: tx })
+            .await
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?;
+        Ok(())
+    }
+
     /// `set_thinking_level`.
     pub async fn set_thinking_level(&self, level: crate::pi::rpc::ThinkingLevel) -> Result<()> {
         self.rpc(RpcCommand::SetThinkingLevel { level }).await?;
@@ -631,6 +648,10 @@ async fn pump_loop(mut pump: Pump) {
                         if let Some(window) = window {
                             pump.context_window = Some(window);
                         }
+                        let _ = respond.send(());
+                    }
+                    Some(SessionCommand::PublishInitialUsage { respond }) => {
+                        pump.emit_initial_usage_update().await;
                         let _ = respond.send(());
                     }
                     Some(SessionCommand::Shutdown { done }) => {
@@ -1000,6 +1021,17 @@ impl Pump {
             }
         }
         self.emit(SessionUpdate::UsageUpdate(update)).await;
+    }
+
+    /// Emit the initial zero-use context window. This is separate from
+    /// [`Self::emit_usage_update`] because pi's first usage event may not
+    /// arrive until after the first model turn.
+    async fn emit_initial_usage_update(&mut self) {
+        let Some(size) = self.context_window else {
+            return;
+        };
+        self.emit(SessionUpdate::UsageUpdate(UsageUpdate::new(0, size)))
+            .await;
     }
 
     // --- pi events ---

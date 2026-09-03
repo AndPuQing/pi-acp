@@ -223,6 +223,15 @@ async fn acp_frame_sequence_matches_golden() {
                 && l.contains("pi v<VER>")
         })
         .expect("startup prelude frame");
+    let initial_usage = lines
+        .iter()
+        .position(|l| {
+            l.contains("\"method\":\"session/update\"")
+                && l.contains("\"sessionUpdate\":\"usage_update\"")
+                && l.contains("\"used\":0")
+                && l.contains("\"size\":1000")
+        })
+        .expect("initial usage frame");
     let commands = lines
         .iter()
         .position(|l| {
@@ -237,6 +246,14 @@ async fn acp_frame_sequence_matches_golden() {
     assert!(
         new_resp < startup,
         "session/new response must precede startup prelude (W-470 / #70)"
+    );
+    assert!(
+        new_resp < initial_usage,
+        "session/new response must precede initial usage update"
+    );
+    assert!(
+        initial_usage < startup,
+        "initial usage update must precede startup prelude"
     );
     assert!(
         startup < commands,

@@ -804,6 +804,67 @@ async fn unknown_config_option_errors() {
     result.expect("connection should complete");
 }
 
+/// The full `pi --thinking` ladder (incl. `max`) round-trips through
+/// `session/set_mode` + `session/set_config_option`; unknown levels still
+/// error (W-475).
+#[tokio::test]
+async fn thinking_max_level_round_trips() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN),
+    );
+
+    let result = Client
+        .builder()
+        .name("thinking-max-client")
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            let sid = new_session.session_id;
+
+            cx.send_request(SetSessionModeRequest::new(sid.clone(), "max"))
+                .block_task()
+                .await?;
+            let set_thought = cx
+                .send_request(SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "thought_level",
+                    "max",
+                ))
+                .block_task()
+                .await?;
+            let thought = find_config_option(&set_thought.config_options, "thought_level").unwrap();
+            if let SessionConfigKind::Select(sel) = &thought.kind {
+                assert_eq!(sel.current_value.0.as_ref(), "max");
+            } else {
+                panic!("thought_level must be a select");
+            }
+
+            let err = cx
+                .send_request(SetSessionModeRequest::new(sid.clone(), "turbo"))
+                .block_task()
+                .await
+                .expect_err("unknown thinking level must error");
+            assert!(err.to_string().contains("Unknown modeId"), "{err}");
+
+            // Close the live subprocess before the SDK tears down the outer
+            // adapter. This keeps the nested mock reaped on resource-limited
+            // CI runners instead of relying on forced process-group cleanup.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
 // ---------------------------------------------------------------------------
 // S8 (W-455): reliability — errors surface, dead pi is loud, auth promotes
 // ---------------------------------------------------------------------------

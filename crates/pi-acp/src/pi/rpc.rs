@@ -44,6 +44,10 @@ pub struct ImageContent {
 }
 
 /// pi thinking levels (`ThinkingLevel` from pi-agent-core).
+///
+/// Single source of truth for the thinking selector: wire ids, display
+/// labels and descriptions all live here so the ACP `modes` list, the
+/// `thought_level` config option and the session event pump cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
@@ -54,6 +58,77 @@ pub enum ThinkingLevel {
     High,
     #[serde(rename = "xhigh")]
     XHigh,
+    Max,
+}
+
+impl ThinkingLevel {
+    /// All levels in ascending reasoning order (the `pi --thinking` ladder).
+    pub fn all() -> [ThinkingLevel; 7] {
+        [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ]
+    }
+
+    /// Wire / mode id (`off` .. `max`).
+    pub fn id(self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "off",
+            ThinkingLevel::Minimal => "minimal",
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::XHigh => "xhigh",
+            ThinkingLevel::Max => "max",
+        }
+    }
+
+    /// Short display label for selectors (Zed renders the raw id otherwise).
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "Off",
+            ThinkingLevel::Minimal => "Minimal",
+            ThinkingLevel::Low => "Low",
+            ThinkingLevel::Medium => "Medium",
+            ThinkingLevel::High => "High",
+            ThinkingLevel::XHigh => "Extra high",
+            ThinkingLevel::Max => "Max",
+        }
+    }
+
+    /// One-line description for selectors. `xhigh`/`max` are only honored by
+    /// selected model families (pi-agent-core contract) — say so up front so
+    /// users do not mistake them for universally-deeper reasoning.
+    pub fn description(self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "No thinking; fastest replies, lowest cost",
+            ThinkingLevel::Minimal => "Tiny thinking budget for trivial tasks",
+            ThinkingLevel::Low => "Light reasoning for simple tasks",
+            ThinkingLevel::Medium => "Balanced reasoning (default)",
+            ThinkingLevel::High => "Deep reasoning for complex tasks",
+            ThinkingLevel::XHigh => "Very deep reasoning; only some models support it",
+            ThinkingLevel::Max => "Maximum thinking budget; only some models support it",
+        }
+    }
+
+    /// Parse a wire / mode / config value id. `None` for unknown levels.
+    pub fn parse(s: &str) -> Option<ThinkingLevel> {
+        match s {
+            "off" => Some(ThinkingLevel::Off),
+            "minimal" => Some(ThinkingLevel::Minimal),
+            "low" => Some(ThinkingLevel::Low),
+            "medium" => Some(ThinkingLevel::Medium),
+            "high" => Some(ThinkingLevel::High),
+            "xhigh" => Some(ThinkingLevel::XHigh),
+            "max" => Some(ThinkingLevel::Max),
+            _ => None,
+        }
+    }
 }
 
 /// Queue drain mode for follow-up / steering messages.
@@ -668,6 +743,45 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn thinking_levels_cover_pi_cli_ladder() {
+        // pi `--thinking` accepts off/minimal/low/medium/high/xhigh/max;
+        // every id must parse, round-trip on the wire, and carry selector
+        // metadata (labels/descriptions Zed renders instead of raw ids).
+        let ids: Vec<&str> = ThinkingLevel::all().iter().map(|l| l.id()).collect();
+        assert_eq!(
+            ids,
+            vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        for level in ThinkingLevel::all() {
+            assert_eq!(ThinkingLevel::parse(level.id()), Some(level));
+            let wire = serde_json::to_value(level).unwrap();
+            assert_eq!(wire, serde_json::Value::String(level.id().to_string()));
+            let back: ThinkingLevel = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, level);
+            assert!(!level.label().is_empty());
+            assert!(!level.description().is_empty());
+        }
+        assert_eq!(ThinkingLevel::parse("turbo"), None);
+        // A pi running at `max` must deserialize in `get_state` (previously
+        // the missing variant failed the whole state parse).
+        let state: RpcSessionState = serde_json::from_str(
+            r#"{
+                "thinkingLevel":"max",
+                "isStreaming":false,
+                "isCompacting":false,
+                "steeringMode":"all",
+                "followUpMode":"all",
+                "sessionId":"abc",
+                "autoCompactionEnabled":false,
+                "messageCount":0,
+                "pendingMessageCount":0
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(state.thinking_level, ThinkingLevel::Max);
     }
 
     #[test]

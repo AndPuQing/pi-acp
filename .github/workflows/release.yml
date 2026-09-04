@@ -1,6 +1,7 @@
 name: Release
 
-# Publishes the three-platform `pi-acp` binary matrix as a GitHub Release.
+# Publishes the three-platform `pi-acp` binary matrix as a GitHub Release and,
+# when NPM_TOKEN is configured, as platform-specific npm packages.
 #
 # Trigger:
 #   - pushing a `vX.Y.Z` tag, or
@@ -107,8 +108,12 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Collect artifacts
         uses: actions/download-artifact@v4
@@ -127,6 +132,19 @@ jobs:
         run: |
           sha256sum pi-acp-* | tee CHECKSUMS.txt
 
+      - name: Prepare npm packages
+        shell: bash
+        run: node npm/scripts/prepare-release.mjs dist npm-dist
+
+      - name: Validate npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          for package in npm-dist/*; do
+            npm pack --dry-run --ignore-scripts "./$package"
+          done
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -136,3 +154,26 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+
+      - name: Setup Node for npm publish
+        if: ${{ env.NPM_TOKEN != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish npm packages
+        if: ${{ env.NPM_TOKEN != '' }}
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for package in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            npm publish "./npm-dist/${package}" --access public
+          done
+          npm publish ./npm-dist/main --access public
+
+      - name: Skip npm publish without NPM_TOKEN
+        if: ${{ env.NPM_TOKEN == '' }}
+        run: echo "NPM_TOKEN is not configured; skipped npm publication."

@@ -1,0 +1,22 @@
+{
+  "name": "@earendil-works/pi-acp-linux-arm64",
+  "version": "0.1.0",
+  "description": "Linux arm64 binary for pi-acp",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndPuQing/pi-acp.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

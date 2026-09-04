@@ -1283,6 +1283,79 @@ async fn settle_timeout_retry_succeeds_on_same_session() {
     fx.session.dispose().await;
 }
 
+/// A failed recovery abort must retire the session instead of allowing a
+/// queued retry to race the timed-out turn (W-480 regression).
+#[tokio::test]
+async fn settle_timeout_abort_failure_poison_session() {
+    let fx = fixture_with_settle_timeout(
+        &[
+            "--mock-no-settle-first",
+            "--mock-abort-error",
+            "abort rejected",
+        ],
+        Duration::from_millis(200),
+    )
+    .await;
+
+    let first = tokio::time::timeout(TIMEOUT, fx.session.prompt("stuck".into(), vec![]))
+        .await
+        .expect("stuck prompt must resolve")
+        .unwrap_err();
+    assert!(matches!(first, AcpxError::SettleTimeout { .. }));
+    wait_for_command(&fx, "abort").await;
+
+    let retry = tokio::time::timeout(TIMEOUT, fx.session.prompt("retry".into(), vec![]))
+        .await
+        .expect("retry must resolve after abort failure")
+        .unwrap_err();
+    assert!(matches!(retry, AcpxError::SessionClosed(_)));
+
+    // The failed abort path must not send the retry to pi.
+    let prompt_count = read_log(&fx.command_log)
+        .iter()
+        .filter(|command| command.as_str() == "prompt")
+        .count();
+    assert_eq!(prompt_count, 1, "retry must not reach pi");
+    fx.session.dispose().await;
+}
+
+/// Cancelling a retry queued during recovery must publish the cleared queue
+/// depth immediately, before the delayed abort eventually settles (W-480).
+#[tokio::test]
+async fn cancel_during_settle_recovery_updates_queue_depth() {
+    let fx = fixture_with_settle_timeout(
+        &["--mock-no-settle-first", "--mock-abort-delay-ms", "200"],
+        Duration::from_millis(50),
+    )
+    .await;
+
+    let first = tokio::time::timeout(TIMEOUT, fx.session.prompt("stuck".into(), vec![]))
+        .await
+        .expect("stuck prompt must resolve")
+        .unwrap_err();
+    assert!(matches!(first, AcpxError::SettleTimeout { .. }));
+    wait_for_command(&fx, "abort").await;
+
+    let s = fx.session.clone();
+    let retry = tokio::spawn(async move { s.prompt("retry".into(), vec![]).await });
+    wait_until(&fx, |recorded| {
+        text_chunks(recorded).contains(&"Queued message (position 1).".to_string())
+    })
+    .await;
+
+    fx.session.cancel().await.expect("cancel during recovery");
+    assert_eq!(retry.await.unwrap().unwrap(), StopReason::Cancelled);
+    let recorded = fx.recorded.lock().await.clone();
+    assert!(
+        queue_depths(&recorded)
+            .windows(2)
+            .any(|window| window == [(1, false), (0, false)]),
+        "cancel must publish the cleared queue depth: {:?}",
+        queue_depths(&recorded)
+    );
+    fx.session.dispose().await;
+}
+
 /// Restoring a file under one ACP id must fail when pi reports a different
 /// native id, and the rejected spawn must not leave its mock child running.
 #[tokio::test]

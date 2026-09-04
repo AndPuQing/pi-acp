@@ -865,6 +865,106 @@ async fn thinking_max_level_round_trips() {
     result.expect("connection should complete");
 }
 
+/// Switching models reshapes the thinking selector to the new model's native
+/// levels, and the current mode follows pi's clamp (W-478).
+///
+/// `mock-limited` supports `off/low/medium/high` only: setting `max` first
+/// then switching models must clamp the mode to `high` and shrink both the
+/// `thought_level` options and the mode list.
+#[tokio::test]
+async fn model_switch_reshapes_thinking_levels() {
+    use agent_client_protocol::schema::v1::SessionConfigSelectOptions;
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN),
+    );
+
+    fn thought_ids(
+        options: &[agent_client_protocol::schema::v1::SessionConfigOption],
+    ) -> Vec<String> {
+        let thought = find_config_option(options, "thought_level").expect("thought_level option");
+        if let SessionConfigKind::Select(sel) = &thought.kind {
+            if let SessionConfigSelectOptions::Ungrouped(opts) = &sel.options {
+                return opts.iter().map(|o| o.value.0.to_string()).collect();
+            }
+            panic!("thought_level options must be ungrouped");
+        }
+        panic!("thought_level option must be a select");
+    }
+
+    let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+    let log_in_handler = log.clone();
+
+    let result = Client
+        .builder()
+        .name("thinking-dynamic-client")
+        .on_receive_notification(
+            async move |notif: SessionNotification, _cx| {
+                log_in_handler
+                    .lock()
+                    .await
+                    .push((notif.session_id.0.to_string(), notif.update.clone()));
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            let sid = new_session.session_id;
+            // Full ladder on the unrestricted mock model.
+            assert_eq!(
+                thought_ids(new_session.config_options.as_ref().expect("configOptions")),
+                vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+
+            // Push thinking to `max`, then switch to the restricted model.
+            cx.send_request(SetSessionModeRequest::new(sid.clone(), "max"))
+                .block_task()
+                .await?;
+            let switched = cx
+                .send_request(SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "model",
+                    "mock/mock-limited",
+                ))
+                .block_task()
+                .await?;
+            // pi clamps `max` down to `high` on the restricted model.
+            assert_eq!(
+                thought_ids(&switched.config_options),
+                vec!["off", "low", "medium", "high"]
+            );
+            let thought = find_config_option(&switched.config_options, "thought_level").unwrap();
+            if let SessionConfigKind::Select(sel) = &thought.kind {
+                assert_eq!(sel.current_value.0.as_ref(), "high");
+            } else {
+                panic!("thought_level option must be a select");
+            }
+            // Zed's mode picker follows the clamp via notification too.
+            wait_for(&log, |u| {
+                matches!(u, SessionUpdate::CurrentModeUpdate(m) if m.current_mode_id.0.as_ref() == "high")
+            })
+            .await;
+
+            // Close the live subprocess before the SDK tears down the outer
+            // adapter. This keeps the nested mock reaped on resource-limited
+            // CI runners instead of relying on forced process-group cleanup.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
 // ---------------------------------------------------------------------------
 // S8 (W-455): reliability — errors surface, dead pi is loud, auth promotes
 // ---------------------------------------------------------------------------

@@ -54,8 +54,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::{AcpxError, Result};
 use crate::pi::process::{PiProcess, RpcClient};
 use crate::pi::rpc::{
-    AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
-    Model, RpcCommand, RpcEvent, RpcSessionState, ThinkingLevel, Usage,
+    supported_thinking_levels, AssistantMessageEvent, CompactionReason, ExtensionUiRequest,
+    ExtensionUiResponse, ImageContent, Model, RpcCommand, RpcEvent, RpcSessionState, ThinkingLevel,
+    Usage,
 };
 use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
@@ -558,6 +559,32 @@ impl PiAcpSession {
         Ok(())
     }
 
+    /// Native per-model thinking levels for the ACP selector (W-478).
+    ///
+    /// Queries pi's `get_available_thinking_levels` (the same source pi's
+    /// own TUI uses), so Zed offers exactly the levels the active model
+    /// supports. Falls back to the local `supported_thinking_levels`
+    /// computation from the current model (pi-ai `getSupportedThinkingLevels`
+    /// parity, for older pi builds without the RPC), then to the full ladder.
+    pub async fn available_thinking_levels(&self) -> Vec<crate::pi::rpc::ThinkingLevel> {
+        if let Ok(data) = self.rpc(RpcCommand::GetAvailableThinkingLevels).await {
+            if let Some(levels) = data.get("levels").and_then(Value::as_array) {
+                let parsed: Vec<crate::pi::rpc::ThinkingLevel> = levels
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(crate::pi::rpc::ThinkingLevel::parse)
+                    .collect();
+                if !parsed.is_empty() {
+                    return parsed;
+                }
+            }
+        }
+        match self.get_state().await {
+            Ok(state) => supported_thinking_levels(state.model.as_ref()),
+            Err(_) => crate::pi::rpc::ThinkingLevel::all().to_vec(),
+        }
+    }
+
     /// `set_steering_mode`.
     pub async fn set_steering_mode(&self, mode: crate::pi::rpc::QueueMode) -> Result<()> {
         self.rpc(RpcCommand::SetSteeringMode { mode }).await?;
@@ -1053,31 +1080,33 @@ impl Pump {
     /// The mode update is authoritative from the event and always emitted.
     /// The config-option refresh re-reads pi state (best-effort): a failed
     /// round-trip must not turn an informational event into a turn failure,
-    /// so the mode update still stands on its own.
+    /// so the mode update still stands on its own. The thought-level options
+    /// are the model's native available levels (W-478), not a static ladder.
     async fn on_thinking_level_changed(&mut self, level: ThinkingLevel) {
         self.emit(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
             level.id(),
         )))
         .await;
-        let (state_res, models_res) = tokio::join!(
+        let (state_res, models_res, levels_res) = tokio::join!(
             self.rpc.request(&RpcCommand::GetState),
             self.rpc.request(&RpcCommand::GetAvailableModels),
+            self.rpc.request(&RpcCommand::GetAvailableThinkingLevels),
         );
         let (Ok(state_data), Ok(models_data)) = (state_res, models_res) else {
             return;
         };
-        let current_model = serde_json::from_value::<RpcSessionState>(state_data)
+        let state_model = serde_json::from_value::<RpcSessionState>(state_data)
             .ok()
-            .and_then(|s| s.model)
-            .and_then(|m| {
-                let provider = m.provider.trim();
-                let id = m.id.trim();
-                if provider.is_empty() || id.is_empty() {
-                    None
-                } else {
-                    Some(format!("{provider}/{id}"))
-                }
-            });
+            .and_then(|s| s.model);
+        let current_model = state_model.as_ref().and_then(|m| {
+            let provider = m.provider.trim();
+            let id = m.id.trim();
+            if provider.is_empty() || id.is_empty() {
+                None
+            } else {
+                Some(format!("{provider}/{id}"))
+            }
+        });
         let available: Vec<(String, String)> = models_data
             .get("models")
             .cloned()
@@ -1094,7 +1123,23 @@ impl Pump {
                 }
             })
             .collect();
-        let mut options = vec![crate::agent::thought_level_config_option(level.id())];
+        // Native levels first; fall back to the local per-model computation
+        // so an older pi without the RPC still yields a dynamic list.
+        let levels: Vec<ThinkingLevel> = levels_res
+            .ok()
+            .and_then(|data| data.get("levels").cloned())
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| ThinkingLevel::parse(id))
+                    .collect()
+            })
+            .filter(|levels: &Vec<ThinkingLevel>| !levels.is_empty())
+            .unwrap_or_else(|| supported_thinking_levels(state_model.as_ref()));
+        let mut options = vec![crate::agent::thought_level_config_option(
+            level.id(),
+            &levels,
+        )];
         let current_model_id = current_model
             .or_else(|| available.first().map(|(id, _)| id.clone()))
             .unwrap_or_default();

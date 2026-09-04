@@ -343,10 +343,16 @@ fn prompt_for(session_id: &SessionId, s: &str) -> PromptRequest {
     )
 }
 
-/// Resident memory probe: spawn a session (adapter is in-process here, pi
-/// is a `pi-acp --mock-rpc` child) and sum the RSS of `pi-acp` executables
-/// that are descendants of this test process (parallel sibling tests are
-/// excluded by construction).
+/// Resident memory probe (Linux-only): spawn a session (adapter is in-process
+/// here, pi is a `pi-acp --mock-rpc` child) and sum the RSS of `pi-acp`
+/// executables that are descendants of this test process (parallel sibling
+/// tests are excluded by construction).
+///
+/// Linux-only by construction: RSS and ancestry are read from `/proc`, which
+/// does not exist on macOS/Windows (the probe found zero children there and
+/// failed since it was introduced). The one-child-spawn property stays covered
+/// on Linux CI; every functional session test runs on all three platforms.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn resident_memory_of_agent_plus_mock_pi() {
     let me = std::process::id();
@@ -368,6 +374,8 @@ async fn resident_memory_of_agent_plus_mock_pi() {
     assert!(total_kb < 200_000, "mock pi child uses {total_kb}KB");
 }
 
+/// `/proc`-based RSS reader for the Linux-only memory probe above.
+#[cfg(target_os = "linux")]
 fn process_rss_kb(pid: u32) -> u64 {
     let raw = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
     raw.lines()
@@ -379,7 +387,8 @@ fn process_rss_kb(pid: u32) -> u64 {
 
 /// `(pid, rss_kb)` of `pi-acp`-executable processes descended from `root`.
 /// Ancestry is resolved via /proc ppid chains, so parallel sibling tests
-/// never pollute the measurement.
+/// never pollute the measurement. Linux-only (see the probe above).
+#[cfg(target_os = "linux")]
 fn descendant_pi_acp_rss_kb(root: u32) -> Vec<(u32, u64)> {
     // pid -> ppid for the whole table (single pass).
     let mut ppid_of: HashMap<u32, u32> = HashMap::new();

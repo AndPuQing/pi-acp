@@ -1,12 +1,12 @@
-# pi-acp
+# pi-acp-rs
 
 Use the [pi coding agent](https://github.com/earendil-works/pi) from [Zed](https://zed.dev/)
 and other [Agent Client Protocol (ACP)](https://agentclientprotocol.com) clients.
 
-`pi-acp` connects an ACP client to pi over a local process boundary. It starts
+`pi-acp-rs` connects an ACP client to pi over a local process boundary. It starts
 pi when a session is opened and forwards prompts, tool activity, session history,
 model settings, and usage information. pi still owns the agent loop, providers,
-credentials, and tools; `pi-acp` is the adapter between pi and the client.
+credentials, and tools; `pi-acp-rs` is the adapter between pi and the client.
 
 ## Requirements
 
@@ -24,9 +24,18 @@ npm install --global @earendil-works/pi-coding-agent
 pi --version
 ```
 
-### 2. Install pi-acp
+### 2. Install pi-acp-rs
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/AndPuQing/pi-acp/releases).
+The easiest option is the npm package, which selects the native binary for the
+current platform:
+
+```bash
+npm install --global pi-acp-rs
+pi-acp-rs --version
+```
+
+You can also download the latest standalone release for your platform from
+[GitHub Releases](https://github.com/AndPuQing/pi-acp/releases).
 
 | Platform | Release asset |
 | --- | --- |
@@ -41,8 +50,8 @@ directory on your `PATH`:
 
 ```bash
 chmod +x pi-acp-<platform>
-sudo mv pi-acp-<platform> /usr/local/bin/pi-acp
-pi-acp --version
+sudo mv pi-acp-<platform> /usr/local/bin/pi-acp-rs
+pi-acp-rs --version
 ```
 
 On Windows, keep the `.exe` suffix and add the directory containing
@@ -52,13 +61,13 @@ download's SHA-256 checksum when installing from a release.
 
 ## Configure Zed
 
-Add `pi-acp` to Zed's `settings.json`:
+Add `pi-acp-rs` to Zed's `settings.json`:
 
 ```json
 {
   "agent_servers": {
     "pi": {
-      "command": "pi-acp",
+      "command": "pi-acp-rs",
       "args": [],
       "env": {}
     }
@@ -73,7 +82,7 @@ on your shell's `PATH`, use an absolute path instead:
 {
   "agent_servers": {
     "pi": {
-      "command": "/usr/local/bin/pi-acp",
+      "command": "/usr/local/bin/pi-acp-rs",
       "args": [],
       "env": {}
     }
@@ -89,7 +98,7 @@ set pi options such as `PI_PROVIDER` and `PI_MODEL` if your pi setup uses them.
 If pi needs an API key or provider login, run its interactive setup once:
 
 ```bash
-pi-acp --terminal-login
+pi-acp-rs --terminal-login
 ```
 
 Complete the setup in the terminal, then start a new agent session in Zed. ACP
@@ -99,7 +108,7 @@ their authentication prompt.
 ## Configuration
 
 Most users can keep the defaults. Set these variables in Zed's `env` block or
-in the environment that launches `pi-acp`:
+in the environment that launches `pi-acp-rs`:
 
 | Variable | Default | Use |
 | --- | --- | --- |
@@ -112,13 +121,13 @@ in the environment that launches `pi-acp`:
 
 ## Troubleshooting
 
-### `pi-acp` or `pi` cannot be found
+### `pi-acp-rs` or `pi` cannot be found
 
 Check both commands from a terminal:
 
 ```bash
 pi --version
-pi-acp --version
+pi-acp-rs --version
 ```
 
 If they work in a terminal but not in Zed, use absolute paths in Zed's
@@ -127,13 +136,13 @@ usually an npm `pi.cmd` wrapper rather than a native `pi.exe`.
 
 ### Authentication fails
 
-Run `pi-acp --terminal-login` and complete the provider setup. If you use
+Run `pi-acp-rs --terminal-login` and complete the provider setup. If you use
 environment variables for credentials, make sure they are present in Zed's
 `env` block as well as in your shell.
 
 ### A session stops unexpectedly
 
-`pi-acp` reports when its pi child process exits and does not restart it
+`pi-acp-rs` reports when its pi child process exits and does not restart it
 automatically. Start a new agent session after fixing the underlying pi error.
 Set `RUST_LOG=pi_acp=debug` temporarily if you need more detail.
 

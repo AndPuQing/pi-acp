@@ -1,6 +1,7 @@
 name: Release
 
-# Publishes the three-platform `pi-acp` binary matrix as a GitHub Release.
+# Publishes the three-platform `pi-acp` binary matrix as a GitHub Release and
+# as platform-specific npm packages via npm Trusted Publishing (OIDC, no token).
 #
 # Trigger:
 #   - pushing a `vX.Y.Z` tag, or
@@ -48,7 +49,7 @@ jobs:
             name: pi-acp-linux-arm64
             bin: pi-acp
             use_cross: true
-          - os: macos-13
+          - os: macos-14
             target: x86_64-apple-darwin
             name: pi-acp-macos-x64
             bin: pi-acp
@@ -76,9 +77,7 @@ jobs:
 
       - name: Install cross (Linux arm64)
         if: matrix.use_cross
-        run: |
-          curl -sSL https://github.com/cross-rs/cross/releases/latest/download/cross-init \
-            | CROSS_INIT_TARGET=aarch64-unknown-linux-musl sh
+        uses: taiki-e/install-action@cross
 
       - name: Build
         shell: bash
@@ -107,25 +106,38 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Collect artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
-
-      # download-artifact places each artifact in its own subdir; flatten so
-      # the release step sees the binaries directly.
-      - name: Flatten
-        shell: bash
-        run: find dist -type f -exec mv -f {} dist/ \;
+          merge-multiple: true
 
       - name: Checksums
         shell: bash
         working-directory: dist
         run: |
           sha256sum pi-acp-* | tee CHECKSUMS.txt
+
+      - name: Prepare npm packages
+        shell: bash
+        run: node npm/scripts/prepare-release.mjs dist npm-dist
+
+      - name: Validate npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          for package in npm-dist/*; do
+            npm pack --dry-run --ignore-scripts "./$package"
+          done
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -136,3 +148,22 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+
+      - name: Setup Node for npm publish
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm for Trusted Publishing
+        shell: bash
+        run: npm install -g npm@latest
+
+      - name: Publish npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            npm publish "./npm-dist/${package}" --provenance --access public
+          done
+          npm publish ./npm-dist/main --provenance --access public

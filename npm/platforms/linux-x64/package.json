@@ -1,0 +1,22 @@
+{
+  "name": "@puqing-works/pi-acp-rs-linux-x64",
+  "version": "0.2.1",
+  "description": "Linux x64 binary for pi-acp-rs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndPuQing/pi-acp.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

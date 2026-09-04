@@ -220,20 +220,10 @@ async fn full_method_set_against_mock_pi() {
             let sid = new_session.session_id.clone();
             assert!(!sid.0.is_empty());
 
-            let session_map: Value = serde_json::from_str(
-                &fs::read_to_string(agent_dir.join("pi-acp/session-map.json"))
-                    .expect("session/new must persist its session mapping"),
-            )
-            .expect("session map must be valid JSON");
-            let stored = &session_map["sessions"]["mock-session-id"];
-            let cwd_string = cwd.to_string_lossy().into_owned();
-            assert_eq!(
-                stored.get("sessionId").and_then(Value::as_str),
-                Some("mock-session-id")
-            );
-            assert_eq!(
-                stored.get("cwd").and_then(Value::as_str),
-                Some(cwd_string.as_str())
+            let session_map_path = agent_dir.join("pi-acp/session-map.json");
+            assert!(
+                !session_map_path.exists(),
+                "an empty new session must not be persisted before its file is flushed"
             );
 
             // configOptions: model select first, then thought_level select.
@@ -288,6 +278,15 @@ async fn full_method_set_against_mock_pi() {
                 assert!(names.contains(&builtin), "builtin /{builtin} advertised: {names:?}");
             }
 
+            // A new session has no pi usage event yet. The adapter still
+            // publishes the model's context window so Zed can render its
+            // context indicator before the first real turn.
+            let initial_usage = wait_for(&log, |u| {
+                matches!(u, SessionUpdate::UsageUpdate(uu) if uu.used == 0 && uu.size == 1000)
+            })
+            .await;
+            assert!(matches!(initial_usage, SessionUpdate::UsageUpdate(_)));
+
             // ---------------------------------------------------------------
             // 6. cancel (through the full ACP path, mid-turn)
             // ---------------------------------------------------------------
@@ -337,9 +336,12 @@ async fn full_method_set_against_mock_pi() {
             })
             .await;
             let _ = chunk;
-            // usage_update (decision 3): used=15 from the mock's message_update,
-            // size=1000 from the mock model's contextWindow.
-            let usage = wait_for(&log, |u| matches!(u, SessionUpdate::UsageUpdate(_))).await;
+            // usage_update (decision 3): used=15 from the final assistant
+            // message_end, size=1000 from the mock model's contextWindow.
+            let usage = wait_for(&log, |u| {
+                matches!(u, SessionUpdate::UsageUpdate(uu) if uu.used == 15)
+            })
+            .await;
             let SessionUpdate::UsageUpdate(uu) = usage else {
                 unreachable!()
             };
@@ -578,6 +580,145 @@ async fn full_method_set_against_mock_pi() {
     }
 }
 
+/// A new pi session reports a session-file path before the file is durable;
+/// the map entry is written only after the first successful prompt flushes it.
+#[tokio::test]
+async fn new_session_map_waits_for_persisted_session_file() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    let session_file = tmp.path().join("sessions/mock-session.jsonl");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+            .env("PI_ACP_MOCK_SESSION_FILE", session_file.to_str().unwrap()),
+    );
+
+    let result = Client
+        .builder()
+        .name("s6-session-persistence-client")
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd.clone()))
+                .block_task()
+                .await?;
+            assert_eq!(new_session.session_id.0.as_ref(), "mock-session-id");
+            assert!(
+                !session_file.exists(),
+                "mock new session must start without a persisted file"
+            );
+            assert!(
+                !agent_dir.join("pi-acp/session-map.json").exists(),
+                "session/new must not write a mapping for an unpersisted file"
+            );
+
+            let prompt = cx
+                .send_request(PromptRequest::new(
+                    new_session.session_id.clone(),
+                    vec![ContentBlock::Text(TextContent::new("persist".to_string()))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+
+            // Persistence runs after the prompt response is queued (W-479
+            // P1: off prompt latency), so poll for the map entry.
+            let map_path = agent_dir.join("pi-acp/session-map.json");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while fs::read_to_string(&map_path).is_err() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first prompt must persist the session mapping"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let map: Value = serde_json::from_str(&fs::read_to_string(&map_path).unwrap())
+                .expect("session map must be valid JSON");
+            let stored = &map["sessions"]["mock-session-id"];
+            assert_eq!(stored["sessionId"], "mock-session-id");
+            assert_eq!(stored["cwd"], cwd.to_string_lossy().as_ref());
+            assert_eq!(
+                stored["sessionFile"],
+                session_file.to_string_lossy().as_ref()
+            );
+            let header: Value = serde_json::from_str(
+                fs::read_to_string(&session_file)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(header["id"], "mock-session-id");
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
+/// A session/new that never reaches a persisted turn must not become
+/// loadable after the ACP process is restarted.
+#[tokio::test]
+async fn unpersisted_new_session_is_unknown_after_restart() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    let session_file = tmp.path().join("sessions/never-persisted.jsonl");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+
+    let make_agent = || {
+        AcpAgent::new(
+            AcpAgentConfig::new(BIN)
+                .env("PI_ACP_MOCK", "1")
+                .env("PI_ACP_PI_COMMAND", BIN)
+                .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+                .env("PI_ACP_MOCK_SESSION_FILE", session_file.to_str().unwrap()),
+        )
+    };
+
+    let first = Client
+        .builder()
+        .name("s6-session-restart-create-client")
+        .connect_with(make_agent(), async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd.clone()))
+                .block_task()
+                .await?;
+            assert_eq!(new_session.session_id.0.as_ref(), "mock-session-id");
+            assert!(!session_file.exists());
+            assert!(!agent_dir.join("pi-acp/session-map.json").exists());
+            Ok(())
+        })
+        .await;
+    first.expect("initial connection should complete");
+
+    let second = Client
+        .builder()
+        .name("s6-session-restart-load-client")
+        .connect_with(make_agent(), async |cx| {
+            let err = cx
+                .send_request(LoadSessionRequest::new(
+                    "mock-session-id".to_string(),
+                    cwd.clone(),
+                ))
+                .block_task()
+                .await
+                .expect_err("an unpersisted new session must not be loadable");
+            assert!(err.message.contains("Unknown sessionId"), "{err}");
+            Ok(())
+        })
+        .await;
+    second.expect("restart connection should complete");
+}
+
 /// session/set_model with an unknown session must produce a JSON-RPC error
 /// (the fallback handler declines nothing else).
 #[tokio::test]
@@ -658,6 +799,167 @@ async fn unknown_config_option_errors() {
                 .await
                 .expect_err("unknown config option must error");
             assert!(err.to_string().contains("Unknown config option"), "{err}");
+
+            // Close the live subprocess before the SDK tears down the outer
+            // adapter. This keeps the nested mock reaped on resource-limited
+            // CI runners instead of relying on forced process-group cleanup.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
+/// The full `pi --thinking` ladder (incl. `max`) round-trips through
+/// `session/set_mode` + `session/set_config_option`; unknown levels still
+/// error (W-475).
+#[tokio::test]
+async fn thinking_max_level_round_trips() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN),
+    );
+
+    let result = Client
+        .builder()
+        .name("thinking-max-client")
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            let sid = new_session.session_id;
+
+            cx.send_request(SetSessionModeRequest::new(sid.clone(), "max"))
+                .block_task()
+                .await?;
+            let set_thought = cx
+                .send_request(SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "thought_level",
+                    "max",
+                ))
+                .block_task()
+                .await?;
+            let thought = find_config_option(&set_thought.config_options, "thought_level").unwrap();
+            if let SessionConfigKind::Select(sel) = &thought.kind {
+                assert_eq!(sel.current_value.0.as_ref(), "max");
+            } else {
+                panic!("thought_level must be a select");
+            }
+
+            let err = cx
+                .send_request(SetSessionModeRequest::new(sid.clone(), "turbo"))
+                .block_task()
+                .await
+                .expect_err("unknown thinking level must error");
+            assert!(err.to_string().contains("Unknown modeId"), "{err}");
+
+            // Close the live subprocess before the SDK tears down the outer
+            // adapter. This keeps the nested mock reaped on resource-limited
+            // CI runners instead of relying on forced process-group cleanup.
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await;
+    result.expect("connection should complete");
+}
+
+/// Switching models reshapes the thinking selector to the new model's native
+/// levels, and the current mode follows pi's clamp (W-478).
+///
+/// `mock-limited` supports `off/low/medium/high` only: setting `max` first
+/// then switching models must clamp the mode to `high` and shrink both the
+/// `thought_level` options and the mode list.
+#[tokio::test]
+async fn model_switch_reshapes_thinking_levels() {
+    use agent_client_protocol::schema::v1::SessionConfigSelectOptions;
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN),
+    );
+
+    fn thought_ids(
+        options: &[agent_client_protocol::schema::v1::SessionConfigOption],
+    ) -> Vec<String> {
+        let thought = find_config_option(options, "thought_level").expect("thought_level option");
+        if let SessionConfigKind::Select(sel) = &thought.kind {
+            if let SessionConfigSelectOptions::Ungrouped(opts) = &sel.options {
+                return opts.iter().map(|o| o.value.0.to_string()).collect();
+            }
+            panic!("thought_level options must be ungrouped");
+        }
+        panic!("thought_level option must be a select");
+    }
+
+    let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+    let log_in_handler = log.clone();
+
+    let result = Client
+        .builder()
+        .name("thinking-dynamic-client")
+        .on_receive_notification(
+            async move |notif: SessionNotification, _cx| {
+                log_in_handler
+                    .lock()
+                    .await
+                    .push((notif.session_id.0.to_string(), notif.update.clone()));
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(agent, async |cx| {
+            let new_session = cx
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            let sid = new_session.session_id;
+            // Full ladder on the unrestricted mock model.
+            assert_eq!(
+                thought_ids(new_session.config_options.as_ref().expect("configOptions")),
+                vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+
+            // Push thinking to `max`, then switch to the restricted model.
+            cx.send_request(SetSessionModeRequest::new(sid.clone(), "max"))
+                .block_task()
+                .await?;
+            let switched = cx
+                .send_request(SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "model",
+                    "mock/mock-limited",
+                ))
+                .block_task()
+                .await?;
+            // pi clamps `max` down to `high` on the restricted model.
+            assert_eq!(
+                thought_ids(&switched.config_options),
+                vec!["off", "low", "medium", "high"]
+            );
+            let thought = find_config_option(&switched.config_options, "thought_level").unwrap();
+            if let SessionConfigKind::Select(sel) = &thought.kind {
+                assert_eq!(sel.current_value.0.as_ref(), "high");
+            } else {
+                panic!("thought_level option must be a select");
+            }
+            // Zed's mode picker follows the clamp via notification too.
+            wait_for(&log, |u| {
+                matches!(u, SessionUpdate::CurrentModeUpdate(m) if m.current_mode_id.0.as_ref() == "high")
+            })
+            .await;
 
             // Close the live subprocess before the SDK tears down the outer
             // adapter. This keeps the nested mock reaped on resource-limited

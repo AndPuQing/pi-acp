@@ -1,0 +1,35 @@
+{
+  "name": "pi-acp-rs",
+  "version": "0.2.1",
+  "description": "ACP adapter for the pi coding agent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndPuQing/pi-acp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "pi-acp-rs": "npm/bin/pi-acp-rs.js"
+  },
+  "files": [
+    "npm/bin",
+    "npm/lib",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@puqing-works/pi-acp-rs-linux-x64": "0.2.1",
+    "@puqing-works/pi-acp-rs-linux-arm64": "0.2.1",
+    "@puqing-works/pi-acp-rs-darwin-x64": "0.2.1",
+    "@puqing-works/pi-acp-rs-darwin-arm64": "0.2.1",
+    "@puqing-works/pi-acp-rs-win32-x64": "0.2.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "node npm/scripts/check-package.mjs",
+    "test": "node --test npm/test/platform.test.js"
+  }
+}

@@ -71,7 +71,10 @@ fn is_mock_mode(args: &[String]) -> bool {
 
 async fn async_main() -> Result<()> {
     // Structured logging (env-filter driven, e.g. RUST_LOG=pi_acp=debug).
+    // Logs go to stderr: stdout carries the ACP JSONL stream and any stray
+    // line breaks strict clients' framing (W-479 P1).
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
@@ -175,6 +178,13 @@ fn terminal_login() -> Result<()> {
 ///   instead of emitting. `agent_settled` is auto-appended unless the file
 ///   already contains one or `--mock-no-settle` is set.
 /// - `--mock-no-settle`      never auto-append `agent_settled` (cancel tests)
+/// - `--mock-no-settle-first` suppress the auto `agent_settled` for the first
+///   prompt only (settle-timeout recovery tests: the stuck turn times out,
+///   the post-timeout `abort` still settles, and the retry settles normally)
+/// - `--mock-abort-error <text>` answer `abort` with `success:false`
+///   (settle-timeout recovery failure tests)
+/// - `--mock-abort-delay-ms <n>` delay the abort response and settle event
+///   (settle-timeout recovery cancellation tests)
 /// - `--mock-event-delay-ms <n>` sleep `n` ms before each scenario event
 /// - `--mock-command-log <path>`  append each received command type
 /// - `--mock-extension-log <path>` append each received `extension_ui_response`
@@ -187,12 +197,15 @@ fn terminal_login() -> Result<()> {
 ///   response until its scenario events have been emitted (channel-order tests)
 /// - `--mock-models-error <text>`   answer `get_available_models` with
 ///   `success:false` and this error text (authRequired-on-new tests)
+/// - `PI_ACP_MOCK_SESSION_FILE`     session file path for a new mock session;
+///   the mock writes a valid session header after the first successful prompt
 ///
 /// Default: respond `success: true` to every command (with a fixed `get_state`
 /// payload), and after a `prompt` command emit a `text_delta` message_update
-/// (carrying token usage) followed by `agent_settled` (mirroring pi's
-/// early-response + settled-event semantics, S2 constraint 2). After an
-/// `abort`, emit `agent_settled` (pi settles once the aborted turn unwinds).
+/// with an empty usage snapshot, the final assistant `message_end` with token
+/// usage, and then `agent_settled` (mirroring pi's early-response + settled-
+/// event semantics, S2 constraint 2). After an `abort`, emit `agent_settled`
+/// (pi settles once the aborted turn unwinds).
 async fn run_mock_rpc() -> Result<()> {
     use std::path::PathBuf;
 
@@ -205,6 +218,9 @@ async fn run_mock_rpc() -> Result<()> {
     let mut unknown_event = false;
     let mut scenario_dir: Option<PathBuf> = None;
     let mut no_settle = false;
+    let mut no_settle_first = false;
+    let mut abort_error: Option<String> = None;
+    let mut abort_delay_ms: u64 = 0;
     let mut event_delay_ms: u64 = 0;
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
@@ -213,6 +229,8 @@ async fn run_mock_rpc() -> Result<()> {
     let mut prompt_hang = false;
     let mut prompt_response_after_events_ms: u64 = 0;
     let mut models_error: Option<String> = None;
+    let env_session_file = std::env::var_os("PI_ACP_MOCK_SESSION_FILE").map(PathBuf::from);
+    let mut session_arg: Option<PathBuf> = None;
     let mut prompt_count: usize = 0;
     // Stateful mock: real pi keeps these across RPC calls, and the agent's
     // config-option / slash-command handlers read them back via get_state.
@@ -234,6 +252,11 @@ async fn run_mock_rpc() -> Result<()> {
             "--mock-unknown-event" => unknown_event = true,
             "--mock-scenario" => scenario_dir = args.next().map(PathBuf::from),
             "--mock-no-settle" => no_settle = true,
+            "--mock-no-settle-first" => no_settle_first = true,
+            "--mock-abort-error" => abort_error = args.next(),
+            "--mock-abort-delay-ms" => {
+                abort_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
             "--mock-event-delay-ms" => {
                 event_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
             }
@@ -247,6 +270,7 @@ async fn run_mock_rpc() -> Result<()> {
                     args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
             }
             "--mock-models-error" => models_error = args.next(),
+            "--session" => session_arg = args.next().map(PathBuf::from),
             _ => {}
         }
     }
@@ -267,6 +291,16 @@ async fn run_mock_rpc() -> Result<()> {
             .ok()
             .and_then(|v| v.parse().ok());
     }
+
+    let mock_session_file = session_arg
+        .clone()
+        .or_else(|| env_session_file.clone())
+        .unwrap_or_else(|| PathBuf::from("/tmp/mock-session.jsonl"));
+    let mock_session_id = session_arg
+        .as_deref()
+        .and_then(read_mock_session_id)
+        .unwrap_or_else(|| "mock-session-id".to_string());
+    let persist_new_session = session_arg.is_none() && env_session_file.is_some();
 
     if let Some(log) = &cwd_log {
         if let Ok(cwd) = std::env::current_dir() {
@@ -359,14 +393,14 @@ async fn run_mock_rpc() -> Result<()> {
 
         let data = match ty {
             "get_state" => serde_json::json!({
-                "model": {"id": mock_model, "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
+                "model": mock_model_definition(&mock_model),
                 "thinkingLevel": mock_thinking_level,
                 "isStreaming": false,
                 "isCompacting": false,
                 "steeringMode": mock_steering_mode,
                 "followUpMode": mock_follow_up_mode,
-                "sessionFile": "/tmp/mock-session.jsonl",
-                "sessionId": "mock-session-id",
+                "sessionFile": mock_session_file.to_string_lossy(),
+                "sessionId": mock_session_id,
                 "sessionName": mock_session_name,
                 "autoCompactionEnabled": mock_auto_compaction,
                 "messageCount": 3,
@@ -374,21 +408,28 @@ async fn run_mock_rpc() -> Result<()> {
             }),
             "get_available_models" => serde_json::json!({
                 "models": [
-                    {"id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
-                    {"id": "mock-fast", "name": "Mock Fast", "provider": "mock", "reasoning": false, "contextWindow": 8000, "maxTokens": 100}
+                    mock_model_definition("mock-model"),
+                    mock_model_definition("mock-fast"),
+                    mock_model_definition("mock-limited")
                 ]
             }),
-            "export_html" => serde_json::json!({"path": "/tmp/mock.html"}),
-            "set_model" => serde_json::json!({
-                "id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000
+            // Native per-model levels (pi `AgentSession.getAvailableThinkingLevels`).
+            "get_available_thinking_levels" => serde_json::json!({
+                "levels": mock_supported_levels(&mock_model)
             }),
+            "export_html" => serde_json::json!({"path": "/tmp/mock.html"}),
+            "set_model" => command
+                .get("modelId")
+                .and_then(serde_json::Value::as_str)
+                .map(mock_model_definition)
+                .unwrap_or_else(|| mock_model_definition(&mock_model)),
             "compact" => serde_json::json!({
                 "tokensBefore": 1500,
                 "summary": "The conversation was summarized."
             }),
             "get_session_stats" => serde_json::json!({
-                "sessionId": "mock-session-id",
-                "sessionFile": "/tmp/mock-session.jsonl",
+                "sessionId": mock_session_id,
+                "sessionFile": mock_session_file.to_string_lossy(),
                 "totalMessages": 3,
                 "cost": 0.0123,
                 "tokens": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "total": 165}
@@ -413,15 +454,32 @@ async fn run_mock_rpc() -> Result<()> {
 
         // Apply stateful mutations (real pi persists these; the agent reads
         // them back via get_state for configOptions / slash-command displays).
+        // Mirror pi: thinking changes clamp to the model's levels and only
+        // emit `thinking_level_changed` when the effective level moves.
+        let mut thinking_event: Option<serde_json::Value> = None;
         match ty {
             "set_thinking_level" => {
                 if let Some(l) = command.get("level").and_then(serde_json::Value::as_str) {
-                    mock_thinking_level = l.to_string();
+                    let effective = mock_clamp_level(&mock_model, l);
+                    if effective != mock_thinking_level {
+                        mock_thinking_level = effective.clone();
+                        thinking_event = Some(serde_json::json!({
+                            "type": "thinking_level_changed", "level": effective
+                        }));
+                    }
                 }
             }
             "set_model" => {
                 if let Some(m) = command.get("modelId").and_then(serde_json::Value::as_str) {
                     mock_model = m.to_string();
+                }
+                // pi re-resolves + clamps thinking on a model switch.
+                let effective = mock_clamp_level(&mock_model, &mock_thinking_level.clone());
+                if effective != mock_thinking_level {
+                    mock_thinking_level = effective.clone();
+                    thinking_event = Some(serde_json::json!({
+                        "type": "thinking_level_changed", "level": effective
+                    }));
                 }
             }
             "set_auto_compaction" => {
@@ -458,6 +516,7 @@ async fn run_mock_rpc() -> Result<()> {
         // (auth / error-surfacing tests).
         let (success, error) = match ty {
             "prompt" => (prompt_error.is_none(), prompt_error.clone()),
+            "abort" => (abort_error.is_none(), abort_error.clone()),
             "get_available_models" => (models_error.is_none(), models_error.clone()),
             _ => (true, None),
         };
@@ -469,6 +528,9 @@ async fn run_mock_rpc() -> Result<()> {
         }
         let delay_prompt_response =
             success && ty == "prompt" && prompt_response_after_events_ms > 0;
+        if success && ty == "abort" && abort_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(abort_delay_ms)).await;
+        }
         if !delay_prompt_response {
             mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
         }
@@ -483,10 +545,21 @@ async fn run_mock_rpc() -> Result<()> {
             mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
         }
 
+        // Mirror pi: a thinking change that moves the effective level emits
+        // `thinking_level_changed` (W-478 clamp parity).
+        if success {
+            if let Some(event) = thinking_event {
+                mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
+            }
+        }
+
         // Mirror pi: the prompt response arrives early; the streaming events
         // and the real turn-completion signal (`agent_settled`) follow after.
         if success && ty == "prompt" {
             prompt_count += 1;
+            // Suppress the auto settle for the first prompt only when asked
+            // (recovery tests); the post-timeout `abort` below still settles.
+            let suppress_settle = no_settle || (no_settle_first && prompt_count == 1);
             if let Some(dir) = &scenario_dir {
                 let scenario = dir.join(format!("{prompt_count}.jsonl"));
                 if scenario.exists() {
@@ -495,15 +568,15 @@ async fn run_mock_rpc() -> Result<()> {
                         &mut stdout,
                         &content,
                         &mut reader,
-                        no_settle,
+                        suppress_settle,
                         event_delay_ms,
                         extension_log.as_deref(),
                     )
                     .await?;
-                } else if !no_settle {
+                } else if !suppress_settle {
                     emit_default_prompt_response(&mut stdout).await?;
                 }
-            } else if !no_settle {
+            } else if !suppress_settle {
                 emit_default_prompt_response(&mut stdout).await?;
             }
             if delay_prompt_response {
@@ -512,6 +585,9 @@ async fn run_mock_rpc() -> Result<()> {
                 ))
                 .await;
                 mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
+            }
+            if persist_new_session {
+                persist_mock_session_file(&mock_session_file, &mock_session_id)?;
             }
         } else if success && ty == "abort" {
             // pi settles once an aborted turn unwinds.
@@ -522,12 +598,106 @@ async fn run_mock_rpc() -> Result<()> {
     Ok(())
 }
 
-/// The default post-prompt event sequence: a `text_delta` message_update
-/// (carrying token usage) followed by `agent_settled`.
+/// Mock model definition for `get_state` / `get_available_models` /
+/// `set_model` responses. `mock-model` + `mock-fast` advertise the full pi
+/// thinking ladder; `mock-limited` only supports a subset (no `minimal`,
+/// `xhigh`, `max`) so tests can prove the per-model dynamic selector
+/// (W-478). Shapes mirror real pi payloads (`thinkingLevelMap` included).
+fn mock_model_definition(id: &str) -> serde_json::Value {
+    match id {
+        "mock-limited" => serde_json::json!({
+            "id": "mock-limited", "name": "Mock Limited", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "low": "low", "medium": "medium", "high": "high"},
+            "contextWindow": 4000, "maxTokens": 100
+        }),
+        "mock-fast" => serde_json::json!({
+            "id": "mock-fast", "name": "Mock Fast", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+            "contextWindow": 8000, "maxTokens": 100
+        }),
+        _ => serde_json::json!({
+            "id": "mock-model", "name": "Mock Model", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+            "contextWindow": 1000, "maxTokens": 100
+        }),
+    }
+}
+
+/// Native per-model thinking levels for the mock (`getSupportedThinkingLevels`
+/// parity: `null`/missing entries exclude `xhigh`/`max`; a `null` entry
+/// excludes its level everywhere). Unknown model ids get the full ladder.
+fn mock_supported_levels(id: &str) -> Vec<&'static str> {
+    match id {
+        "mock-limited" => vec!["off", "low", "medium", "high"],
+        _ => vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    }
+}
+
+/// Clamp a requested level to the mock model's levels (pi-ai
+/// `clampThinkingLevel` parity: exact hit, else nearest higher, else nearest
+/// lower). Unknown levels fall back to the first supported level.
+fn mock_clamp_level(id: &str, level: &str) -> String {
+    const LADDER: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let supported = mock_supported_levels(id);
+    if supported.contains(&level) {
+        return level.to_string();
+    }
+    let requested = LADDER.iter().position(|l| *l == level);
+    if let Some(i) = requested {
+        if let Some(up) = LADDER.iter().skip(i + 1).find(|l| supported.contains(*l)) {
+            return up.to_string();
+        }
+        if let Some(down) = LADDER[..i].iter().rev().find(|l| supported.contains(*l)) {
+            return down.to_string();
+        }
+    }
+    supported.first().unwrap_or(&"off").to_string()
+}
+
+/// Read the native id from a persisted pi session header. A missing or
+/// malformed file intentionally falls back to the default mock id, which lets
+/// restore tests exercise the adapter's mismatch check.
+fn read_mock_session_id(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let first = raw.lines().next()?.trim();
+    let value: serde_json::Value = serde_json::from_str(first).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session") {
+        return None;
+    }
+    let id = value.get("id").and_then(serde_json::Value::as_str)?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Simulate pi flushing a new session after its first successful turn. The
+/// caller can still use a scenario directive to provide richer file content;
+/// an existing file is therefore left untouched.
+fn persist_mock_session_file(path: &Path, session_id: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cwd = std::env::current_dir()?;
+    let header = serde_json::json!({
+        "type": "session",
+        "id": session_id,
+        "cwd": cwd.to_string_lossy(),
+    });
+    std::fs::write(path, format!("{header}\n"))?;
+    Ok(())
+}
+
+/// The default post-prompt event sequence: a `text_delta` message_update with
+/// an empty usage snapshot, the final assistant `message_end` with token
+/// usage, and `agent_settled`.
 async fn emit_default_prompt_response(stdout: &mut tokio::io::Stdout) -> Result<()> {
     let update = serde_json::json!({
         "type": "message_update",
-        "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15},
+        "usage": {},
         "assistantMessageEvent": {
             "type": "text_delta",
             "contentIndex": 0,
@@ -535,6 +705,15 @@ async fn emit_default_prompt_response(stdout: &mut tokio::io::Stdout) -> Result<
         }
     });
     mock_write_line(stdout, update.to_string().as_bytes()).await?;
+    let end = serde_json::json!({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello from mock"}],
+            "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15}
+        }
+    });
+    mock_write_line(stdout, end.to_string().as_bytes()).await?;
     mock_write_line(stdout, b"{\"type\":\"agent_settled\"}").await?;
     Ok(())
 }

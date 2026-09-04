@@ -9,7 +9,11 @@
 //!   completing only on pi's `agent_settled` event (**not** `agent_end`, which
 //!   pi may emit repeatedly for retries/compaction/continuations). `cancel()`
 //!   clears the queue (each queued turn resolves `Cancelled`) and aborts the
-//!   in-flight turn.
+//!   in-flight turn. A settle timeout (pi accepted the prompt but never
+//!   settled) does **not** immediately retire the session: the stuck turn fails
+//!   with `SettleTimeout`, pi is aborted, and new prompts queue behind a
+//!   bounded drain until the abort response and late `agent_settled` arrive —
+//!   so neither can affect a fresh turn (W-480).
 //! - **Event pump**: a single `tokio::select!` loop consumes pi events and
 //!   session commands; every outbound ACP notification goes through one
 //!   ordered channel (`[`OutboundMessage`]`), so `session/update` frames leave
@@ -41,10 +45,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Cost, Diff, PermissionOption, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionInfoUpdate, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, CurrentModeUpdate, Diff,
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::{json, Value};
@@ -53,8 +58,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::{AcpxError, Result};
 use crate::pi::process::{PiProcess, RpcClient};
 use crate::pi::rpc::{
-    AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
-    RpcCommand, RpcEvent, Usage,
+    supported_thinking_levels, AssistantMessageEvent, CompactionReason, ExtensionUiRequest,
+    ExtensionUiResponse, ImageContent, Model, RpcCommand, RpcEvent, RpcSessionState, ThinkingLevel,
+    Usage,
 };
 use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
@@ -80,6 +86,36 @@ pub enum StopReason {
 /// alive); shared between the session handle and the pump task so a dead pi is
 /// reported loudly on every later command (S8 / #82).
 type PiExitStatus = Option<(Option<i32>, Option<i32>)>;
+
+/// How long after our own thinking/model set a `thinking_level_changed` event
+/// counts as that set's echo (W-479 P1). The echoing event follows the set
+/// response by milliseconds; 2s is generous headroom for loaded runners while
+/// keeping genuinely pi-initiated later changes on the full-refresh path.
+const THINKING_SET_ECHO_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a settle-timeout recovery waits for pi to confirm that the
+/// aborted turn is over (W-480). A healthy pi settles promptly after `abort`;
+/// an unresponsive one is retired instead of letting stale events race a
+/// fresh turn.
+const STALE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether a `thinking_level_changed` event observed at `now` is the echo of
+/// our own set at `last_set` (pure predicate for the pump's echo suppression).
+fn thinking_event_is_echo(last_set: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_set.is_some_and(|t| now.saturating_duration_since(t) <= THINKING_SET_ECHO_WINDOW)
+}
+
+/// Clear a thinking-set stamp recorded before a failed set — but only when it
+/// is still ours, so a concurrent newer set's stamp is never wiped.
+fn clear_thinking_stamp(
+    slot: &Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    stamp: std::time::Instant,
+) {
+    let mut guard = slot.lock().unwrap();
+    if guard.as_ref() == Some(&stamp) {
+        *guard = None;
+    }
+}
 
 /// Outbound ACP messages produced by the session pump.
 ///
@@ -126,8 +162,9 @@ pub struct SessionParams {
     /// Optional pi session file to resume (`--session <path>`; used by
     /// `session/load`).
     pub session_path: Option<PathBuf>,
-    /// Optional ACP session id override (used by `session/load`: the session
-    /// is registered under the requested id, not the spawned pi's own).
+    /// Optional ACP session id override (used by `session/load`). It must match
+    /// the id reported by pi for `session_path`; it is only an ACP registration
+    /// value, never a replacement for pi's native/provider session id.
     pub session_id_override: Option<SessionId>,
     /// File-based slash commands to expand in `prompt` (pi RPC mode disables
     /// its own slash expansion, so pi-acp does it — TS `session.ts`).
@@ -153,6 +190,19 @@ pub struct PiAcpSession {
     /// with [`AcpxError::PiExited`] (code/signal + hint) instead of a generic
     /// "session closed" (S8 / fixes #82 — a dead pi is always loud).
     death: Arc<std::sync::Mutex<PiExitStatus>>,
+    /// The `get_state` snapshot taken during [`PiAcpSession::spawn`]. No pi
+    /// mutation happens between spawn and the `session/new` handshake, so the
+    /// agent reuses this instead of re-fetching state (W-479: saves one pi
+    /// round-trip on the session/new critical path). Later reads use the
+    /// live [`PiAcpSession::get_state`] RPC.
+    initial_state: RpcSessionState,
+    /// When our own `set_thinking_level` / `set_model` last succeeded.
+    /// A `thinking_level_changed` event arriving inside
+    /// [`THINKING_SET_ECHO_WINDOW`] is that set's echo: the agent's explicit
+    /// config refresh (which runs right after the set) already re-read the
+    /// same post-set state, so the pump skips its own re-read and emits only
+    /// the authoritative mode update (W-479 P1).
+    thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Commands the pump task accepts from the outside world.
@@ -180,6 +230,9 @@ enum SessionCommand {
         window: Option<u64>,
         respond: oneshot::Sender<()>,
     },
+    /// Publish the empty initial context usage once the ACP session is known
+    /// to the client (`session/new` response has been sent).
+    PublishInitialUsage { respond: oneshot::Sender<()> },
     /// Graceful teardown: dispose the pi process, then signal completion.
     Shutdown { done: oneshot::Sender<()> },
 }
@@ -262,9 +315,19 @@ struct Pump {
     prompt_rx: mpsc::Receiver<PromptResult>,
     /// Held open so `prompt_rx.recv()` parks when no prompt is in flight.
     _prompt_tx: mpsc::Sender<PromptResult>,
+    /// Receives the result of the recovery `abort` RPC. The abort runs in a
+    /// separate task so the pump can continue consuming pi events while the
+    /// request is pending.
+    recovery_abort_rx: mpsc::Receiver<Result<()>>,
+    /// Held open so `recovery_abort_rx.recv()` parks while no recovery abort is
+    /// in flight; cloned into the recovery abort task.
+    recovery_abort_tx: mpsc::Sender<Result<()>>,
     /// Shared death record; set at teardown when pi exited unexpectedly so the
     /// [`PiAcpSession`] handle fails later commands with [`AcpxError::PiExited`].
     death: Arc<std::sync::Mutex<PiExitStatus>>,
+    /// Shared with the [`PiAcpSession`] handle: when our own thinking/model
+    /// set last succeeded (see the handle's field docs; W-479 P1).
+    thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// True when the pump loop exited because pi's stdout ended (process died).
     pi_died: bool,
 
@@ -274,10 +337,27 @@ struct Pump {
     next_turn_id: u64,
     /// Maps abort semantics to the ACP stop reason for the running turn.
     cancel_requested: bool,
-    /// A turn failure leaves pi's event stream ambiguous (late settle events
-    /// have no turn id), so the session rejects later prompts until it is
-    /// disposed and recreated.
+    /// A turn failure that leaves pi's event stream ambiguous with no bounded
+    /// recovery (a rejected `prompt` RPC, or an `abort` that never confirmed)
+    /// retires the session: later prompts fail with `SessionClosed` until the
+    /// session is disposed and recreated. A settle timeout is NOT poisoned —
+    /// it recovers through [`Pump::recovering`] instead (W-480).
     poisoned: bool,
+    /// Settle-timeout recovery (W-480): pi accepted a prompt but never
+    /// settled, so the turn failed with `SettleTimeout` and pi was aborted.
+    /// The aborted turn's late `agent_settled` carries no turn id and must
+    /// never complete a fresh turn, so new prompts queue until the stale
+    /// settle arrives (absorbed) or [`Pump::recover_deadline`] elapses; an
+    /// unconfirmed recovery is then poisoned rather than starting a fresh turn.
+    recovering: bool,
+    /// End of the stale-settle drain (see [`Pump::recovering`]). `None` while
+    /// not recovering.
+    recover_deadline: Option<tokio::time::Instant>,
+    /// The recovery `abort` RPC has returned successfully. A successful RPC
+    /// alone is insufficient: pi must also emit the stale turn's settle event.
+    recovery_abort_confirmed: bool,
+    /// The stale turn's `agent_settled` has been consumed during recovery.
+    recovery_settled: bool,
     /// True while pi's agent loop is running (`agent_start` .. `agent_end`).
     in_agent_loop: bool,
     /// Deadline by which the in-flight turn's `agent_settled` must arrive
@@ -324,9 +404,23 @@ impl PiAcpSession {
                 return Err(err);
             }
         };
-        let session_id = params
-            .session_id_override
-            .unwrap_or_else(|| state.session_id.clone().into());
+        let session_id = match params.session_id_override {
+            Some(expected) => {
+                if expected.0.as_ref() != state.session_id.as_str() {
+                    let expected_id = expected.0.to_string();
+                    let actual_id = state.session_id.clone();
+                    // Do not leave a pi child running after rejecting a stale
+                    // map entry or a missing session file.
+                    proc.dispose().await;
+                    return Err(AcpxError::SessionIdMismatch {
+                        expected: expected_id,
+                        actual: actual_id,
+                    });
+                }
+                expected
+            }
+            None => state.session_id.clone().into(),
+        };
         tracing::info!(session_id = %session_id.0, "pi session ready");
         let rpc = proc.request_client();
         let event_rx = match proc.take_event_receiver() {
@@ -340,8 +434,11 @@ impl PiAcpSession {
             }
         };
 
+        // Shared set-timestamp for thinking-echo suppression (W-479 P1).
+        let thinking_set_at = Arc::new(std::sync::Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (prompt_tx, prompt_rx) = mpsc::channel(4);
+        let (recovery_abort_tx, recovery_abort_rx) = mpsc::channel(1);
         let (extension_tx, extension_rx) = mpsc::channel(8);
         let death = Arc::new(std::sync::Mutex::new(None));
         let pump = Pump {
@@ -356,13 +453,20 @@ impl PiAcpSession {
             extension_tx,
             prompt_rx,
             _prompt_tx: prompt_tx,
+            recovery_abort_rx,
+            recovery_abort_tx,
             death: death.clone(),
+            thinking_set_at: thinking_set_at.clone(),
             pi_died: false,
             queue: VecDeque::new(),
             pending_turn: None,
             next_turn_id: 0,
             cancel_requested: false,
             poisoned: false,
+            recovering: false,
+            recover_deadline: None,
+            recovery_abort_confirmed: false,
+            recovery_settled: false,
             in_agent_loop: false,
             settle_deadline: None,
             settle_timeout: params.settle_timeout,
@@ -382,11 +486,20 @@ impl PiAcpSession {
             first_prompt: AtomicBool::new(false),
             file_commands: params.file_commands,
             death,
+            initial_state: state,
+            thinking_set_at,
         }))
     }
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// The spawn-time `get_state` snapshot (see the field docs). The
+    /// `session/new` handshake consumes this instead of a second `get_state`
+    /// round-trip (W-479).
+    pub fn initial_state(&self) -> &RpcSessionState {
+        &self.initial_state
     }
 
     /// The error to surface when the session's pump is gone: [`AcpxError::PiExited`]
@@ -497,7 +610,19 @@ impl PiAcpSession {
     }
 
     /// `set_model`; refreshes the cached context window for `usage_update`.
+    /// A model switch can clamp thinking and emit `thinking_level_changed`,
+    /// so it shares `set_thinking_level`'s echo bookkeeping (W-479 P1).
     pub async fn set_model(&self, provider: &str, model_id: &str) -> Result<()> {
+        let stamp = std::time::Instant::now();
+        *self.thinking_set_at.lock().unwrap() = Some(stamp);
+        let result = self.set_model_inner(provider, model_id).await;
+        if result.is_err() {
+            clear_thinking_stamp(&self.thinking_set_at, stamp);
+        }
+        result
+    }
+
+    async fn set_model_inner(&self, provider: &str, model_id: &str) -> Result<()> {
         let data = self
             .rpc(RpcCommand::SetModel {
                 provider: provider.to_string(),
@@ -519,10 +644,60 @@ impl PiAcpSession {
         Ok(())
     }
 
-    /// `set_thinking_level`.
-    pub async fn set_thinking_level(&self, level: crate::pi::rpc::ThinkingLevel) -> Result<()> {
-        self.rpc(RpcCommand::SetThinkingLevel { level }).await?;
+    /// Publish an empty ACP context usage update for a newly-created session.
+    ///
+    /// pi only reports usage after a model turn. Zed needs the model's context
+    /// window before that first turn to render its context indicator.
+    pub async fn publish_initial_usage(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::PublishInitialUsage { respond: tx })
+            .await
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?;
         Ok(())
+    }
+
+    /// `set_thinking_level`. Records the set timestamp *before* sending the
+    /// RPC so a fast `thinking_level_changed` echo can never overtake the
+    /// stamp (the pump processes events concurrently); a failed set clears
+    /// its own stamp again so it can never suppress a later genuine refresh
+    /// (W-479 P1 echo suppression).
+    pub async fn set_thinking_level(&self, level: crate::pi::rpc::ThinkingLevel) -> Result<()> {
+        let stamp = std::time::Instant::now();
+        *self.thinking_set_at.lock().unwrap() = Some(stamp);
+        let result = self.rpc(RpcCommand::SetThinkingLevel { level }).await;
+        if result.is_err() {
+            clear_thinking_stamp(&self.thinking_set_at, stamp);
+        }
+        result?;
+        Ok(())
+    }
+
+    /// Native per-model thinking levels for the ACP selector (W-478).
+    ///
+    /// Queries pi's `get_available_thinking_levels` (the same source pi's
+    /// own TUI uses), so Zed offers exactly the levels the active model
+    /// supports. Falls back to the local `supported_thinking_levels`
+    /// computation from the current model (pi-ai `getSupportedThinkingLevels`
+    /// parity, for older pi builds without the RPC), then to the full ladder.
+    pub async fn available_thinking_levels(&self) -> Vec<crate::pi::rpc::ThinkingLevel> {
+        if let Ok(data) = self.rpc(RpcCommand::GetAvailableThinkingLevels).await {
+            if let Some(levels) = data.get("levels").and_then(Value::as_array) {
+                let parsed: Vec<crate::pi::rpc::ThinkingLevel> = levels
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(crate::pi::rpc::ThinkingLevel::parse)
+                    .collect();
+                if !parsed.is_empty() {
+                    return parsed;
+                }
+            }
+        }
+        match self.get_state().await {
+            Ok(state) => supported_thinking_levels(state.model.as_ref()),
+            Err(_) => crate::pi::rpc::ThinkingLevel::all().to_vec(),
+        }
     }
 
     /// `set_steering_mode`.
@@ -618,6 +793,10 @@ async fn pump_loop(mut pump: Pump) {
                         }
                         let _ = respond.send(());
                     }
+                    Some(SessionCommand::PublishInitialUsage { respond }) => {
+                        pump.emit_initial_usage_update().await;
+                        let _ = respond.send(());
+                    }
                     Some(SessionCommand::Shutdown { done }) => {
                         shutdown_done = Some(done);
                         break;
@@ -646,6 +825,9 @@ async fn pump_loop(mut pump: Pump) {
             prompt_result = pump.prompt_rx.recv() => {
                 pump.on_prompt_result(prompt_result).await;
             }
+            recovery_abort_result = pump.recovery_abort_rx.recv() => {
+                pump.on_recovery_abort_result(recovery_abort_result).await;
+            }
             // Settle deadline (design §11 risk #84): pi accepted the prompt
             // but never emitted `agent_settled` — resolve the turn with an
             // explicit error instead of hanging `session/prompt` forever. The
@@ -661,6 +843,21 @@ async fn pump_loop(mut pump: Pump) {
                 }
             } => {
                 pump.on_settle_timeout().await;
+            }
+            // Stale-settle drain (W-480 recovery): bound the wait for both the
+            // abort confirmation and the aborted turn's late `agent_settled`
+            // before queued retries run or the session is poisoned.
+            // Same borrow discipline as the settle deadline above.
+            _recover_deadline = {
+                let deadline = pump.recover_deadline;
+                async move {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                }
+            } => {
+                pump.on_recover_timeout().await;
             }
         }
     }
@@ -725,12 +922,15 @@ impl Pump {
             images,
             resolve: respond,
         };
-        if self.pending_turn.is_some() {
-            // One-at-a-time: a turn is running, queue this one.
+        if self.pending_turn.is_some() || self.recovering {
+            // One-at-a-time: a turn is running, queue this one. While
+            // recovering from a settle timeout (W-480) no turn is running,
+            // but queued prompts still wait for the aborted turn's stale
+            // `agent_settled` so it can never complete a fresh turn.
             self.queue.push_back(queued);
             self.emit_text(&format!("Queued message (position {}).", self.queue.len()))
                 .await;
-            self.emit_queue_depth(true).await;
+            self.emit_queue_depth(self.pending_turn.is_some()).await;
         } else {
             self.start_turn(queued).await;
         }
@@ -743,6 +943,18 @@ impl Pump {
         }
         if self.pending_turn.is_none() {
             self.cancel_requested = false;
+            // While recovering from a settle timeout (W-480), retries wait
+            // queued with no turn running: cancel clears them so a stray
+            // cancel never leaves stale retries behind. The recovery itself
+            // still runs to absorb the aborted turn's late settle.
+            let had_queue = !self.queue.is_empty();
+            while let Some(t) = self.queue.pop_front() {
+                let _ = t.resolve.send(Ok(StopReason::Cancelled));
+            }
+            if had_queue {
+                self.emit_text("Cleared queued prompts.").await;
+                self.emit_queue_depth(false).await;
+            }
             let _ = respond.send(Ok(()));
             return;
         }
@@ -958,8 +1170,8 @@ impl Pump {
         self.emit(update).await;
     }
 
-    /// Emit an ACP `usage_update` from pi's `message_update.usage` (decision 3:
-    /// first release includes the standard notification, aligning #106).
+    /// Emit an ACP `usage_update` from pi's assistant-message usage (decision
+    /// 3: first release includes the standard notification, aligning #106).
     ///
     /// `used` = pi's cumulative context token count (`totalTokens`, falling
     /// back to the component sum); `size` = the active model's context window;
@@ -987,7 +1199,117 @@ impl Pump {
         self.emit(SessionUpdate::UsageUpdate(update)).await;
     }
 
+    /// Emit the initial zero-use context window. This is separate from
+    /// [`Self::emit_usage_update`] because pi's first usage event may not
+    /// arrive until after the first model turn.
+    async fn emit_initial_usage_update(&mut self) {
+        let Some(size) = self.context_window else {
+            return;
+        };
+        self.emit(SessionUpdate::UsageUpdate(UsageUpdate::new(0, size)))
+            .await;
+    }
+
+    /// pi's streaming `message_update` can carry an empty usage snapshot. The
+    /// final assistant `message_end` contains the authoritative usage, so only
+    /// extract usage from assistant messages here.
+    fn usage_from_assistant_message(message: &Value) -> Option<Usage> {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            return None;
+        }
+        serde_json::from_value(message.get("usage")?.clone()).ok()
+    }
+
     // --- pi events ---
+
+    /// Forward pi's `thinking_level_changed` to the client so Zed's thinking
+    /// selectors follow pi-initiated changes (e.g. alongside a model switch).
+    ///
+    /// The mode update is authoritative from the event and always emitted.
+    /// The config-option refresh re-reads pi state (best-effort): a failed
+    /// round-trip must not turn an informational event into a turn failure,
+    /// so the mode update still stands on its own. The thought-level options
+    /// are the model's native available levels (W-478), not a static ladder.
+    ///
+    /// Echo suppression (W-479 P1): when this event closely follows our own
+    /// `set_thinking_level` / `set_model`, the agent's explicit refresh has
+    /// already re-read the same post-set state — skip the duplicate re-read.
+    async fn on_thinking_level_changed(&mut self, level: ThinkingLevel) {
+        self.emit(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+            level.id(),
+        )))
+        .await;
+        if thinking_event_is_echo(
+            *self.thinking_set_at.lock().unwrap(),
+            std::time::Instant::now(),
+        ) {
+            return;
+        }
+        let (state_res, models_res, levels_res) = tokio::join!(
+            self.rpc.request(&RpcCommand::GetState),
+            self.rpc.request(&RpcCommand::GetAvailableModels),
+            self.rpc.request(&RpcCommand::GetAvailableThinkingLevels),
+        );
+        let (Ok(state_data), Ok(models_data)) = (state_res, models_res) else {
+            return;
+        };
+        let state_model = serde_json::from_value::<RpcSessionState>(state_data)
+            .ok()
+            .and_then(|s| s.model);
+        let current_model = state_model.as_ref().and_then(|m| {
+            let provider = m.provider.trim();
+            let id = m.id.trim();
+            if provider.is_empty() || id.is_empty() {
+                None
+            } else {
+                Some(format!("{provider}/{id}"))
+            }
+        });
+        let available: Vec<(String, String)> = models_data
+            .get("models")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<Model>>(v).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                let provider = m.provider.trim();
+                let id = m.id.trim();
+                if provider.is_empty() || id.is_empty() {
+                    None
+                } else {
+                    Some((format!("{provider}/{id}"), format!("{provider}/{}", m.name)))
+                }
+            })
+            .collect();
+        // Native levels first; fall back to the local per-model computation
+        // so an older pi without the RPC still yields a dynamic list.
+        let levels: Vec<ThinkingLevel> = levels_res
+            .ok()
+            .and_then(|data| data.get("levels").cloned())
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| ThinkingLevel::parse(id))
+                    .collect()
+            })
+            .filter(|levels: &Vec<ThinkingLevel>| !levels.is_empty())
+            .unwrap_or_else(|| supported_thinking_levels(state_model.as_ref()));
+        let mut options = vec![crate::agent::thought_level_config_option(
+            level.id(),
+            &levels,
+        )];
+        let current_model_id = current_model
+            .or_else(|| available.first().map(|(id, _)| id.clone()))
+            .unwrap_or_default();
+        if let Some(model_option) = crate::agent::model_config_option(&current_model_id, &available)
+        {
+            options.insert(0, model_option);
+        }
+        self.emit(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+            options,
+        )))
+        .await;
+    }
 
     async fn on_event(&mut self, ev: RpcEvent) {
         match ev {
@@ -997,6 +1319,11 @@ impl Pump {
             } => {
                 self.emit_usage_update(&usage).await;
                 self.on_message_update(&assistant_message_event).await;
+            }
+            RpcEvent::MessageEnd { message } => {
+                if let Some(usage) = Self::usage_from_assistant_message(&message) {
+                    self.emit_usage_update(&usage).await;
+                }
             }
             RpcEvent::ToolExecutionStart {
                 tool_call_id,
@@ -1081,9 +1408,14 @@ impl Pump {
                     self.emit(SessionUpdate::SessionInfoUpdate(update)).await;
                 }
             }
-            // Not wired (logged): QueueUpdate / ThinkingLevelChanged /
-            // EntryAppended / UnmatchedResponse / ExtensionError /
-            // summarization retries / unknown future events.
+            // pi changed the thinking level itself: push both selectors so
+            // Zed's mode picker and thinking dropdown follow.
+            RpcEvent::ThinkingLevelChanged { level } => {
+                self.on_thinking_level_changed(level).await;
+            }
+            // Not wired (logged): QueueUpdate / EntryAppended /
+            // UnmatchedResponse / ExtensionError / summarization retries /
+            // unknown future events.
             other => {
                 tracing::trace!(?other, "unhandled pi event");
             }
@@ -1095,6 +1427,16 @@ impl Pump {
     /// that response confirms the turn. During cancellation, the abort is the
     /// confirmation that an early response is no longer required.
     async fn on_agent_settled(&mut self) {
+        if self.pending_turn.is_none() && self.recovering {
+            // The aborted turn's late settle (W-480 recovery): absorb it —
+            // it belongs to the timed-out turn, never to a fresh one. The
+            // recovery also waits for the abort RPC response before starting
+            // a retry, so an in-flight abort can never hit the fresh turn.
+            tracing::debug!("absorbed stale agent_settled during settle-timeout recovery");
+            self.recovery_settled = true;
+            self.finish_recovery_if_confirmed().await;
+            return;
+        }
         if let Some(pending) = self.pending_turn.as_mut() {
             if !pending.prompt_accepted && !self.cancel_requested {
                 pending.settled_before_accept = true;
@@ -1171,9 +1513,17 @@ impl Pump {
     /// The settle deadline fired: pi accepted the prompt but never emitted
     /// `agent_settled` (design §11 risk #84). Resolve the pending turn with an
     /// explicit [`AcpxError::SettleTimeout`] so `session/prompt` can never
-    /// hang forever, and fire a best-effort `abort` to unstick pi. Queued
-    /// turns are not auto-started (pi may be unhealthy — same policy as the
-    /// prompt-rejection path).
+    /// hang forever, and fire an `abort` to unstick pi.
+    ///
+    /// Unlike a rejected `prompt` RPC, this path stays recoverable (W-480):
+    /// the session is NOT poisoned. Queued turns fail with the same
+    /// `SettleTimeout` (they never ran — the client retries them), and new
+    /// prompts queue behind a bounded drain until both the abort response and
+    /// the aborted turn's late `agent_settled` arrive, so neither an in-flight
+    /// abort nor a stale settle can affect a fresh turn. `cancel` keeps working
+    /// (it clears the drain queue). A healthy pi retries on the same ACP
+    /// session id; an abort failure or an unconfirmed drain poisons the
+    /// session, which is the safe fallback for an unhealthy pi.
     async fn on_settle_timeout(&mut self) {
         self.settle_deadline = None;
         let Some(pending) = self.pending_turn.take() else {
@@ -1183,21 +1533,145 @@ impl Pump {
         self.flush_outbound().await;
         let secs = self.settle_timeout.as_secs();
         let _ = pending.resolve.send(Err(AcpxError::SettleTimeout { secs }));
-        self.fail_queued_turns();
+        // Queued turns never reached pi: fail them with the same timeout so
+        // the client retries them on this same session (they are not
+        // session-closed — the session recovers below).
+        while let Some(t) = self.queue.pop_front() {
+            let _ = t.resolve.send(Err(AcpxError::SettleTimeout { secs }));
+        }
+        self.cancel_requested = false;
+        self.in_agent_loop = false;
+        self.recovering = true;
+        self.recover_deadline = Some(tokio::time::Instant::now() + STALE_DRAIN_TIMEOUT);
+        self.recovery_abort_confirmed = false;
+        self.recovery_settled = false;
+        self.emit_queue_depth(false).await;
+
+        // Tell pi to stop whatever it accepted. The pump waits for both this
+        // RPC result and the resulting late `agent_settled` before starting a
+        // retry; otherwise the abort could still affect the fresh turn.
+        let rpc = self.rpc.clone();
+        let result_tx = self.recovery_abort_tx.clone();
+        tokio::spawn(async move {
+            let result = rpc.request(&RpcCommand::Abort).await.map(|_| ());
+            let _ = result_tx.send(result).await;
+        });
+    }
+
+    /// Record the result of the recovery abort. A successful RPC is necessary
+    /// but not sufficient: the event pump must also consume the old turn's
+    /// settle event before a retry can start.
+    async fn on_recovery_abort_result(&mut self, result: Option<Result<()>>) {
+        let Some(result) = result else {
+            return;
+        };
+        if !self.recovering {
+            tracing::debug!("late recovery abort result after recovery ended; ignoring");
+            return;
+        }
+        match result {
+            Ok(()) => {
+                tracing::debug!("recovery abort confirmed");
+                self.recovery_abort_confirmed = true;
+                self.finish_recovery_if_confirmed().await;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "abort after settle timeout failed");
+                self.poison_recovery().await;
+            }
+        }
+    }
+
+    /// Start the queued retry only after both sides of the recovery handshake
+    /// are confirmed. Keeping these confirmations separate handles either
+    /// event order without allowing an abort response or settle event to race
+    /// the next prompt.
+    async fn finish_recovery_if_confirmed(&mut self) {
+        if !self.recovering || !self.recovery_abort_confirmed || !self.recovery_settled {
+            return;
+        }
+        self.recovering = false;
+        self.recover_deadline = None;
+        self.recovery_abort_confirmed = false;
+        self.recovery_settled = false;
+        if let Some(next) = self.queue.pop_front() {
+            self.emit_text(&format!(
+                "Starting queued message. ({} remaining)",
+                self.queue.len()
+            ))
+            .await;
+            self.start_turn(next).await;
+        } else {
+            self.emit_queue_depth(false).await;
+        }
+    }
+
+    /// Retire a recovery that cannot prove the old turn is gone. Once poisoned,
+    /// any late settle is ignored because no new turn will be started on this
+    /// process, preserving the no-turn-id safety invariant.
+    async fn poison_recovery(&mut self) {
+        self.recovering = false;
+        self.recover_deadline = None;
+        self.recovery_abort_confirmed = false;
+        self.recovery_settled = false;
         self.poisoned = true;
         self.cancel_requested = false;
         self.in_agent_loop = false;
+        self.fail_queued_turns();
         self.emit_queue_depth(false).await;
+    }
 
-        // Best-effort: tell pi to stop whatever it accepted (it may still be
-        // inside an agent loop; the resulting late `agent_settled` is ignored
-        // — the pending turn is already resolved).
-        let rpc = self.rpc.clone();
-        tokio::spawn(async move {
-            if let Err(e) = rpc.request(&RpcCommand::Abort).await {
-                tracing::warn!(error = %e, "abort after settle timeout failed");
+    /// The stale-settle drain elapsed without confirming both the abort RPC
+    /// and the old turn's settle (W-480). Drain events that are already buffered
+    /// at the deadline, then retry only if the complete handshake is present;
+    /// otherwise poison the session so a late stale event cannot complete a
+    /// future prompt.
+    async fn on_recover_timeout(&mut self) {
+        if !self.recovering {
+            return;
+        }
+
+        // A result or event buffered alongside the timer may complete the
+        // handshake. Consume all currently available values before deciding.
+        while let Ok(result) = self.recovery_abort_rx.try_recv() {
+            self.on_recovery_abort_result(Some(result)).await;
+            if !self.recovering {
+                return;
             }
-        });
+        }
+        while let Ok(ev) = self.event_rx.try_recv() {
+            if matches!(ev, RpcEvent::AgentSettled) {
+                tracing::debug!(
+                    "absorbed buffered stale agent_settled at end of settle-timeout recovery"
+                );
+                self.recovery_settled = true;
+            } else {
+                // Other buffered events still belong to the timed-out turn.
+                // Preserve existing notification behavior, but never allow
+                // them to change the recovery decision.
+                self.on_event(ev).await;
+            }
+            if !self.recovering {
+                return;
+            }
+        }
+        while let Ok(result) = self.recovery_abort_rx.try_recv() {
+            self.on_recovery_abort_result(Some(result)).await;
+            if !self.recovering {
+                return;
+            }
+        }
+
+        if self.recovery_abort_confirmed && self.recovery_settled {
+            self.finish_recovery_if_confirmed().await;
+        } else {
+            tracing::warn!(
+                abort_confirmed = self.recovery_abort_confirmed,
+                settled = self.recovery_settled,
+                "settle-timeout recovery drain expired without confirmation"
+            );
+            self.poison_recovery().await;
+        }
     }
 
     // --- streaming assistant messages ---
@@ -1998,6 +2472,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn thinking_echo_window_classifies_set_echoes() {
+        let now = std::time::Instant::now();
+        // No set yet: never an echo (genuine pi-initiated change refreshes).
+        assert!(!thinking_event_is_echo(None, now));
+        // Fresh set: echo, skip the redundant re-read.
+        assert!(thinking_event_is_echo(Some(now), now));
+        assert!(thinking_event_is_echo(
+            Some(now - THINKING_SET_ECHO_WINDOW),
+            now
+        ));
+        // Stale set: full refresh again.
+        assert!(!thinking_event_is_echo(
+            Some(now - THINKING_SET_ECHO_WINDOW - Duration::from_millis(1)),
+            now
+        ));
+    }
+
+    #[test]
     fn option_index_parses_choice_ids() {
         assert_eq!(option_index("choice-0"), Some(0));
         assert_eq!(option_index("choice-12"), Some(12));
@@ -2108,17 +2600,21 @@ mod tests {
 
         let permission =
             request_permission(&session_id, "ui-1", "Pick", &request, Vec::new(), &outbound);
-        let (_, result) = tokio::join!(
-            async {
-                let Some(OutboundMessage::RequestPermission(_, _responder)) =
-                    outbound_rx.recv().await
-                else {
-                    panic!("permission request was not sent");
-                };
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            },
-            permission,
-        );
+        // Receive the request and then never answer: park forever holding the
+        // responder so the extension timeout — not a racy drop — is the only
+        // way the permission future can resolve. The old 25ms-drop raced the
+        // 10ms timeout under coarse OS timer granularity (Windows ~15.6ms),
+        // flaking with "permission responder dropped".
+        let waiter = tokio::spawn(async move {
+            let Some(OutboundMessage::RequestPermission(_, responder)) = outbound_rx.recv().await
+            else {
+                panic!("permission request was not sent");
+            };
+            let _hold = responder;
+            std::future::pending::<()>().await;
+        });
+        let result = permission.await;
+        waiter.abort();
 
         match result {
             Err(AcpxError::RpcFailed { command, message }) => {

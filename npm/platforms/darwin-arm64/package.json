@@ -1,0 +1,22 @@
+{
+  "name": "@puqing-works/pi-acp-rs-darwin-arm64",
+  "version": "0.2.1",
+  "description": "macOS arm64 binary for pi-acp-rs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndPuQing/pi-acp.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

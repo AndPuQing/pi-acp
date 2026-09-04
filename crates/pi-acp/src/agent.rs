@@ -35,7 +35,7 @@
 //! - `authenticate` — no-op (terminal auth runs out-of-band).
 //!
 //! ACP `usage_update` notifications (decision 3 / #106) are emitted by the
-//! session pump from pi's `message_update.usage` (see [`PiAcpSession`]).
+//! session pump from pi's assistant-message usage (see [`PiAcpSession`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,7 +66,9 @@ use crate::commands::{self, FileSlashCommand};
 use crate::config::Config;
 use crate::error::{AcpxError, Result};
 use crate::pi::rpc::{ImageContent, Model, QueueMode, RpcSessionState, ThinkingLevel};
-use crate::pi::sessions::{find_pi_session, list_pi_sessions, title_from_session_file};
+use crate::pi::sessions::{
+    find_pi_session, list_pi_sessions, session_file_matches_id, title_from_session_file,
+};
 use crate::session::{
     spawn_outbound_connector, PiAcpSession, SessionManager, SessionParams,
     StopReason as SessionStopReason,
@@ -119,11 +121,14 @@ struct ModelState {
     current_model_id: String,
 }
 
-/// Thought-level mode state (the fixed `off..xhigh` ladder).
+/// Thought-level mode state (the model's native available levels, W-478).
 #[derive(Debug, Clone)]
 struct ModeState {
     current_mode_id: String,
     available_modes: Vec<SessionMode>,
+    /// The native level list behind `available_modes` (shared with the
+    /// `thought_level` config option so both selectors describe one ladder).
+    levels: Vec<ThinkingLevel>,
 }
 
 /// Notifications that must be sent only after the `session/new` response is
@@ -270,6 +275,10 @@ impl AcpAgent {
                     match result {
                         Ok((resp, post_response)) => {
                             responder.respond(resp)?;
+                            // Publish the empty context state before the
+                            // handler returns, so a client cannot race the
+                            // post-response task with its first prompt.
+                            let _ = post_response.session.publish_initial_usage().await;
                             let cx_for_task = cx.clone();
                             cx.spawn(async move {
                                 post_response.send(&cx_for_task).await;
@@ -292,7 +301,17 @@ impl AcpAgent {
                     cx.spawn(async move {
                         let result = agent.handle_prompt(&req, &cx_for_task).await;
                         match result {
-                            Ok(resp) => responder.respond(resp),
+                            Ok((resp, persisted)) => {
+                                let answered = responder.respond(resp);
+                                // Persist after the response is queued: the
+                                // session-map write (+ its `get_state`
+                                // round-trip) must not hold up prompt latency
+                                // (W-479 P1). Failures stay best-effort inside.
+                                if let Some(session) = persisted {
+                                    agent.persist_session_if_ready(&session).await;
+                                }
+                                answered
+                            }
                             Err(e) => responder.respond_with_error(e),
                         }
                     })?;
@@ -527,51 +546,55 @@ impl AcpAgent {
         };
         let session_id = session.session_id().clone();
 
-        // Fetch state + models once (parallel) to reduce startup latency.
-        let (state_res, models_res) =
-            tokio::join!(session.get_state(), session.get_available_models());
-        let state = state_res.as_ref().ok().cloned();
+        // Reuse the spawn-time state: `PiAcpSession::spawn` already fetched
+        // `get_state`, and nothing mutates pi between spawn and here, so only
+        // the model list costs a round-trip on this path (W-479: one fewer
+        // pi RPC on the session/new critical path).
+        let state = session.initial_state().clone();
+        let models_res = session.get_available_models().await;
         let available_models = models_res.as_ref().ok().cloned();
 
         // Auth checks (parity with TS): a model-list failure that smells like
         // missing credentials, or zero models, both mean "authenticate first".
         if let Some(err) = models_res.as_ref().err() {
             if maybe_auth_required_error(&err.to_string()).is_some() {
-                self.cleanup_failed_new_session(&session, state.as_ref())
+                self.cleanup_failed_new_session(&session, Some(&state))
                     .await;
                 drain_startup_tasks(notice_task.take(), version_task.take()).await;
                 return Err(auth_required());
             }
-            self.cleanup_failed_new_session(&session, state.as_ref())
+            self.cleanup_failed_new_session(&session, Some(&state))
                 .await;
             drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(AcpError::new(ACP_INTERNAL_ERROR, err.to_string()));
         }
         let raw_models_count = available_models.as_ref().map(Vec::len).unwrap_or(0);
         if raw_models_count == 0 {
-            self.cleanup_failed_new_session(&session, state.as_ref())
+            self.cleanup_failed_new_session(&session, Some(&state))
                 .await;
             drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(auth_required());
         }
-        if let Some(err) = state_res.as_ref().err() {
-            if maybe_auth_required_error(&err.to_string()).is_some() {
-                self.cleanup_failed_new_session(&session, None).await;
-                drain_startup_tasks(notice_task.take(), version_task.take()).await;
-                return Err(auth_required());
-            }
-        }
 
         let (config_options, _models, modes) =
-            get_session_configuration(&session, state.as_ref(), available_models.as_ref()).await;
+            get_session_configuration(&session, Some(&state), available_models.as_ref()).await;
 
         if let Some(session_file) = state
-            .as_ref()
-            .and_then(|s| s.session_file.as_deref())
+            .session_file
+            .as_deref()
             .filter(|path| !path.trim().is_empty())
         {
-            self.store
-                .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
+            let path = resolve_session_file_path(&req.cwd, session_file);
+            if session_file_matches_id(&path, &session_id.0) {
+                self.store
+                    .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
+            } else {
+                tracing::debug!(
+                    session = %session_id,
+                    ?path,
+                    "session file is not persisted yet; delaying session-map entry"
+                );
+            }
         }
 
         let update_notice = if let Some(task) = notice_task.take() {
@@ -648,15 +671,69 @@ impl AcpAgent {
         self.store.delete(&session_id.0);
     }
 
+    /// Persist a new session's map entry after pi has had a chance to flush
+    /// its first assistant response. pi intentionally keeps an empty new
+    /// session in memory, so `get_state.sessionFile` alone is not proof that
+    /// the path can be restored after this process exits.
+    async fn persist_session_if_ready(&self, session: &Arc<PiAcpSession>) {
+        let state = match session.get_state().await {
+            Ok(state) => state,
+            Err(err) => {
+                // The prompt already settled; a late process exit should not
+                // turn a successful turn into a persistence error.
+                tracing::debug!(
+                    session = %session.session_id(),
+                    error = %err,
+                    "could not refresh session state for persistence"
+                );
+                return;
+            }
+        };
+        let Some(session_file) = state
+            .session_file
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        else {
+            return;
+        };
+
+        let path = resolve_session_file_path(session.cwd(), session_file);
+        if state.session_id != session.session_id().0.as_ref() {
+            tracing::warn!(
+                expected = %session.session_id(),
+                actual = %state.session_id,
+                "pi session id changed unexpectedly; refusing to persist session map entry"
+            );
+            return;
+        }
+        if session_file_matches_id(&path, &state.session_id) {
+            self.store.upsert(
+                session.session_id().0.as_ref(),
+                &session.cwd().to_string_lossy(),
+                session_file,
+            );
+        } else {
+            tracing::debug!(
+                session = %session.session_id(),
+                ?path,
+                "session file is still not persisted; leaving session-map unchanged"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // session/prompt
     // -----------------------------------------------------------------------
 
+    /// Run one prompt turn. Returns the response plus the session to persist
+    /// (`None` for headless built-in commands, which never persist — same as
+    /// before); the caller persists *after* queueing the response so the
+    /// map write stays off prompt latency (W-479 P1).
     async fn handle_prompt(
         &self,
         req: &PromptRequest,
         cx: &ConnectionTo<Client>,
-    ) -> std::result::Result<PromptResponse, AcpError> {
+    ) -> std::result::Result<(PromptResponse, Option<Arc<PiAcpSession>>), AcpError> {
         let session = self.restore_session(&req.session_id, None, cx).await?;
         let session_id = session.session_id().clone();
 
@@ -669,7 +746,7 @@ impl AcpAgent {
                 .handle_builtin_command(cx, &session, &session_id, &pi_prompt.message)
                 .await?
             {
-                return Ok(resp);
+                return Ok((resp, None));
             }
         }
 
@@ -695,7 +772,7 @@ impl AcpAgent {
             .map_err(acp_error_from_pi)?;
         let stop_reason = acp_stop_reason(reason);
         tracing::info!(session = %session_id, ?stop_reason, "prompt turn settled");
-        Ok(PromptResponse::new(stop_reason))
+        Ok((PromptResponse::new(stop_reason), Some(session)))
     }
 
     async fn handle_cancel(&self, notif: &CancelNotification) {
@@ -866,7 +943,7 @@ impl AcpAgent {
     ) -> std::result::Result<SetSessionModeResponse, AcpError> {
         let session = self.restore_session(&req.session_id, None, cx).await?;
         let mode = req.mode_id.0.as_ref();
-        let level = parse_thinking_level(mode)
+        let level = ThinkingLevel::parse(mode)
             .ok_or_else(|| invalid_params(&format!("Unknown modeId: {mode}")))?;
 
         session
@@ -874,9 +951,8 @@ impl AcpAgent {
             .await
             .map_err(acp_error_from_pi)?;
 
-        // Let the client know the current mode changed (keeps the dropdown in sync).
-        send_current_mode_update(cx, &req.session_id, mode).await;
-
+        // Refreshes both selectors; the mode update carries pi's effective
+        // (possibly clamped) level.
         let _ = emit_config_options_update(cx, &req.session_id, &session).await;
         Ok(SetSessionModeResponse::new())
     }
@@ -906,13 +982,12 @@ impl AcpAgent {
                     .map_err(acp_error_from_pi)?;
             }
             THOUGHT_LEVEL_CONFIG_ID => {
-                let level = parse_thinking_level(&value)
+                let level = ThinkingLevel::parse(&value)
                     .ok_or_else(|| invalid_params(&format!("Unknown thinking level: {value}")))?;
                 session
                     .set_thinking_level(level)
                     .await
                     .map_err(acp_error_from_pi)?;
-                send_current_mode_update(cx, &req.session_id, &value).await;
             }
             other => {
                 return Err(invalid_params(&format!("Unknown config option: {other}")));
@@ -1417,6 +1492,17 @@ fn acp_stop_reason(reason: SessionStopReason) -> StopReason {
     }
 }
 
+/// Resolve a session file the same way pi does when it receives a relative
+/// `--session` path while running in the session cwd.
+fn resolve_session_file_path(cwd: &Path, session_file: &str) -> PathBuf {
+    let path = Path::new(session_file);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
 fn invalid_params(msg: &str) -> AcpError {
     AcpError::new(ACP_INVALID_PARAMS, msg.to_string())
 }
@@ -1499,12 +1585,17 @@ async fn advertise_commands(
 
 /// Rebuild and emit the `config_option_update` notification; returns the new
 /// options (also used in the `session/set_config_option` response).
+/// Refresh both selectors after a model/thinking change: the config options
+/// (dynamic per-model thought levels, W-478) plus the effective current mode
+/// (pi clamps thinking to the model's capabilities, so Zed must follow the
+/// read-back level, not the requested one).
 async fn emit_config_options_update(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     session: &Arc<PiAcpSession>,
 ) -> std::result::Result<Vec<SessionConfigOption>, AcpxError> {
-    let (config_options, _models, _modes) = get_session_configuration(session, None, None).await;
+    let (config_options, _models, modes) = get_session_configuration(session, None, None).await;
+    send_current_mode_update(cx, session_id, &modes.current_mode_id).await;
     let update = ConfigOptionUpdate::new(config_options.clone());
     cx.send_notification(SessionNotification::new(
         session_id.clone(),
@@ -1539,18 +1630,11 @@ async fn get_session_configuration(
     pre_state: Option<&RpcSessionState>,
     pre_models: Option<&Vec<Model>>,
 ) -> (Vec<SessionConfigOption>, Option<ModelState>, ModeState) {
-    let models = get_model_state(session, pre_state, pre_models).await;
-    let modes = get_mode_state(session, pre_state).await;
-    let config_options = build_config_options(models.as_ref(), &modes);
-    (config_options, models, modes)
-}
-
-async fn get_model_state(
-    session: &Arc<PiAcpSession>,
-    pre_state: Option<&RpcSessionState>,
-    pre_models: Option<&Vec<Model>>,
-) -> Option<ModelState> {
-    let (available, state) = tokio::join!(
+    // Fetch all three inputs concurrently in one join (W-479): the refresh
+    // path used to fetch `get_state` twice (once for the model state, once
+    // for the mode state). pi has no combined state+levels endpoint, so the
+    // native levels always cost one RPC.
+    let (available, state, levels) = tokio::join!(
         async {
             if let Some(models) = pre_models {
                 models.clone()
@@ -1564,9 +1648,23 @@ async fn get_model_state(
             } else {
                 session.get_state().await.ok()
             }
-        }
+        },
+        session.available_thinking_levels(),
     );
+    let models = model_state_from_parts(&available, state.as_ref());
+    let current = state
+        .as_ref()
+        .map(|s| s.thinking_level.id())
+        .unwrap_or("medium");
+    let modes = mode_state_from_levels(current, levels);
+    let config_options = build_config_options(models.as_ref(), &modes);
+    (config_options, models, modes)
+}
 
+fn model_state_from_parts(
+    available: &[Model],
+    state: Option<&RpcSessionState>,
+) -> Option<ModelState> {
     let available_models: Vec<AdvertisedModel> = available
         .iter()
         .filter_map(|m| {
@@ -1606,28 +1704,24 @@ async fn get_model_state(
     })
 }
 
-async fn get_mode_state(
-    session: &Arc<PiAcpSession>,
-    pre_state: Option<&RpcSessionState>,
-) -> ModeState {
-    let state: Option<RpcSessionState> = if let Some(state) = pre_state {
-        Some(state.clone())
-    } else {
-        session.get_state().await.ok()
-    };
-    let current = state
-        .as_ref()
-        .and_then(|s| thinking_level_str(s.thinking_level))
-        .unwrap_or("medium");
-
+/// Build a [`ModeState`] from the current level id + native level list.
+/// A current level outside the list (stale pi state) is kept as the current
+/// mode so the picker still reflects reality instead of silently flipping.
+fn mode_state_from_levels(current: &str, levels: Vec<ThinkingLevel>) -> ModeState {
+    let available_modes = levels
+        .iter()
+        .map(|level| {
+            SessionMode::new(
+                SessionModeId::new(level.id()),
+                format!("Thinking: {}", level.label()),
+            )
+            .description(level.description().to_string())
+        })
+        .collect();
     ModeState {
         current_mode_id: current.to_string(),
-        available_modes: THINKING_LEVELS
-            .iter()
-            .map(|(id, name)| {
-                SessionMode::new(SessionModeId::new(*id), format!("Thinking: {name}"))
-            })
-            .collect(),
+        available_modes,
+        levels,
     }
 }
 
@@ -1635,41 +1729,71 @@ fn build_config_options(
     models: Option<&ModelState>,
     modes: &ModeState,
 ) -> Vec<SessionConfigOption> {
-    let thought_level_options: Vec<SessionConfigSelectOption> = modes
-        .available_modes
-        .iter()
-        .map(|m| SessionConfigSelectOption::new(m.id.0.as_ref().to_string(), m.name.clone()))
-        .collect();
-    let mut options = vec![SessionConfigOption::select(
-        THOUGHT_LEVEL_CONFIG_ID,
-        "Thinking",
-        modes.current_mode_id.clone(),
-        thought_level_options,
-    )
-    .description("Set the reasoning effort for this session")
-    .category(SessionConfigOptionCategory::ThoughtLevel)];
+    let mut options = vec![thought_level_config_option(
+        &modes.current_mode_id,
+        &modes.levels,
+    )];
 
     if let Some(models) = models {
-        if !models.available_models.is_empty() {
-            let model_options: Vec<SessionConfigSelectOption> = models
-                .available_models
-                .iter()
-                .map(|m| SessionConfigSelectOption::new(m.model_id.clone(), m.name.clone()))
-                .collect();
-            options.insert(
-                0,
-                SessionConfigOption::select(
-                    MODEL_CONFIG_ID,
-                    "Model",
-                    models.current_model_id.clone(),
-                    model_options,
-                )
-                .description("Select the model for this session")
-                .category(SessionConfigOptionCategory::Model),
-            );
+        let available: Vec<(String, String)> = models
+            .available_models
+            .iter()
+            .map(|m| (m.model_id.clone(), m.name.clone()))
+            .collect();
+        if let Some(model_option) = model_config_option(&models.current_model_id, &available) {
+            options.insert(0, model_option);
         }
     }
     options
+}
+
+/// Build the `thought_level` config option for `current_level_id` over the
+/// model's native `available` levels (shared with the session pump's
+/// `thinking_level_changed` handler so the ACP thinking dropdown and the
+/// mode picker always describe the same ladder).
+pub(crate) fn thought_level_config_option(
+    current_level_id: &str,
+    available: &[ThinkingLevel],
+) -> SessionConfigOption {
+    let options: Vec<SessionConfigSelectOption> = available
+        .iter()
+        .map(|level| {
+            SessionConfigSelectOption::new(level.id().to_string(), level.label().to_string())
+                .description(level.description().to_string())
+        })
+        .collect();
+    SessionConfigOption::select(
+        THOUGHT_LEVEL_CONFIG_ID,
+        "Thinking",
+        current_level_id.to_string(),
+        options,
+    )
+    .description("Set the reasoning effort for this session")
+    .category(SessionConfigOptionCategory::ThoughtLevel)
+}
+
+/// Build the `model` config option (`None` when no models are advertised).
+pub(crate) fn model_config_option(
+    current_model_id: &str,
+    available: &[(String, String)],
+) -> Option<SessionConfigOption> {
+    if available.is_empty() {
+        return None;
+    }
+    let options: Vec<SessionConfigSelectOption> = available
+        .iter()
+        .map(|(id, name)| SessionConfigSelectOption::new(id.clone(), name.clone()))
+        .collect();
+    Some(
+        SessionConfigOption::select(
+            MODEL_CONFIG_ID,
+            "Model",
+            current_model_id.to_string(),
+            options,
+        )
+        .description("Select the model for this session")
+        .category(SessionConfigOptionCategory::Model),
+    )
 }
 
 /// Resolve `provider/model` (or bare `model` via the available-model list) and
@@ -1702,39 +1826,6 @@ async fn set_session_model(
         }),
     }
 }
-
-fn parse_thinking_level(s: &str) -> Option<ThinkingLevel> {
-    match s {
-        "off" => Some(ThinkingLevel::Off),
-        "minimal" => Some(ThinkingLevel::Minimal),
-        "low" => Some(ThinkingLevel::Low),
-        "medium" => Some(ThinkingLevel::Medium),
-        "high" => Some(ThinkingLevel::High),
-        "xhigh" => Some(ThinkingLevel::XHigh),
-        _ => None,
-    }
-}
-
-fn thinking_level_str(level: ThinkingLevel) -> Option<&'static str> {
-    match level {
-        ThinkingLevel::Off => Some("off"),
-        ThinkingLevel::Minimal => Some("minimal"),
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-        ThinkingLevel::XHigh => Some("xhigh"),
-    }
-}
-
-/// The fixed thought-level ladder (id, display name).
-const THINKING_LEVELS: [(&str, &str); 6] = [
-    ("off", "off"),
-    ("minimal", "minimal"),
-    ("low", "low"),
-    ("medium", "medium"),
-    ("high", "high"),
-    ("xhigh", "xhigh"),
-];
 
 /// Replay a session's message history as ACP notifications (TS `loadSession`).
 async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, data: &Value) {

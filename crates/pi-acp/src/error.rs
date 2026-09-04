@@ -52,6 +52,11 @@ pub enum AcpxError {
         signal: Option<i32>,
     },
 
+    /// The ACP id supplied while restoring a session does not match the id
+    /// reported by pi for the selected session file.
+    #[error("pi session id mismatch: ACP requested '{expected}', pi reported '{actual}'")]
+    SessionIdMismatch { expected: String, actual: String },
+
     /// pi answered a command with `success: false`.
     #[error("pi RPC command '{command}' failed: {message}")]
     RpcFailed { command: String, message: String },
@@ -106,6 +111,7 @@ impl AcpxError {
             AcpxError::PiSpawn(_) => "piSpawn",
             AcpxError::RpcTimeout { .. } => "rpcTimeout",
             AcpxError::PiExited { .. } => "piExited",
+            AcpxError::SessionIdMismatch { .. } => "sessionIdMismatch",
             AcpxError::RpcFailed { .. } => "rpcFailed",
             AcpxError::SettleTimeout { .. } => "settleTimeout",
             AcpxError::AuthRequired(_) => "authRequired",
@@ -139,6 +145,14 @@ impl AcpxError {
                 obj.insert(
                     "hint".to_string(),
                     json!("pi-acp does not restart pi automatically; start a new session (session/new) or restart pi-acp to recover"),
+                );
+            }
+            AcpxError::SessionIdMismatch { expected, actual } => {
+                obj.insert("expectedSessionId".to_string(), json!(expected));
+                obj.insert("actualSessionId".to_string(), json!(actual));
+                obj.insert(
+                    "hint".to_string(),
+                    json!("The mapped session file may be missing or belong to a different session; start a new session (session/new) to recover"),
                 );
             }
             AcpxError::RpcFailed { command, message } => {
@@ -254,6 +268,21 @@ mod tests {
                 .contains("does not restart pi"),
             "hint: {data}"
         );
+    }
+
+    #[test]
+    fn session_id_mismatch_detail_carries_both_ids() {
+        let err: AcpError = AcpxError::SessionIdMismatch {
+            expected: "requested".into(),
+            actual: "reported".into(),
+        }
+        .into();
+        assert_eq!(err.code, ACP_INTERNAL_ERROR.into());
+        let data = err.data.as_ref().expect("error data");
+        assert_eq!(data["errorType"], "sessionIdMismatch");
+        assert_eq!(data["expectedSessionId"], "requested");
+        assert_eq!(data["actualSessionId"], "reported");
+        assert!(data["hint"].as_str().unwrap().contains("session/new"));
     }
 
     #[test]

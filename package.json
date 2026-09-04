@@ -1,6 +1,6 @@
 {
   "name": "pi-acp-rs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "ACP adapter for the pi coding agent",
   "license": "MIT",
   "repository": {
@@ -19,11 +19,11 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "pi-acp-rs-linux-x64": "0.1.0",
-    "pi-acp-rs-linux-arm64": "0.1.0",
-    "pi-acp-rs-darwin-x64": "0.1.0",
-    "pi-acp-rs-darwin-arm64": "0.1.0",
-    "pi-acp-rs-win32-x64": "0.1.0"
+    "@puqing-works/pi-acp-rs-linux-x64": "0.2.0",
+    "@puqing-works/pi-acp-rs-linux-arm64": "0.2.0",
+    "@puqing-works/pi-acp-rs-darwin-x64": "0.2.0",
+    "@puqing-works/pi-acp-rs-darwin-arm64": "0.2.0",
+    "@puqing-works/pi-acp-rs-win32-x64": "0.2.0"
   },
   "publishConfig": {
     "access": "public"

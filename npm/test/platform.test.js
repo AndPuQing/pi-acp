@@ -5,10 +5,10 @@ const assert = require('node:assert/strict');
 const { getPlatformSpec } = require('../lib/platform.js');
 
 test('maps each release target to its platform package', () => {
-  assert.equal(getPlatformSpec('linux', 'x64').packageName, 'pi-acp-rs-linux-x64');
-  assert.equal(getPlatformSpec('linux', 'arm64').packageName, 'pi-acp-rs-linux-arm64');
-  assert.equal(getPlatformSpec('darwin', 'x64').packageName, 'pi-acp-rs-darwin-x64');
-  assert.equal(getPlatformSpec('darwin', 'arm64').packageName, 'pi-acp-rs-darwin-arm64');
+  assert.equal(getPlatformSpec('linux', 'x64').packageName, '@puqing-works/pi-acp-rs-linux-x64');
+  assert.equal(getPlatformSpec('linux', 'arm64').packageName, '@puqing-works/pi-acp-rs-linux-arm64');
+  assert.equal(getPlatformSpec('darwin', 'x64').packageName, '@puqing-works/pi-acp-rs-darwin-x64');
+  assert.equal(getPlatformSpec('darwin', 'arm64').packageName, '@puqing-works/pi-acp-rs-darwin-arm64');
   assert.equal(getPlatformSpec('win32', 'x64').binaryPath, 'bin/pi-acp.exe');
 });
 

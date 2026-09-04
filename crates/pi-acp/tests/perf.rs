@@ -114,20 +114,22 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
 
 /// Stage-by-stage handshake latency with a known per-RPC delay.
 ///
-/// Mirrors the `session/new` handshake sequence
-/// (spawn → get_state+get_models → thinking levels) so the number of
-/// sequential RPC stages — the critical-path cost — is visible.
+/// Mirrors the `session/new` handshake sequence post-optimization: spawn
+/// (whose `get_state` is cached as `initial_state`, no re-fetch) → models →
+/// thinking levels. The number of sequential RPC stages — the critical-path
+/// cost — is visible here.
 #[tokio::test]
 async fn handshake_stage_latency_with_50ms_rpc_delay() {
     let t0 = Instant::now();
     let fx = spawn_session_with_delay(RPC_DELAY_MS).await;
     let spawn_ms = t0.elapsed().as_millis();
 
+    // Zero-RPC reuse of the spawn-time state (W-479 P0).
+    let _ = fx.session.initial_state();
+
     let t1 = Instant::now();
-    let (state_res, models_res) =
-        tokio::join!(fx.session.get_state(), fx.session.get_available_models());
+    let models_res = fx.session.get_available_models().await;
     let fetch_ms = t1.elapsed().as_millis();
-    assert!(state_res.is_ok());
     assert!(!models_res.unwrap().is_empty());
 
     let t2 = Instant::now();
@@ -139,13 +141,15 @@ async fn handshake_stage_latency_with_50ms_rpc_delay() {
     let cmds = read_command_log(&fx.command_log);
     println!(
         "[perf] handshake stages (50ms/RPC mock): spawn={spawn_ms}ms \
-         get_state+get_models(join)={fetch_ms}ms available_levels={levels_ms}ms \
+         get_models={fetch_ms}ms available_levels={levels_ms}ms \
          total={total_ms}ms pi_commands={cmds:?}"
     );
+    // Exactly 3 pi RPCs on the handshake: spawn get_state + models + levels.
+    assert_eq!(cmds.len(), 3, "handshake must cost 3 pi RPCs, got {cmds:?}");
     // Loose bounds: each stage is dominated by exactly one 50ms delay plus
     // process spawn / IPC overhead; CI runners just need headroom.
     assert!(spawn_ms < 10_000, "spawn took {spawn_ms}ms");
-    assert!(fetch_ms < 5_000, "parallel fetch took {fetch_ms}ms");
+    assert!(fetch_ms < 5_000, "models fetch took {fetch_ms}ms");
     assert!(levels_ms < 5_000, "levels fetch took {levels_ms}ms");
 }
 

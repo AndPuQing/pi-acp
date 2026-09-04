@@ -333,11 +333,19 @@ async fn run_mock_rpc() -> Result<()> {
     // Markers go to stderr, mirroring real pi (which routes everything its
     // extensions print to the child's stderr); pi-acp scrapes them there.
     // `PI_ACP_MOCK_MCP_FAIL=<name>` makes that server report failure
-    // instead (explicit per-server error path).
+    // instead (explicit per-server error path). `PI_ACP_MOCK_MCP_SILENT=1`
+    // emits no markers at all: the registrar/adapter died without reporting,
+    // so the session handshake must time out loudly (W-484), never hang or
+    // resolve with a partial menu.
     if let Ok(payload) = std::env::var("PI_ACP_MCP_SERVERS_JSON") {
         use tokio::io::AsyncWriteExt as _;
+        let silent = std::env::var_os("PI_ACP_MOCK_MCP_SILENT").is_some();
         let fail_name = std::env::var("PI_ACP_MOCK_MCP_FAIL").ok();
-        if let Ok(specs) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if silent {
+            // Registrar died without reporting: stay alive (the RPC loop
+            // below still runs) but emit nothing, so the handshake gate
+            // must time out loudly naming the pending servers.
+        } else if let Ok(specs) = serde_json::from_str::<serde_json::Value>(&payload) {
             if let Some(items) = specs.as_array() {
                 let mut stderr = tokio::io::stderr();
                 for item in items {

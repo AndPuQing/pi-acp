@@ -1,7 +1,7 @@
 name: Release
 
-# Publishes the three-platform `pi-acp` binary matrix as a GitHub Release and,
-# when NPM_TOKEN is configured, as platform-specific npm packages.
+# Publishes the three-platform `pi-acp` binary matrix as a GitHub Release and
+# as platform-specific npm packages via npm Trusted Publishing (OIDC, no token).
 #
 # Trigger:
 #   - pushing a `vX.Y.Z` tag, or
@@ -108,8 +108,9 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
-    env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -156,24 +157,20 @@ jobs:
           prerelease: false
 
       - name: Setup Node for npm publish
-        if: ${{ env.NPM_TOKEN != '' }}
         uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Publish npm packages
-        if: ${{ env.NPM_TOKEN != '' }}
+      - name: Update npm for Trusted Publishing
         shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm install -g npm@latest
+
+      - name: Publish npm packages
+        shell: bash
         run: |
           set -euo pipefail
           for package in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            npm publish "./npm-dist/${package}" --access public
+            npm publish "./npm-dist/${package}" --provenance --access public
           done
-          npm publish ./npm-dist/main --access public
-
-      - name: Skip npm publish without NPM_TOKEN
-        if: ${{ env.NPM_TOKEN == '' }}
-        run: echo "NPM_TOKEN is not configured; skipped npm publication."
+          npm publish ./npm-dist/main --provenance --access public

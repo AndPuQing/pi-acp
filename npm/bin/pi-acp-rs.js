@@ -15,7 +15,7 @@ function resolveBinary() {
   } catch (error) {
     const missingPackage = new Error(
       `The optional dependency ${spec.packageName} is not installed. ` +
-        'Reinstall @earendil-works/pi-acp without --omit=optional.',
+        'Reinstall pi-acp-rs without --omit=optional.',
     );
     missingPackage.cause = error;
     throw missingPackage;
@@ -33,7 +33,7 @@ let binaryPath;
 try {
   binaryPath = resolveBinary();
 } catch (error) {
-  console.error(`pi-acp: ${error.message}`);
+  console.error(`pi-acp-rs: ${error.message}`);
   process.exitCode = 1;
 }
 
@@ -44,13 +44,13 @@ if (binaryPath) {
   });
 
   child.once('error', (error) => {
-    console.error(`pi-acp: failed to start native binary: ${error.message}`);
+    console.error(`pi-acp-rs: failed to start native binary: ${error.message}`);
     process.exitCode = 1;
   });
 
   child.once('exit', (code, signal) => {
     if (signal) {
-      console.error(`pi-acp: native binary exited on signal ${signal}`);
+      console.error(`pi-acp-rs: native binary exited on signal ${signal}`);
       process.exitCode = 1;
     } else {
       process.exitCode = code ?? 1;

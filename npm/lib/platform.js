@@ -2,23 +2,23 @@
 
 const PLATFORM_SPECS = Object.freeze({
   'linux-x64': Object.freeze({
-    packageName: '@earendil-works/pi-acp-linux-x64',
+    packageName: 'pi-acp-rs-linux-x64',
     binaryPath: 'bin/pi-acp',
   }),
   'linux-arm64': Object.freeze({
-    packageName: '@earendil-works/pi-acp-linux-arm64',
+    packageName: 'pi-acp-rs-linux-arm64',
     binaryPath: 'bin/pi-acp',
   }),
   'darwin-x64': Object.freeze({
-    packageName: '@earendil-works/pi-acp-darwin-x64',
+    packageName: 'pi-acp-rs-darwin-x64',
     binaryPath: 'bin/pi-acp',
   }),
   'darwin-arm64': Object.freeze({
-    packageName: '@earendil-works/pi-acp-darwin-arm64',
+    packageName: 'pi-acp-rs-darwin-arm64',
     binaryPath: 'bin/pi-acp',
   }),
   'win32-x64': Object.freeze({
-    packageName: '@earendil-works/pi-acp-win32-x64',
+    packageName: 'pi-acp-rs-win32-x64',
     binaryPath: 'bin/pi-acp.exe',
   }),
 });

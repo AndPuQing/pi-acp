@@ -49,4 +49,4 @@ for (const platform of platforms) {
   await chmod(path.join(binaryDir, platform.binary), 0o755);
 }
 
-console.log(`Prepared npm packages for pi-acp ${mainManifest.version} in ${outputDir}.`);
+console.log(`Prepared npm packages for pi-acp-rs ${mainManifest.version} in ${outputDir}.`);

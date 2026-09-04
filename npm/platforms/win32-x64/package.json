@@ -1,7 +1,7 @@
 {
-  "name": "@earendil-works/pi-acp-win32-x64",
+  "name": "pi-acp-rs-win32-x64",
   "version": "0.1.0",
-  "description": "Windows x64 binary for pi-acp",
+  "description": "Windows x64 binary for pi-acp-rs",
   "license": "MIT",
   "repository": {
     "type": "git",

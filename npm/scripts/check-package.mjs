@@ -9,11 +9,11 @@ const readJson = async (relativePath) =>
 
 const main = await readJson('package.json');
 const platforms = [
-  { id: 'linux-x64', name: '@earendil-works/pi-acp-linux-x64', os: ['linux'], cpu: ['x64'] },
-  { id: 'linux-arm64', name: '@earendil-works/pi-acp-linux-arm64', os: ['linux'], cpu: ['arm64'] },
-  { id: 'darwin-x64', name: '@earendil-works/pi-acp-darwin-x64', os: ['darwin'], cpu: ['x64'] },
-  { id: 'darwin-arm64', name: '@earendil-works/pi-acp-darwin-arm64', os: ['darwin'], cpu: ['arm64'] },
-  { id: 'win32-x64', name: '@earendil-works/pi-acp-win32-x64', os: ['win32'], cpu: ['x64'] },
+  { id: 'linux-x64', name: 'pi-acp-rs-linux-x64', os: ['linux'], cpu: ['x64'] },
+  { id: 'linux-arm64', name: 'pi-acp-rs-linux-arm64', os: ['linux'], cpu: ['arm64'] },
+  { id: 'darwin-x64', name: 'pi-acp-rs-darwin-x64', os: ['darwin'], cpu: ['x64'] },
+  { id: 'darwin-arm64', name: 'pi-acp-rs-darwin-arm64', os: ['darwin'], cpu: ['arm64'] },
+  { id: 'win32-x64', name: 'pi-acp-rs-win32-x64', os: ['win32'], cpu: ['x64'] },
 ];
 const errors = [];
 
@@ -60,5 +60,5 @@ if (errors.length > 0) {
   console.error(errors.join('\n'));
   process.exitCode = 1;
 } else {
-  console.log(`npm package manifests match pi-acp ${main.version}.`);
+  console.log(`npm package manifests match pi-acp-rs ${main.version}.`);
 }

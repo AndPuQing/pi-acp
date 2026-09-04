@@ -1,7 +1,7 @@
 {
-  "name": "@earendil-works/pi-acp-darwin-arm64",
+  "name": "pi-acp-rs-darwin-arm64",
   "version": "0.1.0",
-  "description": "macOS arm64 binary for pi-acp",
+  "description": "macOS arm64 binary for pi-acp-rs",
   "license": "MIT",
   "repository": {
     "type": "git",

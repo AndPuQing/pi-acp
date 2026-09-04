@@ -1,7 +1,7 @@
 {
-  "name": "@earendil-works/pi-acp-linux-x64",
+  "name": "pi-acp-rs-linux-x64",
   "version": "0.1.0",
-  "description": "Linux x64 binary for pi-acp",
+  "description": "Linux x64 binary for pi-acp-rs",
   "license": "MIT",
   "repository": {
     "type": "git",

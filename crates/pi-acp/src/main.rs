@@ -178,6 +178,13 @@ fn terminal_login() -> Result<()> {
 ///   instead of emitting. `agent_settled` is auto-appended unless the file
 ///   already contains one or `--mock-no-settle` is set.
 /// - `--mock-no-settle`      never auto-append `agent_settled` (cancel tests)
+/// - `--mock-no-settle-first` suppress the auto `agent_settled` for the first
+///   prompt only (settle-timeout recovery tests: the stuck turn times out,
+///   the post-timeout `abort` still settles, and the retry settles normally)
+/// - `--mock-abort-error <text>` answer `abort` with `success:false`
+///   (settle-timeout recovery failure tests)
+/// - `--mock-abort-delay-ms <n>` delay the abort response and settle event
+///   (settle-timeout recovery cancellation tests)
 /// - `--mock-event-delay-ms <n>` sleep `n` ms before each scenario event
 /// - `--mock-command-log <path>`  append each received command type
 /// - `--mock-extension-log <path>` append each received `extension_ui_response`
@@ -211,6 +218,9 @@ async fn run_mock_rpc() -> Result<()> {
     let mut unknown_event = false;
     let mut scenario_dir: Option<PathBuf> = None;
     let mut no_settle = false;
+    let mut no_settle_first = false;
+    let mut abort_error: Option<String> = None;
+    let mut abort_delay_ms: u64 = 0;
     let mut event_delay_ms: u64 = 0;
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
@@ -242,6 +252,11 @@ async fn run_mock_rpc() -> Result<()> {
             "--mock-unknown-event" => unknown_event = true,
             "--mock-scenario" => scenario_dir = args.next().map(PathBuf::from),
             "--mock-no-settle" => no_settle = true,
+            "--mock-no-settle-first" => no_settle_first = true,
+            "--mock-abort-error" => abort_error = args.next(),
+            "--mock-abort-delay-ms" => {
+                abort_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
             "--mock-event-delay-ms" => {
                 event_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
             }
@@ -501,6 +516,7 @@ async fn run_mock_rpc() -> Result<()> {
         // (auth / error-surfacing tests).
         let (success, error) = match ty {
             "prompt" => (prompt_error.is_none(), prompt_error.clone()),
+            "abort" => (abort_error.is_none(), abort_error.clone()),
             "get_available_models" => (models_error.is_none(), models_error.clone()),
             _ => (true, None),
         };
@@ -512,6 +528,9 @@ async fn run_mock_rpc() -> Result<()> {
         }
         let delay_prompt_response =
             success && ty == "prompt" && prompt_response_after_events_ms > 0;
+        if success && ty == "abort" && abort_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(abort_delay_ms)).await;
+        }
         if !delay_prompt_response {
             mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
         }
@@ -538,6 +557,9 @@ async fn run_mock_rpc() -> Result<()> {
         // and the real turn-completion signal (`agent_settled`) follow after.
         if success && ty == "prompt" {
             prompt_count += 1;
+            // Suppress the auto settle for the first prompt only when asked
+            // (recovery tests); the post-timeout `abort` below still settles.
+            let suppress_settle = no_settle || (no_settle_first && prompt_count == 1);
             if let Some(dir) = &scenario_dir {
                 let scenario = dir.join(format!("{prompt_count}.jsonl"));
                 if scenario.exists() {
@@ -546,15 +568,15 @@ async fn run_mock_rpc() -> Result<()> {
                         &mut stdout,
                         &content,
                         &mut reader,
-                        no_settle,
+                        suppress_settle,
                         event_delay_ms,
                         extension_log.as_deref(),
                     )
                     .await?;
-                } else if !no_settle {
+                } else if !suppress_settle {
                     emit_default_prompt_response(&mut stdout).await?;
                 }
-            } else if !no_settle {
+            } else if !suppress_settle {
                 emit_default_prompt_response(&mut stdout).await?;
             }
             if delay_prompt_response {

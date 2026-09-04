@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
@@ -60,6 +60,9 @@ const SPAWN_RETRY_ATTEMPTS: usize = 120;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Upper bound on collected prelude lines (defensive; pi's banner is ~10).
 const PRELUDE_CAP: usize = 200;
+/// Upper bound on collected MCP registrar markers (one per requested server;
+/// defensive — a menu with hundreds of servers is already unreasonable).
+const MCP_MARKER_CAP: usize = 128;
 
 /// Shared state between the client handle and the two background tasks
 /// (reader + watcher).
@@ -71,6 +74,12 @@ struct Shared {
     exit: Mutex<Option<(Option<i32>, Option<i32>)>>,
     /// Human-readable stdout lines (ANSI-stripped) seen before/instead of NDJSON.
     prelude: Mutex<Vec<String>>,
+    /// `PI_ACP_MCP:*` marker lines scraped from the child's stderr (W-483).
+    /// pi routes everything its extensions print (including raw
+    /// `process.stdout.write`) to the child's stderr, so the in-pi
+    /// registrar reports there; pi-acp pipes stderr and keeps only marker
+    /// lines (pi diagnostics stay invisible, as when stderr was nulled).
+    mcp_markers: Mutex<Vec<String>>,
 }
 
 /// The request transport shared with session operations. Its stdin lock only
@@ -117,7 +126,7 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, &[], session_path, None, timeout).await
+        Self::spawn_inner(pi_command, &[], session_path, None, &[], timeout).await
     }
 
     /// [`PiProcess::spawn_with_session`] with extra pi CLI flags appended after
@@ -128,7 +137,7 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, extra_args, session_path, None, timeout).await
+        Self::spawn_inner(pi_command, extra_args, session_path, None, &[], timeout).await
     }
 
     /// [`PiProcess::spawn_with_args`] with an explicit working directory for
@@ -141,7 +150,39 @@ impl PiProcess {
         cwd: &Path,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, extra_args, session_path, Some(cwd), timeout).await
+        Self::spawn_inner(
+            pi_command,
+            extra_args,
+            session_path,
+            Some(cwd),
+            &[],
+            timeout,
+        )
+        .await
+    }
+
+    /// [`PiProcess::spawn_with_args_in_dir`] plus per-child environment
+    /// overrides. The child still inherits the current environment; entries
+    /// here only add or shadow single keys for this child (W-483 uses it for
+    /// the session-scoped `PI_ACP_MCP_SERVERS_JSON` payload — never global,
+    /// never on disk).
+    pub async fn spawn_with_args_in_dir_and_env(
+        pi_command: &str,
+        extra_args: &[&str],
+        session_path: Option<&Path>,
+        cwd: &Path,
+        extra_env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            pi_command,
+            extra_args,
+            session_path,
+            Some(cwd),
+            extra_env,
+            timeout,
+        )
+        .await
     }
 
     async fn spawn_inner(
@@ -149,6 +190,7 @@ impl PiProcess {
         extra_args: &[&str],
         session_path: Option<&Path>,
         cwd: Option<&Path>,
+        extra_env: &[(String, String)],
         timeout: Duration,
     ) -> Result<Self> {
         // Resolve the configured command to a launchable program. On Windows
@@ -165,10 +207,15 @@ impl PiProcess {
         cmd.args(extra_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // pi writes diagnostics to stderr; keep it out of the JSONL stream.
-            .stderr(Stdio::null());
+            // pi writes diagnostics to stderr: piped (never the JSONL
+            // stream) and drained by a reader task that keeps only the
+            // `PI_ACP_MCP:*` registrar markers (W-483).
+            .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
+        }
+        for (key, value) in extra_env {
+            cmd.env(key, value);
         }
         // Put real pi in its own process group so teardown can signal the whole
         // tree (wrapper launchers like pi.cmd may spawn grandchildren). The
@@ -221,12 +268,20 @@ impl PiProcess {
             pending: tokio::sync::Mutex::new(HashMap::new()),
             exit: Mutex::new(None),
             prelude: Mutex::new(Vec::new()),
+            mcp_markers: Mutex::new(Vec::new()),
         });
 
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         let reader_shared = shared.clone();
         tokio::spawn(read_loop(stdout, reader_shared, events_tx));
+
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AcpxError::PiSpawn("pi stderr not piped".to_string()))?;
+        let stderr_shared = shared.clone();
+        tokio::spawn(stderr_loop(stderr, stderr_shared));
 
         let pid = child.id();
         let watcher_shared = shared.clone();
@@ -300,6 +355,12 @@ impl PiProcess {
     pub fn consume_prelude_lines(&self) -> Vec<String> {
         let mut lines = self.shared.prelude.lock().unwrap();
         std::mem::take(&mut *lines)
+    }
+
+    /// Non-draining snapshot of the MCP registrar markers scraped from the
+    /// child's stderr (W-483 handshake gate input).
+    pub fn mcp_marker_snapshot(&self) -> Vec<String> {
+        self.shared.mcp_markers.lock().unwrap().clone()
     }
 
     /// Whether the watcher has observed the child exit.
@@ -792,6 +853,38 @@ async fn read_loop(stdout: ChildStdout, shared: Arc<Shared>, events_tx: mpsc::Se
     // Stream ended: signal consumers by dropping the sender. The watcher task
     // independently marks the process dead / rejects pending.
     tracing::debug!("pi stdout stream ended");
+}
+
+/// Background task: drain pi's stderr, keeping only the MCP registrar
+/// markers (W-483). Everything else is pi diagnostics — dropped, exactly as
+/// invisible as when stderr was nulled, but without ever blocking the child
+/// on a full pipe.
+async fn stderr_loop(stderr: ChildStderr, shared: Arc<Shared>) {
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "pi stderr read error");
+                break;
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.starts_with(crate::mcp::MCP_MARKER_PREFIX) {
+            continue;
+        }
+        let mut markers = shared.mcp_markers.lock().unwrap();
+        if markers.len() < MCP_MARKER_CAP {
+            markers.push(trimmed.to_string());
+        }
+    }
+    tracing::debug!("pi stderr stream ended");
 }
 
 /// Background task: reap the child and propagate its exit.

@@ -26,6 +26,7 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod mcp;
 pub mod pi;
 pub mod session;
 pub mod session_store;

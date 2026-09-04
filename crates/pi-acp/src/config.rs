@@ -8,6 +8,9 @@
 //! - `PI_ACP_SETTLE_TIMEOUT_SECS` — deadline for a turn's `agent_settled`
 //!   after pi accepts the prompt (default `600`; `0` disables — design §11
 //!   risk #84 mitigation).
+//! - `PI_ACP_ENABLE_MCP` — advertise ACP MCP transports and wire
+//!   `session/new|load` `mcp_servers` through pi-mcp-adapter's
+//!   `runtime-register` event (default: **off**; W-483).
 
 /// Default per-request pi RPC deadline in seconds (design D2).
 pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
@@ -28,6 +31,10 @@ pub struct Config {
     pub enable_embedded_context: bool,
     /// Whether to run the startup version/update check (default off).
     pub enable_version_check: bool,
+    /// Whether MCP wiring is switched on: `initialize` advertises the
+    /// transports (only together with an installed pi-mcp-adapter) and
+    /// `session/new|load` consume `mcp_servers` (W-483). Default off.
+    pub enable_mcp: bool,
     /// Per-request pi RPC deadline in seconds.
     pub rpc_timeout_secs: u64,
     /// Deadline for a turn's `agent_settled` after pi accepts the prompt
@@ -41,6 +48,7 @@ impl Default for Config {
             pi_command: "pi".to_string(),
             enable_embedded_context: false,
             enable_version_check: false,
+            enable_mcp: false,
             rpc_timeout_secs: DEFAULT_RPC_TIMEOUT_SECS,
             settle_timeout_secs: DEFAULT_SETTLE_TIMEOUT_SECS,
         }
@@ -78,6 +86,8 @@ impl Config {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_SETTLE_TIMEOUT_SECS);
 
+        cfg.enable_mcp = crate::mcp::mcp_enabled();
+
         cfg
     }
 }
@@ -93,6 +103,8 @@ mod tests {
         assert!(!cfg.enable_embedded_context);
         // Decision 2: version check is off by default.
         assert!(!cfg.enable_version_check);
+        // W-483: MCP wiring is off by default.
+        assert!(!cfg.enable_mcp);
         assert_eq!(cfg.rpc_timeout_secs, DEFAULT_RPC_TIMEOUT_SECS);
         // Settle fallback is on by default with a generous bound (0 = off).
         assert_eq!(cfg.settle_timeout_secs, DEFAULT_SETTLE_TIMEOUT_SECS);

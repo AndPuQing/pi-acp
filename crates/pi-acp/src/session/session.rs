@@ -169,6 +169,10 @@ pub struct SessionParams {
     /// File-based slash commands to expand in `prompt` (pi RPC mode disables
     /// its own slash expansion, so pi-acp does it — TS `session.ts`).
     pub file_commands: Vec<crate::commands::FileSlashCommand>,
+    /// Per-child environment overrides for the pi subprocess (inherits the
+    /// rest). W-483 passes the session-scoped `PI_ACP_MCP_SERVERS_JSON`
+    /// payload here; empty everywhere else.
+    pub extra_env: Vec<(String, String)>,
 }
 
 /// A handle to a running session. The heavy lifting lives in the pump task;
@@ -233,6 +237,11 @@ enum SessionCommand {
     /// Publish the empty initial context usage once the ACP session is known
     /// to the client (`session/new` response has been sent).
     PublishInitialUsage { respond: oneshot::Sender<()> },
+    /// Snapshot the MCP registrar markers scraped from pi's stderr (W-483
+    /// handshake gate input).
+    McpMarkerSnapshot {
+        respond: oneshot::Sender<Vec<String>>,
+    },
     /// Graceful teardown: dispose the pi process, then signal completion.
     Shutdown { done: oneshot::Sender<()> },
 }
@@ -386,11 +395,12 @@ impl PiAcpSession {
     pub async fn spawn(params: SessionParams) -> Result<Arc<Self>> {
         let extra: Vec<&str> = params.extra_args.iter().map(String::as_str).collect();
         let session_path = params.session_path.as_deref();
-        let mut proc = PiProcess::spawn_with_args_in_dir(
+        let mut proc = PiProcess::spawn_with_args_in_dir_and_env(
             &params.pi_command,
             &extra,
             session_path,
             &params.cwd,
+            &params.extra_env,
             params.timeout,
         )
         .await?;
@@ -658,6 +668,18 @@ impl PiAcpSession {
         Ok(())
     }
 
+    /// Snapshot the MCP registrar markers scraped from pi's stderr (W-483
+    /// handshake gate input; a dead pump surfaces as the session's death
+    /// error).
+    pub async fn mcp_marker_snapshot(&self) -> Result<Vec<String>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::McpMarkerSnapshot { respond: tx })
+            .await
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())
+    }
+
     /// `set_thinking_level`. Records the set timestamp *before* sending the
     /// RPC so a fast `thinking_level_changed` echo can never overtake the
     /// stamp (the pump processes events concurrently); a failed set clears
@@ -796,6 +818,10 @@ async fn pump_loop(mut pump: Pump) {
                     Some(SessionCommand::PublishInitialUsage { respond }) => {
                         pump.emit_initial_usage_update().await;
                         let _ = respond.send(());
+                    }
+                    Some(SessionCommand::McpMarkerSnapshot { respond }) => {
+                        let lines = pump.proc.lock().await.mcp_marker_snapshot();
+                        let _ = respond.send(lines);
                     }
                     Some(SessionCommand::Shutdown { done }) => {
                         shutdown_done = Some(done);

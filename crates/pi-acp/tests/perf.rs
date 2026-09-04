@@ -100,6 +100,7 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
+        extra_env: vec![],
     })
     .await
     .expect("session spawn");

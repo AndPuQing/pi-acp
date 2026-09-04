@@ -32,6 +32,17 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # W-484 real-chain acceptance provisions its harness env itself, but
+      # needs Node on PATH plus a real `pi` binary (template install runs
+      # `pi install npm:pi-mcp-adapter@<pin>`). Without these the new tests
+      # skip loudly instead of proving anything — CI must provide them.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install pi for MCP real-chain acceptance
+        run: npm install -g @earendil-works/pi-coding-agent@0.85.0
+
       - name: test
         # Integration fixtures spawn nested pi-acp processes; serialize test
         # binaries and cases so runner process limits cannot cause EAGAIN or

@@ -36,25 +36,29 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Diff, PermissionOption, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionInfoUpdate, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, CurrentModeUpdate, Diff,
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{AcpxError, Result};
-use crate::pi::process::PiProcess;
+use crate::pi::process::{PiProcess, RpcClient};
 use crate::pi::rpc::{
-    AssistantMessageEvent, CompactionReason, ExtensionUiRequest, ExtensionUiResponse, ImageContent,
-    RpcCommand, RpcEvent,
+    supported_thinking_levels, AssistantMessageEvent, CompactionReason, ExtensionUiRequest,
+    ExtensionUiResponse, ImageContent, Model, RpcCommand, RpcEvent, RpcSessionState, ThinkingLevel,
+    Usage,
 };
+use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
     bash_command, bash_exit_code, bash_output_delta, bash_result_text, bash_terminal_content,
     bash_terminal_exit_meta, bash_terminal_info_meta, bash_terminal_output_meta, is_bash_tool,
@@ -74,6 +78,35 @@ pub enum StopReason {
     Cancelled,
 }
 
+/// The pi subprocess's exit `(code, signal)` once it has exited (`None` while
+/// alive); shared between the session handle and the pump task so a dead pi is
+/// reported loudly on every later command (S8 / #82).
+type PiExitStatus = Option<(Option<i32>, Option<i32>)>;
+
+/// How long after our own thinking/model set a `thinking_level_changed` event
+/// counts as that set's echo (W-479 P1). The echoing event follows the set
+/// response by milliseconds; 2s is generous headroom for loaded runners while
+/// keeping genuinely pi-initiated later changes on the full-refresh path.
+const THINKING_SET_ECHO_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether a `thinking_level_changed` event observed at `now` is the echo of
+/// our own set at `last_set` (pure predicate for the pump's echo suppression).
+fn thinking_event_is_echo(last_set: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_set.is_some_and(|t| now.saturating_duration_since(t) <= THINKING_SET_ECHO_WINDOW)
+}
+
+/// Clear a thinking-set stamp recorded before a failed set — but only when it
+/// is still ours, so a concurrent newer set's stamp is never wiped.
+fn clear_thinking_stamp(
+    slot: &Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    stamp: std::time::Instant,
+) {
+    let mut guard = slot.lock().unwrap();
+    if guard.as_ref() == Some(&stamp) {
+        *guard = None;
+    }
+}
+
 /// Outbound ACP messages produced by the session pump.
 ///
 /// Everything the session sends to the ACP client travels this single ordered
@@ -91,6 +124,11 @@ pub enum OutboundMessage {
         RequestPermissionRequest,
         oneshot::Sender<std::result::Result<RequestPermissionResponse, AcpxError>>,
     ),
+    /// Ordering barrier (S8 / D4): acknowledged once everything sent before it
+    /// has been forwarded to the connection. The pump awaits this before
+    /// resolving a turn so streamed notifications are never overtaken by the
+    /// `session/prompt` response (TS `flushEmits` parity).
+    Flush(oneshot::Sender<()>),
 }
 
 /// Parameters for spawning a session (S6 agent wiring / tests).
@@ -102,10 +140,25 @@ pub struct SessionParams {
     pub extra_args: Vec<String>,
     /// Per-request pi RPC deadline.
     pub timeout: Duration,
+    /// Deadline for a turn's `agent_settled` after pi accepts the prompt
+    /// (design §11 risk #84 mitigation). When it elapses the pending turn is
+    /// resolved with [`AcpxError::SettleTimeout`] instead of hanging
+    /// `session/prompt` forever. `Duration::ZERO` disables the fallback.
+    pub settle_timeout: Duration,
     /// Working directory of the session (resolves relative tool paths).
     pub cwd: PathBuf,
     /// Outbound ACP message sink (see [`OutboundMessage`]).
     pub outbound: mpsc::Sender<OutboundMessage>,
+    /// Optional pi session file to resume (`--session <path>`; used by
+    /// `session/load`).
+    pub session_path: Option<PathBuf>,
+    /// Optional ACP session id override (used by `session/load`). It must match
+    /// the id reported by pi for `session_path`; it is only an ACP registration
+    /// value, never a replacement for pi's native/provider session id.
+    pub session_id_override: Option<SessionId>,
+    /// File-based slash commands to expand in `prompt` (pi RPC mode disables
+    /// its own slash expansion, so pi-acp does it — TS `session.ts`).
+    pub file_commands: Vec<crate::commands::FileSlashCommand>,
 }
 
 /// A handle to a running session. The heavy lifting lives in the pump task;
@@ -116,6 +169,30 @@ pub struct PiAcpSession {
     session_id: SessionId,
     cwd: PathBuf,
     cmd_tx: mpsc::Sender<SessionCommand>,
+    /// Whether a real (non-slash) prompt has already been sent; the first one
+    /// derives the thread's provisional title (fixes #102/#24).
+    first_prompt: AtomicBool,
+    /// File-based slash commands for this session's cwd (expanded in
+    /// [`PiAcpSession::prompt`]; pi RPC mode disables its own expansion).
+    file_commands: Vec<crate::commands::FileSlashCommand>,
+    /// The pi subprocess's exit `(code, signal)` when it died **unexpectedly**
+    /// (stream end, not graceful dispose). Commands issued after death fail
+    /// with [`AcpxError::PiExited`] (code/signal + hint) instead of a generic
+    /// "session closed" (S8 / fixes #82 — a dead pi is always loud).
+    death: Arc<std::sync::Mutex<PiExitStatus>>,
+    /// The `get_state` snapshot taken during [`PiAcpSession::spawn`]. No pi
+    /// mutation happens between spawn and the `session/new` handshake, so the
+    /// agent reuses this instead of re-fetching state (W-479: saves one pi
+    /// round-trip on the session/new critical path). Later reads use the
+    /// live [`PiAcpSession::get_state`] RPC.
+    initial_state: RpcSessionState,
+    /// When our own `set_thinking_level` / `set_model` last succeeded.
+    /// A `thinking_level_changed` event arriving inside
+    /// [`THINKING_SET_ECHO_WINDOW`] is that set's echo: the agent's explicit
+    /// config refresh (which runs right after the set) already re-read the
+    /// same post-set state, so the pump skips its own re-read and emits only
+    /// the authoritative mode update (W-479 P1).
+    thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Commands the pump task accepts from the outside world.
@@ -130,6 +207,22 @@ enum SessionCommand {
     Cancel {
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Run an arbitrary pi RPC command on the session's process and return the
+    /// response `data` (thin delegation for the agent's method handlers —
+    /// `set_model`, `compact`, `get_commands`, ...).
+    Rpc {
+        command: RpcCommand,
+        respond: oneshot::Sender<Result<Value>>,
+    },
+    /// Refresh the cached context window after a successful `set_model` (feeds
+    /// ACP `usage_update.size`).
+    SetContextWindow {
+        window: Option<u64>,
+        respond: oneshot::Sender<()>,
+    },
+    /// Publish the empty initial context usage once the ACP session is known
+    /// to the client (`session/new` response has been sent).
+    PublishInitialUsage { respond: oneshot::Sender<()> },
     /// Graceful teardown: dispose the pi process, then signal completion.
     Shutdown { done: oneshot::Sender<()> },
 }
@@ -144,6 +237,28 @@ struct QueuedTurn {
 /// The currently running turn.
 struct PendingTurn {
     resolve: oneshot::Sender<Result<StopReason>>,
+    /// Monotonic identity for the prompt RPC that owns this turn. Pi events do
+    /// not carry a turn id, but prompt responses do arrive through a separate
+    /// channel, so this prevents a late response from an earlier turn from
+    /// mutating the current turn's deadline or result.
+    turn_id: u64,
+    /// Whether pi has acknowledged the prompt RPC. Normally this precedes all
+    /// events, but separate response/event channels can be observed in either
+    /// order by the pump.
+    prompt_accepted: bool,
+    /// An `agent_settled` observed before the prompt response. Keep it until
+    /// the matching response confirms that it belongs to this turn.
+    settled_before_accept: bool,
+    /// Completes once the prompt JSON line is written. Cancellation waits for
+    /// this before sending abort so abort cannot overtake a prompt that has not
+    /// reached pi yet.
+    prompt_started: Option<oneshot::Receiver<()>>,
+}
+
+/// Result of the early prompt RPC, tagged with the turn that sent it.
+struct PromptResult {
+    turn_id: u64,
+    result: std::result::Result<(), AcpxError>,
 }
 
 /// Monotonic tool-call status tracked by the session. pi may surface a tool
@@ -170,6 +285,9 @@ struct FileSnapshot {
 /// Per-session state machine state, owned by the pump task.
 struct Pump {
     proc: Arc<Mutex<PiProcess>>,
+    /// Shared request transport. Request waits do not hold `proc`, allowing
+    /// cancellation to send `abort` while the prompt response is pending.
+    rpc: Arc<RpcClient>,
     outbound: mpsc::Sender<OutboundMessage>,
     session_id: SessionId,
     cwd: PathBuf,
@@ -184,17 +302,38 @@ struct Pump {
     extension_tx: mpsc::Sender<ExtensionUiResponse>,
     /// Receives the result of the in-flight `prompt` RPC (the *early*
     /// acceptance response — the turn itself completes at `agent_settled`).
-    prompt_rx: mpsc::Receiver<std::result::Result<(), AcpxError>>,
+    prompt_rx: mpsc::Receiver<PromptResult>,
     /// Held open so `prompt_rx.recv()` parks when no prompt is in flight.
-    _prompt_tx: mpsc::Sender<std::result::Result<(), AcpxError>>,
+    _prompt_tx: mpsc::Sender<PromptResult>,
+    /// Shared death record; set at teardown when pi exited unexpectedly so the
+    /// [`PiAcpSession`] handle fails later commands with [`AcpxError::PiExited`].
+    death: Arc<std::sync::Mutex<PiExitStatus>>,
+    /// Shared with the [`PiAcpSession`] handle: when our own thinking/model
+    /// set last succeeded (see the handle's field docs; W-479 P1).
+    thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// True when the pump loop exited because pi's stdout ended (process died).
+    pi_died: bool,
 
     /// Client-side one-at-a-time turn queue.
     queue: VecDeque<QueuedTurn>,
     pending_turn: Option<PendingTurn>,
+    next_turn_id: u64,
     /// Maps abort semantics to the ACP stop reason for the running turn.
     cancel_requested: bool,
+    /// A turn failure leaves pi's event stream ambiguous (late settle events
+    /// have no turn id), so the session rejects later prompts until it is
+    /// disposed and recreated.
+    poisoned: bool,
     /// True while pi's agent loop is running (`agent_start` .. `agent_end`).
     in_agent_loop: bool,
+    /// Deadline by which the in-flight turn's `agent_settled` must arrive
+    /// (design §11 risk #84 mitigation: a pi that accepts a prompt but never
+    /// settles must not hang `session/prompt` forever). Armed when the prompt
+    /// is accepted; cleared at resolution. `None` = no deadline (disabled or
+    /// no turn in flight).
+    settle_deadline: Option<tokio::time::Instant>,
+    /// The settle deadline duration (from [`SessionParams::settle_timeout`]).
+    settle_timeout: Duration,
 
     /// Monotonic tool statuses (`tool_call_id` -> status).
     current_tool_calls: HashMap<String, TrackedStatus>,
@@ -203,29 +342,73 @@ struct Pump {
     file_snapshots: HashMap<String, FileSnapshot>,
     bash_tool_call_ids: HashSet<String>,
     bash_output_snapshots: HashMap<String, String>,
+    /// The active model's context window (tokens), from `get_state` at spawn
+    /// and refreshed on `set_model`. Feeds ACP `usage_update.size` (S6).
+    context_window: Option<u64>,
 }
 
 impl PiAcpSession {
     /// Spawn `pi --mode rpc`, learn its session id, and start the pump task.
     pub async fn spawn(params: SessionParams) -> Result<Arc<Self>> {
         let extra: Vec<&str> = params.extra_args.iter().map(String::as_str).collect();
-        let mut proc =
-            PiProcess::spawn_with_args(&params.pi_command, &extra, None, params.timeout).await?;
-        let state = proc.get_state().await?;
-        let session_id: SessionId = state.session_id.into();
+        let session_path = params.session_path.as_deref();
+        let mut proc = PiProcess::spawn_with_args_in_dir(
+            &params.pi_command,
+            &extra,
+            session_path,
+            &params.cwd,
+            params.timeout,
+        )
+        .await?;
+        let state = match proc.get_state().await {
+            Ok(state) => state,
+            Err(err) => {
+                // The process is owned locally until the pump is installed;
+                // dispose it here so a failed startup cannot orphan the pi
+                // child while the caller handles the handshake error.
+                proc.dispose().await;
+                return Err(err);
+            }
+        };
+        let session_id = match params.session_id_override {
+            Some(expected) => {
+                if expected.0.as_ref() != state.session_id.as_str() {
+                    let expected_id = expected.0.to_string();
+                    let actual_id = state.session_id.clone();
+                    // Do not leave a pi child running after rejecting a stale
+                    // map entry or a missing session file.
+                    proc.dispose().await;
+                    return Err(AcpxError::SessionIdMismatch {
+                        expected: expected_id,
+                        actual: actual_id,
+                    });
+                }
+                expected
+            }
+            None => state.session_id.clone().into(),
+        };
         tracing::info!(session_id = %session_id.0, "pi session ready");
-        let event_rx = proc
-            .take_event_receiver()
-            .ok_or_else(|| AcpxError::RpcFailed {
-                command: "session".into(),
-                message: "pi event channel already taken".into(),
-            })?;
+        let rpc = proc.request_client();
+        let event_rx = match proc.take_event_receiver() {
+            Some(event_rx) => event_rx,
+            None => {
+                proc.dispose().await;
+                return Err(AcpxError::RpcFailed {
+                    command: "session".into(),
+                    message: "pi event channel already taken".into(),
+                });
+            }
+        };
 
+        // Shared set-timestamp for thinking-echo suppression (W-479 P1).
+        let thinking_set_at = Arc::new(std::sync::Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (prompt_tx, prompt_rx) = mpsc::channel(4);
         let (extension_tx, extension_rx) = mpsc::channel(8);
+        let death = Arc::new(std::sync::Mutex::new(None));
         let pump = Pump {
             proc: Arc::new(Mutex::new(proc)),
+            rpc,
             outbound: params.outbound.clone(),
             session_id: session_id.clone(),
             cwd: params.cwd.clone(),
@@ -235,15 +418,23 @@ impl PiAcpSession {
             extension_tx,
             prompt_rx,
             _prompt_tx: prompt_tx,
+            death: death.clone(),
+            thinking_set_at: thinking_set_at.clone(),
+            pi_died: false,
             queue: VecDeque::new(),
             pending_turn: None,
+            next_turn_id: 0,
             cancel_requested: false,
+            poisoned: false,
             in_agent_loop: false,
+            settle_deadline: None,
+            settle_timeout: params.settle_timeout,
             current_tool_calls: HashMap::new(),
             file_mutation_tool_call_ids: HashSet::new(),
             file_snapshots: HashMap::new(),
             bash_tool_call_ids: HashSet::new(),
             bash_output_snapshots: HashMap::new(),
+            context_window: state.model.as_ref().and_then(|m| m.context_window),
         };
         tokio::spawn(pump_loop(pump));
 
@@ -251,6 +442,11 @@ impl PiAcpSession {
             session_id,
             cwd: params.cwd,
             cmd_tx,
+            first_prompt: AtomicBool::new(false),
+            file_commands: params.file_commands,
+            death,
+            initial_state: state,
+            thinking_set_at,
         }))
     }
 
@@ -258,29 +454,57 @@ impl PiAcpSession {
         &self.session_id
     }
 
+    /// The spawn-time `get_state` snapshot (see the field docs). The
+    /// `session/new` handshake consumes this instead of a second `get_state`
+    /// round-trip (W-479).
+    pub fn initial_state(&self) -> &RpcSessionState {
+        &self.initial_state
+    }
+
+    /// The error to surface when the session's pump is gone: [`AcpxError::PiExited`]
+    /// when pi died unexpectedly (carrying code/signal so the client gets the
+    /// "pi is dead" diagnosis + hint), else [`AcpxError::SessionClosed`].
+    fn death_error(&self) -> AcpxError {
+        if let Some((code, signal)) = *self.death.lock().unwrap() {
+            AcpxError::PiExited { code, signal }
+        } else {
+            AcpxError::SessionClosed(self.session_id.0.to_string())
+        }
+    }
+
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Atomically claim the first-prompt slot. Returns `true` on the first
+    /// call and `false` forever after; drives the provisional-title emission
+    /// in the agent's `session/prompt` handler (fixes #102/#24).
+    pub fn mark_first_prompt(&self) -> bool {
+        !self.first_prompt.swap(true, Ordering::SeqCst)
     }
 
     /// Start a turn (or queue it behind the running one) and await its
     /// completion — which happens at pi's `agent_settled`, **not** at the
     /// early `prompt` response (S2 constraint 2).
     ///
+    /// File-based slash commands are expanded first (pi RPC mode disables its
+    /// own expansion; TS `session.prompt` does the same).
+    ///
     /// Returns [`StopReason::EndTurn`] for a normal settle, [`StopReason::Cancelled`]
     /// when `cancel()` was requested, or `Err` when the turn failed (pi error /
     /// process death) — surfaced explicitly per design D5.
     pub async fn prompt(&self, message: String, images: Vec<ImageContent>) -> Result<StopReason> {
+        let expanded = crate::commands::expand_slash_command(&message, &self.file_commands);
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::Prompt {
-                message,
+                message: expanded,
                 images,
                 respond: tx,
             })
             .await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
-        rx.await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?
     }
 
     /// Cancel the running turn and clear all queued turns (each resolves
@@ -291,9 +515,8 @@ impl PiAcpSession {
         self.cmd_tx
             .send(SessionCommand::Cancel { respond: tx })
             .await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?;
-        rx.await
-            .map_err(|_| AcpxError::SessionClosed(self.session_id.0.to_string()))?
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?
     }
 
     /// Gracefully tear the session down: dispose the pi process (SIGTERM →
@@ -306,6 +529,200 @@ impl PiAcpSession {
             .send(SessionCommand::Shutdown { done: tx })
             .await;
         let _ = rx.await;
+    }
+
+    // --- thin pi RPC delegation (agent method handlers, S6) ---
+    //
+    // The pump owns the `PiProcess`; these send a [`SessionCommand::Rpc`] and
+    // await the response. Keeps the ACP handlers thin while the process stays
+    // inside the session.
+
+    async fn rpc(&self, command: RpcCommand) -> Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::Rpc {
+                command,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?
+    }
+
+    /// `get_state`.
+    pub async fn get_state(&self) -> Result<crate::pi::rpc::RpcSessionState> {
+        let data = self.rpc(RpcCommand::GetState).await?;
+        serde_json::from_value(data).map_err(Into::into)
+    }
+
+    /// `get_available_models`.
+    pub async fn get_available_models(&self) -> Result<Vec<crate::pi::rpc::Model>> {
+        let data = self.rpc(RpcCommand::GetAvailableModels).await?;
+        let models = data
+            .get("models")
+            .cloned()
+            .ok_or_else(|| AcpxError::RpcFailed {
+                command: "get_available_models".into(),
+                message: "response missing data.models".into(),
+            })?;
+        serde_json::from_value(models).map_err(Into::into)
+    }
+
+    /// `set_model`; refreshes the cached context window for `usage_update`.
+    /// A model switch can clamp thinking and emit `thinking_level_changed`,
+    /// so it shares `set_thinking_level`'s echo bookkeeping (W-479 P1).
+    pub async fn set_model(&self, provider: &str, model_id: &str) -> Result<()> {
+        let stamp = std::time::Instant::now();
+        *self.thinking_set_at.lock().unwrap() = Some(stamp);
+        let result = self.set_model_inner(provider, model_id).await;
+        if result.is_err() {
+            clear_thinking_stamp(&self.thinking_set_at, stamp);
+        }
+        result
+    }
+
+    async fn set_model_inner(&self, provider: &str, model_id: &str) -> Result<()> {
+        let data = self
+            .rpc(RpcCommand::SetModel {
+                provider: provider.to_string(),
+                model_id: model_id.to_string(),
+            })
+            .await?;
+        let window = serde_json::from_value::<crate::pi::rpc::Model>(data)
+            .ok()
+            .and_then(|m| m.context_window);
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::SetContextWindow {
+                window,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| self.death_error())?;
+        let _ = rx.await;
+        Ok(())
+    }
+
+    /// Publish an empty ACP context usage update for a newly-created session.
+    ///
+    /// pi only reports usage after a model turn. Zed needs the model's context
+    /// window before that first turn to render its context indicator.
+    pub async fn publish_initial_usage(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::PublishInitialUsage { respond: tx })
+            .await
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())?;
+        Ok(())
+    }
+
+    /// `set_thinking_level`. Records the set timestamp *before* sending the
+    /// RPC so a fast `thinking_level_changed` echo can never overtake the
+    /// stamp (the pump processes events concurrently); a failed set clears
+    /// its own stamp again so it can never suppress a later genuine refresh
+    /// (W-479 P1 echo suppression).
+    pub async fn set_thinking_level(&self, level: crate::pi::rpc::ThinkingLevel) -> Result<()> {
+        let stamp = std::time::Instant::now();
+        *self.thinking_set_at.lock().unwrap() = Some(stamp);
+        let result = self.rpc(RpcCommand::SetThinkingLevel { level }).await;
+        if result.is_err() {
+            clear_thinking_stamp(&self.thinking_set_at, stamp);
+        }
+        result?;
+        Ok(())
+    }
+
+    /// Native per-model thinking levels for the ACP selector (W-478).
+    ///
+    /// Queries pi's `get_available_thinking_levels` (the same source pi's
+    /// own TUI uses), so Zed offers exactly the levels the active model
+    /// supports. Falls back to the local `supported_thinking_levels`
+    /// computation from the current model (pi-ai `getSupportedThinkingLevels`
+    /// parity, for older pi builds without the RPC), then to the full ladder.
+    pub async fn available_thinking_levels(&self) -> Vec<crate::pi::rpc::ThinkingLevel> {
+        if let Ok(data) = self.rpc(RpcCommand::GetAvailableThinkingLevels).await {
+            if let Some(levels) = data.get("levels").and_then(Value::as_array) {
+                let parsed: Vec<crate::pi::rpc::ThinkingLevel> = levels
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(crate::pi::rpc::ThinkingLevel::parse)
+                    .collect();
+                if !parsed.is_empty() {
+                    return parsed;
+                }
+            }
+        }
+        match self.get_state().await {
+            Ok(state) => supported_thinking_levels(state.model.as_ref()),
+            Err(_) => crate::pi::rpc::ThinkingLevel::all().to_vec(),
+        }
+    }
+
+    /// `set_steering_mode`.
+    pub async fn set_steering_mode(&self, mode: crate::pi::rpc::QueueMode) -> Result<()> {
+        self.rpc(RpcCommand::SetSteeringMode { mode }).await?;
+        Ok(())
+    }
+
+    /// `set_follow_up_mode`.
+    pub async fn set_follow_up_mode(&self, mode: crate::pi::rpc::QueueMode) -> Result<()> {
+        self.rpc(RpcCommand::SetFollowUpMode { mode }).await?;
+        Ok(())
+    }
+
+    /// `compact`.
+    pub async fn compact(&self, custom_instructions: Option<&str>) -> Result<Value> {
+        self.rpc(RpcCommand::Compact {
+            custom_instructions: custom_instructions.map(str::to_string),
+        })
+        .await
+    }
+
+    /// `get_session_stats`.
+    pub async fn get_session_stats(&self) -> Result<Value> {
+        self.rpc(RpcCommand::GetSessionStats).await
+    }
+
+    /// `set_session_name`.
+    pub async fn set_session_name(&self, name: &str) -> Result<()> {
+        self.rpc(RpcCommand::SetSessionName {
+            name: name.to_string(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// `set_auto_compaction`.
+    pub async fn set_auto_compaction(&self, enabled: bool) -> Result<()> {
+        self.rpc(RpcCommand::SetAutoCompaction { enabled }).await?;
+        Ok(())
+    }
+
+    /// `export_html` → the written file path.
+    pub async fn export_html(&self, output_path: &str) -> Result<String> {
+        let data = self
+            .rpc(RpcCommand::ExportHtml {
+                output_path: Some(output_path.to_string()),
+            })
+            .await?;
+        data.get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| AcpxError::RpcFailed {
+                command: "export_html".into(),
+                message: "response missing data.path".into(),
+            })
+    }
+
+    /// `get_messages` (session/load history replay).
+    pub async fn get_messages(&self) -> Result<Value> {
+        self.rpc(RpcCommand::GetMessages).await
+    }
+
+    /// `get_commands` (slash / skill / extension command list).
+    pub async fn get_commands(&self) -> Result<Value> {
+        self.rpc(RpcCommand::GetCommands).await
     }
 }
 
@@ -325,6 +742,19 @@ async fn pump_loop(mut pump: Pump) {
                     }
                     Some(SessionCommand::Cancel { respond }) => {
                         pump.on_cancel(respond).await;
+                    }
+                    Some(SessionCommand::Rpc { command, respond }) => {
+                        pump.on_rpc(command, respond).await;
+                    }
+                    Some(SessionCommand::SetContextWindow { window, respond }) => {
+                        if let Some(window) = window {
+                            pump.context_window = Some(window);
+                        }
+                        let _ = respond.send(());
+                    }
+                    Some(SessionCommand::PublishInitialUsage { respond }) => {
+                        pump.emit_initial_usage_update().await;
+                        let _ = respond.send(());
                     }
                     Some(SessionCommand::Shutdown { done }) => {
                         shutdown_done = Some(done);
@@ -346,12 +776,29 @@ async fn pump_loop(mut pump: Pump) {
                     // pi's stdout ended (process exit) — fail the in-flight turn.
                     None => {
                         pump.on_stream_end().await;
+                        pump.pi_died = true;
                         break;
                     }
                 }
             }
             prompt_result = pump.prompt_rx.recv() => {
                 pump.on_prompt_result(prompt_result).await;
+            }
+            // Settle deadline (design §11 risk #84): pi accepted the prompt
+            // but never emitted `agent_settled` — resolve the turn with an
+            // explicit error instead of hanging `session/prompt` forever. The
+            // deadline is copied out of the pump so the async block only
+            // borrows the copy, not the pump (the other arms mutate it).
+            _settle_deadline = {
+                let deadline = pump.settle_deadline;
+                async move {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                }
+            } => {
+                pump.on_settle_timeout().await;
             }
         }
     }
@@ -369,6 +816,19 @@ async fn pump_loop(mut pump: Pump) {
             signal: None,
         }));
     }
+    // pi died unexpectedly: record the (settled) exit status so later commands
+    // on this session fail with `PiExited` (code/signal + hint) instead of a
+    // generic "session closed" (S8 / fixes #82). Graceful shutdowns skip this.
+    if pump.pi_died {
+        let status = {
+            let mut proc = pump.proc.lock().await;
+            proc.wait_exited(std::time::Duration::from_millis(200))
+                .await
+        };
+        if let Some(status) = status {
+            *pump.death.lock().unwrap() = Some(status);
+        }
+    }
     pump.proc.lock().await.dispose().await;
     if let Some(done) = shutdown_done {
         let _ = done.send(());
@@ -378,12 +838,26 @@ async fn pump_loop(mut pump: Pump) {
 impl Pump {
     // --- commands ---
 
+    fn session_closed_error(&self) -> AcpxError {
+        AcpxError::SessionClosed(self.session_id.0.to_string())
+    }
+
+    fn fail_queued_turns(&mut self) {
+        while let Some(turn) = self.queue.pop_front() {
+            let _ = turn.resolve.send(Err(self.session_closed_error()));
+        }
+    }
+
     async fn on_prompt(
         &mut self,
         message: String,
         images: Vec<ImageContent>,
         respond: oneshot::Sender<Result<StopReason>>,
     ) {
+        if self.poisoned {
+            let _ = respond.send(Err(self.session_closed_error()));
+            return;
+        }
         let queued = QueuedTurn {
             message,
             images,
@@ -401,6 +875,15 @@ impl Pump {
     }
 
     async fn on_cancel(&mut self, respond: oneshot::Sender<Result<()>>) {
+        if self.poisoned {
+            let _ = respond.send(Err(self.session_closed_error()));
+            return;
+        }
+        if self.pending_turn.is_none() {
+            self.cancel_requested = false;
+            let _ = respond.send(Ok(()));
+            return;
+        }
         self.cancel_requested = true;
 
         // Clear the queue; each queued turn resolves as cancelled.
@@ -413,24 +896,49 @@ impl Pump {
             self.emit_queue_depth(self.pending_turn.is_some()).await;
         }
 
-        // Abort the in-flight turn (no-op when none is running). Runs in a
-        // spawned task so the pump keeps consuming events — pi settles after
-        // an abort, and that settle resolves the pending turn as cancelled.
-        let proc = self.proc.clone();
-        tokio::spawn(async move {
-            let result = {
-                let mut p = proc.lock().await;
-                p.abort().await
-            };
-            let _ = respond.send(result);
-        });
+        // The prompt is sent from a spawned task so the pump can service
+        // cancellation while its response is pending. Preserve the wire
+        // ordering by waiting only for the write/flush milestone, never for
+        // the prompt response itself.
+        let prompt_started = self
+            .pending_turn
+            .as_mut()
+            .and_then(|pending| pending.prompt_started.take());
+        if let Some(prompt_started) = prompt_started {
+            let _ = prompt_started.await;
+        }
+
+        // Complete the abort before the pump handles another command/event.
+        // This keeps a delayed abort from acquiring the process mutex after a
+        // queued turn has already started. The resulting agent_settled event
+        // is buffered by the event channel while the RPC is in flight.
+        let result = self.rpc.request(&RpcCommand::Abort).await.map(|_| ());
+        if result.is_err() {
+            // Without a confirmed abort, pi may still settle asynchronously;
+            // retire the session so that event cannot resolve a later turn.
+            self.poisoned = true;
+            self.cancel_requested = false;
+            if let Some(pending) = self.pending_turn.take() {
+                let _ = pending.resolve.send(Err(self.session_closed_error()));
+            }
+            self.fail_queued_turns();
+            self.in_agent_loop = false;
+            self.settle_deadline = None;
+            self.emit_queue_depth(false).await;
+        }
+        let _ = respond.send(result);
     }
 
     async fn on_extension_ui_response(&mut self, resp: ExtensionUiResponse) {
-        let mut proc = self.proc.lock().await;
-        if let Err(e) = proc.send_extension_ui_response(resp).await {
+        if let Err(e) = self.rpc.send_extension_ui_response(resp).await {
             tracing::warn!(error = %e, "failed to write extension_ui_response to pi");
         }
+    }
+
+    /// Run one delegated pi RPC command (thin agent delegation).
+    async fn on_rpc(&mut self, command: RpcCommand, respond: oneshot::Sender<Result<Value>>) {
+        let result = self.rpc.request(&command).await;
+        let _ = respond.send(result);
     }
 
     /// The early `prompt` RPC response. `Ok` means pi accepted the turn (it
@@ -438,46 +946,103 @@ impl Pump {
     /// pi died — resolve the pending turn explicitly (TS parity), surfacing
     /// the error per design D5, and do **not** auto-start queued turns (pi may
     /// be unhealthy).
-    async fn on_prompt_result(&mut self, result: Option<std::result::Result<(), AcpxError>>) {
-        let result = match result {
-            Some(Ok(())) | None => return, // accepted; wait for agent_settled
-            Some(Err(e)) => e,
+    async fn on_prompt_result(&mut self, prompt: Option<PromptResult>) {
+        let Some(PromptResult { turn_id, result }) = prompt else {
+            return;
         };
-        let Some(pending) = self.pending_turn.take() else {
-            return; // already settled (defensive)
+
+        let Some(pending) = self.pending_turn.as_ref() else {
+            tracing::debug!(
+                turn_id,
+                "late prompt response with no pending turn; ignoring"
+            );
+            return;
         };
-        if self.cancel_requested {
-            let _ = pending.resolve.send(Ok(StopReason::Cancelled));
-        } else {
-            let _ = pending.resolve.send(Err(result));
+        if pending.turn_id != turn_id {
+            tracing::debug!(
+                turn_id,
+                current_turn_id = pending.turn_id,
+                "late prompt response; ignoring"
+            );
+            return;
         }
-        self.in_agent_loop = false;
-        self.emit_queue_depth(false).await;
+
+        match result {
+            Ok(()) => {
+                // The response and event channels are separate. A fast pi can
+                // therefore put agent_settled in the event channel before the
+                // pump observes this response even though pi wrote the
+                // response first. Mark the response before deciding whether a
+                // buffered settle can complete this turn.
+                let settled_before_accept = {
+                    let pending = self
+                        .pending_turn
+                        .as_mut()
+                        .expect("pending turn checked above");
+                    pending.prompt_accepted = true;
+                    pending.settled_before_accept
+                };
+                if settled_before_accept {
+                    self.settle_pending_turn().await;
+                } else if self.settle_timeout > Duration::ZERO {
+                    // Accepted: arm the settle fallback (design §11 risk #84).
+                    // The turn completes at `agent_settled`; the per-request
+                    // RPC timeout only bounds the early response.
+                    self.settle_deadline = Some(tokio::time::Instant::now() + self.settle_timeout);
+                }
+            }
+            Err(result) => {
+                self.settle_deadline = None;
+                let Some(pending) = self.pending_turn.take() else {
+                    return;
+                };
+                self.flush_outbound().await;
+                let _ = pending.resolve.send(Err(result));
+                self.fail_queued_turns();
+                self.poisoned = true;
+                self.cancel_requested = false;
+                self.in_agent_loop = false;
+                self.emit_queue_depth(false).await;
+            }
+        }
     }
 
     async fn start_turn(&mut self, queued: QueuedTurn) {
         self.cancel_requested = false;
         self.in_agent_loop = false;
+        let turn_id = self.next_turn_id;
+        self.next_turn_id += 1;
+        let (prompt_started_tx, prompt_started_rx) = oneshot::channel();
         self.pending_turn = Some(PendingTurn {
             resolve: queued.resolve,
+            turn_id,
+            prompt_accepted: false,
+            settled_before_accept: false,
+            prompt_started: Some(prompt_started_rx),
         });
         self.emit_queue_depth(true).await;
 
         // Send the prompt in a spawned task so the pump keeps servicing
         // commands (cancel) and events while the early response is in flight.
-        let proc = self.proc.clone();
+        let rpc = self.rpc.clone();
         let tx = self._prompt_tx.clone();
         tokio::spawn(async move {
-            let result = {
-                let mut p = proc.lock().await;
-                p.request(&RpcCommand::Prompt {
-                    message: queued.message,
-                    images: Some(queued.images),
-                    streaming_behavior: None,
+            let result = rpc
+                .request_with_started(
+                    &RpcCommand::Prompt {
+                        message: queued.message,
+                        images: Some(queued.images),
+                        streaming_behavior: None,
+                    },
+                    prompt_started_tx,
+                )
+                .await;
+            let _ = tx
+                .send(PromptResult {
+                    turn_id,
+                    result: result.map(|_| ()),
                 })
-                .await
-            };
-            let _ = tx.send(result.map(|_| ())).await;
+                .await;
         });
     }
 
@@ -493,6 +1058,23 @@ impl Pump {
         {
             tracing::debug!("outbound sink closed; dropping session update");
         }
+    }
+
+    /// Ordering barrier: block until everything already sent on the outbound
+    /// channel has been forwarded to the connection (S8 / D4; TS `flushEmits`).
+    /// Resolving a turn only after this guarantees streamed notifications are
+    /// never overtaken by the `session/prompt` response frame.
+    async fn flush_outbound(&mut self) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .outbound
+            .send(OutboundMessage::Flush(tx))
+            .await
+            .is_err()
+        {
+            return; // sink closed; nothing to flush
+        }
+        let _ = rx.await;
     }
 
     async fn emit_text(&mut self, text: &str) {
@@ -514,14 +1096,161 @@ impl Pump {
         self.emit(update).await;
     }
 
+    /// Emit an ACP `usage_update` from pi's assistant-message usage (decision
+    /// 3: first release includes the standard notification, aligning #106).
+    ///
+    /// `used` = pi's cumulative context token count (`totalTokens`, falling
+    /// back to the component sum); `size` = the active model's context window;
+    /// `cost` = the cumulative USD cost when pi reports one. Skipped when the
+    /// usage is all-zero or the model's context window is unknown (a
+    /// `usage_update` without a meaningful `size` would be misleading).
+    async fn emit_usage_update(&mut self, usage: &Usage) {
+        let Some(size) = self.context_window else {
+            return;
+        };
+        let used = if usage.total_tokens > 0 {
+            usage.total_tokens
+        } else {
+            usage.input + usage.output + usage.cache_read + usage.cache_write
+        };
+        if used == 0 && !usage.cost.as_ref().is_some_and(|c| c.total > 0.0) {
+            return;
+        }
+        let mut update = UsageUpdate::new(used, size);
+        if let Some(cost) = &usage.cost {
+            if cost.total > 0.0 {
+                update = update.cost(Cost::new(cost.total, "USD"));
+            }
+        }
+        self.emit(SessionUpdate::UsageUpdate(update)).await;
+    }
+
+    /// Emit the initial zero-use context window. This is separate from
+    /// [`Self::emit_usage_update`] because pi's first usage event may not
+    /// arrive until after the first model turn.
+    async fn emit_initial_usage_update(&mut self) {
+        let Some(size) = self.context_window else {
+            return;
+        };
+        self.emit(SessionUpdate::UsageUpdate(UsageUpdate::new(0, size)))
+            .await;
+    }
+
+    /// pi's streaming `message_update` can carry an empty usage snapshot. The
+    /// final assistant `message_end` contains the authoritative usage, so only
+    /// extract usage from assistant messages here.
+    fn usage_from_assistant_message(message: &Value) -> Option<Usage> {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            return None;
+        }
+        serde_json::from_value(message.get("usage")?.clone()).ok()
+    }
+
     // --- pi events ---
+
+    /// Forward pi's `thinking_level_changed` to the client so Zed's thinking
+    /// selectors follow pi-initiated changes (e.g. alongside a model switch).
+    ///
+    /// The mode update is authoritative from the event and always emitted.
+    /// The config-option refresh re-reads pi state (best-effort): a failed
+    /// round-trip must not turn an informational event into a turn failure,
+    /// so the mode update still stands on its own. The thought-level options
+    /// are the model's native available levels (W-478), not a static ladder.
+    ///
+    /// Echo suppression (W-479 P1): when this event closely follows our own
+    /// `set_thinking_level` / `set_model`, the agent's explicit refresh has
+    /// already re-read the same post-set state — skip the duplicate re-read.
+    async fn on_thinking_level_changed(&mut self, level: ThinkingLevel) {
+        self.emit(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+            level.id(),
+        )))
+        .await;
+        if thinking_event_is_echo(
+            *self.thinking_set_at.lock().unwrap(),
+            std::time::Instant::now(),
+        ) {
+            return;
+        }
+        let (state_res, models_res, levels_res) = tokio::join!(
+            self.rpc.request(&RpcCommand::GetState),
+            self.rpc.request(&RpcCommand::GetAvailableModels),
+            self.rpc.request(&RpcCommand::GetAvailableThinkingLevels),
+        );
+        let (Ok(state_data), Ok(models_data)) = (state_res, models_res) else {
+            return;
+        };
+        let state_model = serde_json::from_value::<RpcSessionState>(state_data)
+            .ok()
+            .and_then(|s| s.model);
+        let current_model = state_model.as_ref().and_then(|m| {
+            let provider = m.provider.trim();
+            let id = m.id.trim();
+            if provider.is_empty() || id.is_empty() {
+                None
+            } else {
+                Some(format!("{provider}/{id}"))
+            }
+        });
+        let available: Vec<(String, String)> = models_data
+            .get("models")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<Model>>(v).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                let provider = m.provider.trim();
+                let id = m.id.trim();
+                if provider.is_empty() || id.is_empty() {
+                    None
+                } else {
+                    Some((format!("{provider}/{id}"), format!("{provider}/{}", m.name)))
+                }
+            })
+            .collect();
+        // Native levels first; fall back to the local per-model computation
+        // so an older pi without the RPC still yields a dynamic list.
+        let levels: Vec<ThinkingLevel> = levels_res
+            .ok()
+            .and_then(|data| data.get("levels").cloned())
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| ThinkingLevel::parse(id))
+                    .collect()
+            })
+            .filter(|levels: &Vec<ThinkingLevel>| !levels.is_empty())
+            .unwrap_or_else(|| supported_thinking_levels(state_model.as_ref()));
+        let mut options = vec![crate::agent::thought_level_config_option(
+            level.id(),
+            &levels,
+        )];
+        let current_model_id = current_model
+            .or_else(|| available.first().map(|(id, _)| id.clone()))
+            .unwrap_or_default();
+        if let Some(model_option) = crate::agent::model_config_option(&current_model_id, &available)
+        {
+            options.insert(0, model_option);
+        }
+        self.emit(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+            options,
+        )))
+        .await;
+    }
 
     async fn on_event(&mut self, ev: RpcEvent) {
         match ev {
             RpcEvent::MessageUpdate {
+                usage,
                 assistant_message_event,
-                ..
-            } => self.on_message_update(&assistant_message_event).await,
+            } => {
+                self.emit_usage_update(&usage).await;
+                self.on_message_update(&assistant_message_event).await;
+            }
+            RpcEvent::MessageEnd { message } => {
+                if let Some(usage) = Self::usage_from_assistant_message(&message) {
+                    self.emit_usage_update(&usage).await;
+                }
+            }
             RpcEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
@@ -594,22 +1323,63 @@ impl Pump {
                     .await;
                 }
             }
-            // Not wired in S5 (logged): QueueUpdate / SessionInfoChanged /
-            // ThinkingLevelChanged / EntryAppended / UnmatchedResponse /
-            // ExtensionError / summarization retries / unknown future events.
+            // pi-initiated renames (e.g. an extension calling `setSessionName`)
+            // are forwarded as `session_info_update` so the client's thread
+            // title stays live (fixes #102/#24).
+            RpcEvent::SessionInfoChanged { name } => {
+                if let Some(name) = name {
+                    let update = SessionInfoUpdate::new()
+                        .title(name)
+                        .updated_at(utc_now_iso8601());
+                    self.emit(SessionUpdate::SessionInfoUpdate(update)).await;
+                }
+            }
+            // pi changed the thinking level itself: push both selectors so
+            // Zed's mode picker and thinking dropdown follow.
+            RpcEvent::ThinkingLevelChanged { level } => {
+                self.on_thinking_level_changed(level).await;
+            }
+            // Not wired (logged): QueueUpdate / EntryAppended /
+            // UnmatchedResponse / ExtensionError / summarization retries /
+            // unknown future events.
             other => {
                 tracing::trace!(?other, "unhandled pi event");
             }
         }
     }
 
-    /// The turn is truly over. Resolve the pending ACP prompt, then either
-    /// start the next queued turn or publish the idle queue depth.
+    /// Handle pi's turn-completion event. The event does not carry a turn id,
+    /// so an event observed before the matching prompt response is held until
+    /// that response confirms the turn. During cancellation, the abort is the
+    /// confirmation that an early response is no longer required.
     async fn on_agent_settled(&mut self) {
-        let Some(pending) = self.pending_turn.take() else {
+        if let Some(pending) = self.pending_turn.as_mut() {
+            if !pending.prompt_accepted && !self.cancel_requested {
+                pending.settled_before_accept = true;
+                tracing::debug!(
+                    turn_id = pending.turn_id,
+                    "agent_settled arrived before prompt response; buffering"
+                );
+                return;
+            }
+        } else {
             tracing::debug!("agent_settled with no pending turn; ignoring");
             return;
+        }
+        self.settle_pending_turn().await;
+    }
+
+    /// The turn is truly over. Resolve the pending ACP prompt, then either
+    /// start the next queued turn or publish the idle queue depth.
+    async fn settle_pending_turn(&mut self) {
+        self.settle_deadline = None;
+        let Some(pending) = self.pending_turn.take() else {
+            tracing::debug!("settling with no pending turn; ignoring");
+            return;
         };
+        // All streamed updates derived from pi events are delivered before the
+        // response frame (TS `flushEmits` parity; S8 / D4 ordering).
+        self.flush_outbound().await;
         let reason = if self.cancel_requested {
             StopReason::Cancelled
         } else {
@@ -628,17 +1398,25 @@ impl Pump {
         } else {
             self.emit_queue_depth(false).await;
         }
+        self.cancel_requested = false;
     }
 
     /// pi's stdout ended without a settle: the process exited mid-turn. Fail
     /// the pending turn and all queued turns with [`AcpxError::PiExited`]
     /// (fixes #82 — a dead pi is never a silent empty `end_turn`).
     async fn on_stream_end(&mut self) {
-        let (code, signal) = {
-            let proc = self.proc.lock().await;
-            proc.exit_status().unwrap_or((None, None))
+        self.settle_deadline = None;
+        // The reader can observe stdout EOF just before Child::wait() records
+        // the exit status. Give the watcher a short polling window before
+        // rejecting turns so a real exit code is not lost in that race. The
+        // helper polls shared state, leaving the JoinHandle for teardown.
+        let status = {
+            let mut proc = self.proc.lock().await;
+            proc.wait_exited(Duration::from_millis(200)).await
         };
+        let (code, signal) = status.unwrap_or((None, None));
         let pending_err = AcpxError::PiExited { code, signal };
+        self.flush_outbound().await;
         if let Some(p) = self.pending_turn.take() {
             let _ = p.resolve.send(Err(pending_err));
         }
@@ -646,6 +1424,38 @@ impl Pump {
             let _ = t.resolve.send(Err(AcpxError::PiExited { code, signal }));
         }
         self.in_agent_loop = false;
+    }
+
+    /// The settle deadline fired: pi accepted the prompt but never emitted
+    /// `agent_settled` (design §11 risk #84). Resolve the pending turn with an
+    /// explicit [`AcpxError::SettleTimeout`] so `session/prompt` can never
+    /// hang forever, and fire a best-effort `abort` to unstick pi. Queued
+    /// turns are not auto-started (pi may be unhealthy — same policy as the
+    /// prompt-rejection path).
+    async fn on_settle_timeout(&mut self) {
+        self.settle_deadline = None;
+        let Some(pending) = self.pending_turn.take() else {
+            tracing::debug!("settle deadline fired with no pending turn; ignoring");
+            return;
+        };
+        self.flush_outbound().await;
+        let secs = self.settle_timeout.as_secs();
+        let _ = pending.resolve.send(Err(AcpxError::SettleTimeout { secs }));
+        self.fail_queued_turns();
+        self.poisoned = true;
+        self.cancel_requested = false;
+        self.in_agent_loop = false;
+        self.emit_queue_depth(false).await;
+
+        // Best-effort: tell pi to stop whatever it accepted (it may still be
+        // inside an agent loop; the resulting late `agent_settled` is ignored
+        // — the pending turn is already resolved).
+        let rpc = self.rpc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = rpc.request(&RpcCommand::Abort).await {
+                tracing::warn!(error = %e, "abort after settle timeout failed");
+            }
+        });
     }
 
     // --- streaming assistant messages ---
@@ -1091,6 +1901,11 @@ pub fn spawn_outbound_connector(
                         });
                         let _ = respond.send(response);
                     }
+                    OutboundMessage::Flush(ack) => {
+                        // Everything before this marker is now enqueued on the
+                        // connection's outgoing channel; release the pump.
+                        let _ = ack.send(());
+                    }
                 }
             }
             Ok(())
@@ -1148,6 +1963,15 @@ impl ExtensionUiRequest {
             | ExtensionUiRequest::Confirm { title, .. }
             | ExtensionUiRequest::Input { title, .. }
             | ExtensionUiRequest::Editor { title, .. } => Some(title),
+            _ => None,
+        }
+    }
+
+    fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            ExtensionUiRequest::Select { timeout, .. }
+            | ExtensionUiRequest::Confirm { timeout, .. }
+            | ExtensionUiRequest::Input { timeout, .. } => *timeout,
             _ => None,
         }
     }
@@ -1287,7 +2111,17 @@ async fn request_permission(
             command: "request_permission".into(),
             message: "outbound sink closed".into(),
         })?;
-    let response = rx.await.map_err(|_| AcpxError::RpcFailed {
+    let response = if let Some(timeout_ms) = req.timeout_ms() {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .map_err(|_| AcpxError::RpcFailed {
+                command: "request_permission".into(),
+                message: format!("client did not respond within {timeout_ms}ms"),
+            })?
+    } else {
+        rx.await
+    }
+    .map_err(|_| AcpxError::RpcFailed {
         command: "request_permission".into(),
         message: "permission responder dropped".into(),
     })??;
@@ -1422,6 +2256,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn thinking_echo_window_classifies_set_echoes() {
+        let now = std::time::Instant::now();
+        // No set yet: never an echo (genuine pi-initiated change refreshes).
+        assert!(!thinking_event_is_echo(None, now));
+        // Fresh set: echo, skip the redundant re-read.
+        assert!(thinking_event_is_echo(Some(now), now));
+        assert!(thinking_event_is_echo(
+            Some(now - THINKING_SET_ECHO_WINDOW),
+            now
+        ));
+        // Stale set: full refresh again.
+        assert!(!thinking_event_is_echo(
+            Some(now - THINKING_SET_ECHO_WINDOW - Duration::from_millis(1)),
+            now
+        ));
+    }
+
+    #[test]
     fn option_index_parses_choice_ids() {
         assert_eq!(option_index("choice-0"), Some(0));
         assert_eq!(option_index("choice-12"), Some(12));
@@ -1494,6 +2346,63 @@ mod tests {
         assert_eq!(input["method"], "input");
         assert_eq!(input["placeholder"], "hint");
         assert!(input.get("options").is_none());
+    }
+
+    #[test]
+    fn extension_ui_timeout_is_read_from_interactive_requests() {
+        let select: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-1",
+            "method": "select",
+            "title": "Pick",
+            "options": ["a"],
+            "timeout": 250
+        }))
+        .unwrap();
+        assert_eq!(select.timeout_ms(), Some(250));
+
+        let notify: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-2",
+            "method": "notify",
+            "message": "hello"
+        }))
+        .unwrap();
+        assert_eq!(notify.timeout_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn request_permission_honors_extension_timeout() {
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        let session_id: SessionId = "session".into();
+        let request: ExtensionUiRequest = serde_json::from_value(json!({
+            "id": "ui-1",
+            "method": "select",
+            "title": "Pick",
+            "options": ["a"],
+            "timeout": 10
+        }))
+        .unwrap();
+
+        let permission =
+            request_permission(&session_id, "ui-1", "Pick", &request, Vec::new(), &outbound);
+        let (_, result) = tokio::join!(
+            async {
+                let Some(OutboundMessage::RequestPermission(_, _responder)) =
+                    outbound_rx.recv().await
+                else {
+                    panic!("permission request was not sent");
+                };
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            },
+            permission,
+        );
+
+        match result {
+            Err(AcpxError::RpcFailed { command, message }) => {
+                assert_eq!(command, "request_permission");
+                assert!(message.contains("10ms"), "{message}");
+            }
+            other => panic!("expected permission timeout, got {other:?}"),
+        }
     }
 
     #[test]

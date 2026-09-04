@@ -59,12 +59,19 @@ impl SessionManager {
             .ok_or_else(|| AcpxError::UnknownSession(session_id.0.to_string()))
     }
 
-    /// Register a session (spawned by the caller, e.g. `session/new`).
+    /// Register a session (spawned by the caller, e.g. `session/new`). A
+    /// replaced instance is disposed after ownership leaves the map.
     pub async fn insert(&self, session: Arc<PiAcpSession>) {
-        self.sessions
+        let replaced = self
+            .sessions
             .lock()
             .await
-            .insert(session.session_id().clone(), session);
+            .insert(session.session_id().clone(), session.clone());
+        if let Some(previous) = replaced {
+            if !Arc::ptr_eq(&previous, &session) {
+                previous.dispose().await;
+            }
+        }
     }
 
     /// Spawn a fresh session (pi subprocess + pump) and register it.
@@ -76,9 +83,12 @@ impl SessionManager {
 
     /// Dispose a session's pi process and remove it from the manager.
     pub async fn close(&self, session_id: &SessionId) {
-        if let Some(session) = self.maybe_get(session_id).await {
+        // Remove ownership before awaiting process teardown. Otherwise an
+        // insert of the same id during dispose could be removed by the stale
+        // close after it finishes.
+        let session = self.sessions.lock().await.remove(session_id);
+        if let Some(session) = session {
             session.dispose().await;
-            self.sessions.lock().await.remove(session_id);
         }
     }
 
@@ -99,9 +109,15 @@ impl SessionManager {
 
     /// Close every session (graceful shutdown path; design §8.3).
     pub async fn dispose_all(&self) {
-        let ids: Vec<SessionId> = self.sessions.lock().await.keys().cloned().collect();
-        for id in ids {
-            self.close(&id).await;
+        let sessions: Vec<Arc<PiAcpSession>> = self
+            .sessions
+            .lock()
+            .await
+            .drain()
+            .map(|(_, session)| session)
+            .collect();
+        for session in sessions {
+            session.dispose().await;
         }
     }
 }

@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# Release staging (populated by CI / local packaging, never committed)
+/dist
+
 # Editor / OS
 .idea/
 .vscode/

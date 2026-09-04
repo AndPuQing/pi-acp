@@ -33,10 +33,11 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use crate::error::{AcpxError, Result};
+use crate::pi::resolve::resolve_current_env;
 use crate::pi::rpc::{
     ExtensionUiResponse, Model, QueueMode, RpcCommand, RpcEvent, RpcResponse, RpcSessionState,
     ThinkingLevel,
@@ -49,8 +50,11 @@ pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
 /// How long [`PiProcess::dispose`] waits after SIGTERM before escalating to
 /// SIGKILL (pi runs a graceful shutdown handler on SIGTERM).
 const SIGTERM_GRACE: Duration = Duration::from_secs(3);
-/// How long [`PiProcess::Drop`]'s off-thread SIGTERM→SIGKILL escalation waits.
-const DROP_ESCALATION_DELAY: Duration = Duration::from_millis(250);
+/// A just-exited process can briefly keep the runner from accepting another
+/// child (`EAGAIN`, especially on Unix). Retry only that transient condition;
+/// permanent spawn failures still surface immediately.
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(25);
+const SPAWN_RETRY_ATTEMPTS: usize = 120;
 /// Bounded event channel capacity. The reader task awaits sends (backpressure),
 /// so a slow event pump stalls the stream rather than unboundedly buffering.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -69,12 +73,21 @@ struct Shared {
     prelude: Mutex<Vec<String>>,
 }
 
+/// The request transport shared with session operations. Its stdin lock only
+/// covers one JSONL write; it is never held while waiting for a response.
+pub(crate) struct RpcClient {
+    stdin: Arc<AsyncMutex<ChildStdin>>,
+    next_id: Arc<AtomicU64>,
+    timeout: Duration,
+    shared: Arc<Shared>,
+}
+
 /// A spawned `pi --mode rpc` child process plus its JSONL request/response
 /// plumbing.
 pub struct PiProcess {
-    stdin: ChildStdin,
+    stdin: Arc<AsyncMutex<ChildStdin>>,
     /// Monotonic id source for pi RPC requests (matched back by `id`).
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     /// Per-request deadline.
     timeout: Duration,
     shared: Arc<Shared>,
@@ -104,7 +117,7 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, &[], session_path, timeout).await
+        Self::spawn_inner(pi_command, &[], session_path, None, timeout).await
     }
 
     /// [`PiProcess::spawn_with_session`] with extra pi CLI flags appended after
@@ -115,16 +128,36 @@ impl PiProcess {
         session_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(pi_command, extra_args, session_path, timeout).await
+        Self::spawn_inner(pi_command, extra_args, session_path, None, timeout).await
+    }
+
+    /// [`PiProcess::spawn_with_args`] with an explicit working directory for
+    /// the child process. Session tools and pi's session header must observe
+    /// the same cwd that the ACP client supplied to `session/new`/`session/load`.
+    pub async fn spawn_with_args_in_dir(
+        pi_command: &str,
+        extra_args: &[&str],
+        session_path: Option<&Path>,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::spawn_inner(pi_command, extra_args, session_path, Some(cwd), timeout).await
     }
 
     async fn spawn_inner(
         pi_command: &str,
         extra_args: &[&str],
         session_path: Option<&Path>,
+        cwd: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        let mut cmd = Command::new(pi_command);
+        // Resolve the configured command to a launchable program. On Windows
+        // this expands a bare `pi` to the npm `pi.cmd` wrapper and routes it
+        // through `cmd.exe /d /s /c` (fixes pi-acp #27); on unix it is a no-op
+        // for the common `pi` name. `cmd_args` carry any shell prefix.
+        let resolved = resolve_current_env(pi_command);
+        let mut cmd = Command::new(&resolved.program);
+        cmd.args(&resolved.cmd_args);
         cmd.args(["--mode", "rpc", "--no-themes"]);
         if let Some(path) = session_path {
             cmd.arg("--session").arg(path);
@@ -134,14 +167,39 @@ impl PiProcess {
             .stdout(Stdio::piped())
             // pi writes diagnostics to stderr; keep it out of the JSONL stream.
             .stderr(Stdio::null());
-        // Put pi in its own process group so teardown can signal the whole tree
-        // (wrapper launchers like pi.cmd may spawn grandchildren).
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        // Put real pi in its own process group so teardown can signal the whole
+        // tree (wrapper launchers like pi.cmd may spawn grandchildren). The
+        // ACP integration fixture nests a mock pi inside an externally-managed
+        // adapter process; sharing that test-only process group lets the SDK's
+        // outer teardown reap both levels instead of orphaning the mock.
         #[cfg(unix)]
-        cmd.process_group(0);
+        if std::env::var_os("PI_ACP_MOCK").is_none() {
+            cmd.process_group(0);
+        }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AcpxError::PiSpawn(format!("{pi_command}: {e}")))?;
+        let mut attempts = 0;
+        let mut child = loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) && attempts < SPAWN_RETRY_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(AcpxError::PiSpawn(spawn_error(
+                        pi_command, &resolved, error,
+                    )))
+                }
+            }
+        };
 
         let stdin = child
             .stdin
@@ -175,8 +233,8 @@ impl PiProcess {
         let watcher = tokio::spawn(wait_loop(child, watcher_shared));
 
         Ok(Self {
-            stdin,
-            next_id: AtomicU64::new(0),
+            stdin: Arc::new(AsyncMutex::new(stdin)),
+            next_id: Arc::new(AtomicU64::new(0)),
             timeout,
             shared,
             events: Some(events_rx),
@@ -185,16 +243,24 @@ impl PiProcess {
         })
     }
 
-    fn next_id(&self) -> String {
-        self.next_id.fetch_add(1, Ordering::Relaxed).to_string()
+    /// Clone the request transport for session operations that must run while
+    /// another RPC is waiting for its response.
+    pub(crate) fn request_client(&self) -> Arc<RpcClient> {
+        Arc::new(RpcClient {
+            stdin: self.stdin.clone(),
+            next_id: self.next_id.clone(),
+            timeout: self.timeout,
+            shared: self.shared.clone(),
+        })
     }
 
     /// Write a single JSON line to pi's stdin.
-    async fn write_line(&mut self, value: &Value) -> std::io::Result<()> {
+    async fn write_line(&self, value: &Value) -> std::io::Result<()> {
         let mut line = value.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
         Ok(())
     }
 
@@ -204,60 +270,13 @@ impl PiProcess {
     /// [`AcpxError::RpcFailed`]. A child exit while awaiting rejects the
     /// request with [`AcpxError::PiExited`] (fixes #82).
     pub async fn request(&mut self, command: &RpcCommand) -> Result<Value> {
-        self.request_response(command).await?.ok()
+        self.request_client().request(command).await
     }
 
     /// [`PiProcess::request`] without unwrapping `data` — callers that need the
     /// full response envelope (e.g. to distinguish error payloads) use this.
     pub async fn request_response(&mut self, command: &RpcCommand) -> Result<RpcResponse> {
-        // Fail fast on a dead child instead of writing into a broken pipe and
-        // hoping for a timeout (design D3; fixes #82's silent empty end_turn).
-        if let Some((code, signal)) = self.exit_status() {
-            return Err(AcpxError::PiExited { code, signal });
-        }
-
-        let id = self.next_id();
-        let mut msg = serde_json::to_value(command)?;
-        msg["id"] = Value::String(id.clone());
-
-        let (tx, rx) = oneshot::channel();
-        self.shared.pending.lock().await.insert(id.clone(), tx);
-
-        if let Err(e) = self.write_line(&msg).await {
-            // Write failed (EPIPE etc.): the request never reached pi — drop the
-            // pending entry and surface the io error.
-            self.shared.pending.lock().await.remove(&id);
-            return Err(e.into());
-        }
-
-        let timeout = self.timeout;
-        let secs = timeout.as_secs();
-        match tokio::time::timeout(timeout, rx).await {
-            // The pending map stores `oneshot::Sender<Result<Value>>`: the outer
-            // `Ok` is the oneshot completing, the inner is the reader's/watcher's
-            // payload (`Ok(response)` / `Err(PiExited)`).
-            Ok(Ok(Ok(res))) => serde_json::from_value(res).map_err(Into::into),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => {
-                // Sender dropped without a payload (stream ended before the
-                // watcher rejected pending) — treat as a dead process.
-                self.shared.pending.lock().await.remove(&id);
-                Err(AcpxError::PiExited {
-                    code: None,
-                    signal: None,
-                })
-            }
-            Err(_) => {
-                // Deadline hit; drop the pending entry so a late response is
-                // routed to the event channel as `UnmatchedResponse` instead of
-                // resolving a vanished request.
-                self.shared.pending.lock().await.remove(&id);
-                Err(AcpxError::RpcTimeout {
-                    cmd: command.name().to_string(),
-                    secs,
-                })
-            }
-        }
+        self.request_client().request_response(command).await
     }
 
     /// The next pi event, or `None` once the event stream has ended (reader
@@ -292,6 +311,24 @@ impl PiProcess {
     /// `signal` is populated on unix only (windows reports `None`).
     pub fn exit_status(&self) -> Option<(Option<i32>, Option<i32>)> {
         *self.shared.exit.lock().unwrap()
+    }
+
+    /// Wait (bounded) for the watcher to publish the child's exit status, then
+    /// return it. This polls shared state instead of polling the JoinHandle so
+    /// the teardown path can still await that handle exactly once.
+    pub async fn wait_exited(&mut self, timeout: Duration) -> Option<(Option<i32>, Option<i32>)> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.exit_status() {
+                return Some(status);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return self.exit_status();
+            }
+            let remaining = deadline - now;
+            tokio::time::sleep(remaining.min(Duration::from_millis(1))).await;
+        }
     }
 
     /// Send a `prompt` command and stream each pi event to `on_event` until the
@@ -496,19 +533,134 @@ impl PiProcess {
     }
 }
 
+impl RpcClient {
+    fn next_id(&self) -> String {
+        self.next_id.fetch_add(1, Ordering::Relaxed).to_string()
+    }
+
+    /// Write a single JSON line to pi's stdin. The lock covers only the write
+    /// and flush, so another request can wait for its response concurrently.
+    async fn write_line(&self, value: &Value) -> std::io::Result<()> {
+        let mut line = value.to_string();
+        line.push('\n');
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn request(&self, command: &RpcCommand) -> Result<Value> {
+        self.request_response(command).await?.ok()
+    }
+
+    /// Send a request and notify `started` once its JSON line has been written
+    /// and flushed. Session cancellation uses this to keep `abort` behind the
+    /// prompt write while still allowing both responses to be awaited
+    /// independently.
+    pub(crate) async fn request_with_started(
+        &self,
+        command: &RpcCommand,
+        started: oneshot::Sender<()>,
+    ) -> Result<Value> {
+        self.request_response_with_started(command, Some(started))
+            .await?
+            .ok()
+    }
+
+    pub(crate) async fn send_extension_ui_response(
+        &self,
+        response: ExtensionUiResponse,
+    ) -> Result<()> {
+        let mut msg = serde_json::to_value(response)?;
+        msg["type"] = Value::String("extension_ui_response".into());
+        self.write_line(&msg).await?;
+        Ok(())
+    }
+
+    async fn request_response(&self, command: &RpcCommand) -> Result<RpcResponse> {
+        self.request_response_with_started(command, None).await
+    }
+
+    async fn request_response_with_started(
+        &self,
+        command: &RpcCommand,
+        started: Option<oneshot::Sender<()>>,
+    ) -> Result<RpcResponse> {
+        // Fail fast on a dead child instead of writing into a broken pipe and
+        // hoping for a timeout (design D3; fixes #82's silent empty end_turn).
+        if let Some((code, signal)) = *self.shared.exit.lock().unwrap() {
+            return Err(AcpxError::PiExited { code, signal });
+        }
+
+        let id = self.next_id();
+        let mut msg = serde_json::to_value(command)?;
+        msg["id"] = Value::String(id.clone());
+
+        let (tx, rx) = oneshot::channel();
+        self.shared.pending.lock().await.insert(id.clone(), tx);
+
+        match tokio::time::timeout(self.timeout, self.write_line(&msg)).await {
+            Ok(Ok(())) => {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+            }
+            Ok(Err(e)) => {
+                // Write failed (EPIPE etc.): the request never reached pi —
+                // drop the pending entry and surface the io error.
+                self.shared.pending.lock().await.remove(&id);
+                return Err(e.into());
+            }
+            Err(_) => {
+                self.shared.pending.lock().await.remove(&id);
+                return Err(AcpxError::RpcTimeout {
+                    cmd: command.name().to_string(),
+                    secs: self.timeout.as_secs(),
+                });
+            }
+        }
+
+        let timeout = self.timeout;
+        let secs = timeout.as_secs();
+        match tokio::time::timeout(timeout, rx).await {
+            // The pending map stores `oneshot::Sender<Result<Value>>`: the outer
+            // `Ok` is the oneshot completing, the inner is the reader's/watcher's
+            // payload (`Ok(response)` / `Err(PiExited)`).
+            Ok(Ok(Ok(res))) => serde_json::from_value(res).map_err(Into::into),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => {
+                // Sender dropped without a payload (stream ended before the
+                // watcher rejected pending) — treat as a dead process.
+                self.shared.pending.lock().await.remove(&id);
+                Err(AcpxError::PiExited {
+                    code: None,
+                    signal: None,
+                })
+            }
+            Err(_) => {
+                // Deadline hit; drop the pending entry so a late response is
+                // routed to the event channel as `UnmatchedResponse` instead
+                // of resolving a vanished request.
+                self.shared.pending.lock().await.remove(&id);
+                Err(AcpxError::RpcTimeout {
+                    cmd: command.name().to_string(),
+                    secs,
+                })
+            }
+        }
+    }
+}
+
 impl Drop for PiProcess {
     /// Sync emergency teardown (used when `dispose()` was not called, e.g.
     /// panic unwinding or session-map eviction without an async context).
-    /// SIGTERM immediately, then an off-thread SIGKILL escalation — `Drop`
-    /// cannot await, so the grace period happens on a detached thread. The
-    /// watcher task still owns the `Child` and reaps it.
+    /// `Drop` cannot await a graceful shutdown, so terminate the whole process
+    /// group immediately. The watcher task still owns the `Child` and reaps it
+    /// while the runtime is alive. A detached delayed killer would both leave
+    /// a resource window and risk signaling a reused PID.
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            signal_pi(pid, /* term */ true);
-            std::thread::spawn(move || {
-                std::thread::sleep(DROP_ESCALATION_DELAY);
-                signal_pi(pid, /* term */ false);
-            });
+        if let Some(pid) = self.pid.take() {
+            signal_pi(pid, /* term */ false);
         }
     }
 }
@@ -522,13 +674,19 @@ impl Drop for PiProcess {
 /// Windows: no SIGTERM exists; `taskkill /T /F` force-terminates the tree.
 #[cfg(unix)]
 fn signal_pi(pid: u32, term: bool) {
-    let sig = if term { "TERM" } else { "KILL" };
-    for target in [format!("-{pid}"), pid.to_string()] {
-        let _ = std::process::Command::new("kill")
-            .arg(format!("-{sig}"))
-            .arg(&target)
-            .output();
-    }
+    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+        return;
+    };
+    let signal = if term {
+        rustix::process::Signal::TERM
+    } else {
+        rustix::process::Signal::KILL
+    };
+
+    // Use direct syscalls so cleanup still works when the process limit is
+    // the very resource that prevented another `kill` helper from spawning.
+    let _ = rustix::process::kill_process_group(pid, signal);
+    let _ = rustix::process::kill_process(pid, signal);
 }
 
 #[cfg(windows)]
@@ -536,6 +694,23 @@ fn signal_pi(pid: u32, _term: bool) {
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output();
+}
+
+/// Build an actionable spawn-failure message. A `NotFound` (ENOENT) gets an
+/// explicit install hint; other failures carry the raw error so the cause
+/// (EACCES, bad path, ...) is not lost.
+fn spawn_error(
+    pi_command: &str,
+    resolved: &crate::pi::resolve::ResolvedPi,
+    e: std::io::Error,
+) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "`{pi_command}` not found on PATH (resolved to {})",
+            resolved.program
+        ),
+        _ => format!("{pi_command}: {e}"),
+    }
 }
 
 /// Background task: read pi's stdout line by line until EOF, routing responses

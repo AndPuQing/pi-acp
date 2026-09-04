@@ -51,6 +51,10 @@ struct Fixture {
 
 /// Spawn a session against the mock pi with a recording outbound sink.
 async fn fixture(extra_args: &[&str]) -> Fixture {
+    fixture_with_settle_timeout(extra_args, Duration::ZERO).await
+}
+
+async fn fixture_with_settle_timeout(extra_args: &[&str], settle_timeout: Duration) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let scenarios = tmp.path().join("scenarios");
     let command_log = tmp.path().join("commands.log");
@@ -78,8 +82,12 @@ async fn fixture(extra_args: &[&str]) -> Fixture {
         pi_command: BIN.to_string(),
         extra_args: args,
         timeout: TIMEOUT,
+        settle_timeout,
         cwd: tmp.path().to_path_buf(),
         outbound: outbound_tx,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
     })
     .await
     .expect("session spawn");
@@ -117,6 +125,10 @@ async fn run_recorder(
                 });
                 let _ = respond.send(Ok(answer));
             }
+            OutboundMessage::Flush(ack) => {
+                // Ordering barrier: everything before it is already recorded.
+                let _ = ack.send(());
+            }
         }
     }
 }
@@ -144,6 +156,23 @@ async fn wait_until<F: Fn(&[Recorded]) -> bool>(fx: &Fixture, predicate: F) {
     }
 }
 
+async fn wait_for_command(fx: &Fixture, expected: &str) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if read_log(&fx.command_log)
+            .iter()
+            .any(|command| command == expected)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for command {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// All streamed agent text chunks in order.
 fn text_chunks(recorded: &[Recorded]) -> Vec<String> {
     recorded
@@ -168,6 +197,18 @@ fn queue_depths(recorded: &[Recorded]) -> Vec<(u64, bool)> {
                 let depth = pi_acp.get("queueDepth")?.as_u64()?;
                 let running = pi_acp.get("running")?.as_bool()?;
                 Some((depth, running))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn usage_updates(recorded: &[Recorded]) -> Vec<(u64, u64)> {
+    recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::Notify(SessionUpdate::UsageUpdate(update)) => {
+                Some((update.used, update.size))
             }
             _ => None,
         })
@@ -211,6 +252,57 @@ fn read_log(path: &Path) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Turn queueing
 // ---------------------------------------------------------------------------
+
+/// pi's streaming usage can be empty; the final assistant message carries the
+/// value that must replace the initial zero-use context update.
+#[tokio::test]
+async fn final_assistant_message_usage_updates_context() {
+    let fx = fixture(&[]).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "usage": {},
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "hello"
+                }
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "usage": {
+                        "input": 21,
+                        "output": 9,
+                        "cacheRead": 3,
+                        "cacheWrite": 0,
+                        "totalTokens": 33,
+                        "cost": {"input": 0.01, "output": 0.02, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.03}
+                    }
+                }
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "toolResult",
+                    "usage": {"totalTokens": 999}
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "hello").await.unwrap(),
+        StopReason::EndTurn
+    );
+    let recorded = fx.recorded.lock().await.clone();
+    assert_eq!(usage_updates(&recorded), vec![(33, 1000)]);
+}
 
 /// Two prompts: the second is queued while the first streams; the queue drains
 /// one-at-a-time, each turn completing on `agent_settled` (never `agent_end`).
@@ -269,6 +361,113 @@ async fn prompts_queue_and_drain_serially() {
     // Queue depth: turn1 starts -> prompt2 queued -> turn2 starts -> idle.
     let depths = queue_depths(&recorded);
     assert_eq!(depths, vec![(0, true), (1, true), (0, true), (0, false)]);
+}
+
+/// Responses and events are delivered through separate channels. A late prompt
+/// response must not arm the settle deadline for the queued turn when pi emits
+/// `agent_settled` before that response is observed by the pump.
+#[tokio::test]
+async fn prompt_response_order_cannot_poison_the_next_turn() {
+    let fx = fixture_with_settle_timeout(
+        &[
+            "--mock-no-settle",
+            "--mock-event-delay-ms",
+            "150",
+            "--mock-prompt-response-after-events-ms",
+            "50",
+        ],
+        Duration::from_millis(100),
+    )
+    .await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "usage": {},
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "first"
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+    write_scenario(
+        &fx.scenarios,
+        2,
+        &[
+            json!({
+                "type": "message_update",
+                "usage": {},
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "second"
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+
+    let first_session = fx.session.clone();
+    let first = tokio::spawn(async move { first_session.prompt("first".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    // Queue the next turn before the first prompt response is emitted. Its
+    // response is intentionally delayed until after its own settle event too.
+    let second_session = fx.session.clone();
+    let second = tokio::spawn(async move { second_session.prompt("second".into(), vec![]).await });
+    wait_until(&fx, |recorded| {
+        text_chunks(recorded).contains(&"Queued message (position 1).".to_string())
+    })
+    .await;
+
+    assert_eq!(first.await.unwrap().unwrap(), StopReason::EndTurn);
+    assert_eq!(second.await.unwrap().unwrap(), StopReason::EndTurn);
+}
+
+/// A rejected prompt must fail the queued turns too, and a later prompt must
+/// not reuse an unhealthy pi session.
+#[tokio::test]
+async fn prompt_failure_fails_queue_and_poison_session() {
+    let fx = fixture(&[
+        "--mock-delay-ms",
+        "100",
+        "--mock-prompt-error",
+        "prompt rejected",
+    ])
+    .await;
+
+    let s = fx.session.clone();
+    let first = tokio::spawn(async move { s.prompt("first".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    let s = fx.session.clone();
+    let second = tokio::spawn(async move { s.prompt("second".into(), vec![]).await });
+    wait_until(&fx, |recorded| {
+        text_chunks(recorded).contains(&"Queued message (position 1).".to_string())
+    })
+    .await;
+
+    let first_result = tokio::time::timeout(TIMEOUT, first)
+        .await
+        .expect("rejected prompt must resolve")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(first_result, AcpxError::RpcFailed { .. }));
+
+    let second_result = tokio::time::timeout(TIMEOUT, second)
+        .await
+        .expect("queued prompt must resolve after rejection")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(second_result, AcpxError::SessionClosed(_)));
+
+    let later = fx.session.prompt("later".into(), vec![]).await.unwrap_err();
+    assert!(matches!(later, AcpxError::SessionClosed(_)));
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +530,30 @@ async fn cancel_clears_queue_and_aborts_running_turn() {
     assert_eq!(
         tool_statuses(&recorded, "t1"),
         vec![ToolCallStatus::InProgress]
+    );
+}
+
+/// Cancellation must be able to reach pi while the prompt RPC is still
+/// waiting for its early response. The abort request must not wait for the
+/// session's process ownership mutex, or cancellation can hang until timeout.
+#[tokio::test]
+async fn cancel_interrupts_prompt_waiting_for_early_response() {
+    let fx = fixture(&["--mock-prompt-hang"]).await;
+
+    let s = fx.session.clone();
+    let turn = tokio::spawn(async move { s.prompt("stuck".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    tokio::time::timeout(Duration::from_secs(1), fx.session.cancel())
+        .await
+        .expect("cancel must not wait for the prompt RPC timeout")
+        .expect("abort must be accepted by pi");
+    assert_eq!(turn.await.unwrap().unwrap(), StopReason::Cancelled);
+
+    let commands = read_log(&fx.command_log);
+    assert!(
+        commands.iter().any(|command| command == "abort"),
+        "abort missing: {commands:?}"
     );
 }
 
@@ -823,6 +1046,71 @@ async fn unknown_events_do_not_break_the_turn() {
     assert_eq!(text_chunks(&recorded), vec!["still works".to_string()]);
 }
 
+/// pi-initiated `thinking_level_changed` pushes both selectors so Zed's mode
+/// picker and thinking dropdown follow (W-475).
+#[tokio::test]
+async fn thinking_level_changed_pushes_mode_and_config_updates() {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+    let fx = fixture(&[]).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({"type":"thinking_level_changed","level":"high"}),
+            json!({"type":"message_update","usage":{},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"ok"}}),
+        ],
+    );
+    assert_eq!(prompt_turn(&fx, "hi").await.unwrap(), StopReason::EndTurn);
+    wait_until(&fx, |rec| {
+        rec.iter()
+            .any(|r| matches!(r, Recorded::Notify(SessionUpdate::ConfigOptionUpdate(_))))
+    })
+    .await;
+    let recorded = fx.recorded.lock().await.clone();
+    assert!(
+        recorded.iter().any(|r| matches!(
+            r,
+            Recorded::Notify(SessionUpdate::CurrentModeUpdate(u))
+                if u.current_mode_id.0.as_ref() == "high"
+        )),
+        "mode picker must follow the pi-initiated change: {recorded:?}"
+    );
+    let update = recorded
+        .iter()
+        .rev()
+        .filter_map(|r| match r {
+            Recorded::Notify(SessionUpdate::ConfigOptionUpdate(u)) => Some(u),
+            _ => None,
+        })
+        .next()
+        .expect("config_option_update");
+    let thought = update
+        .config_options
+        .iter()
+        .find(|o| o.id.0.as_ref() == "thought_level")
+        .expect("thought_level option");
+    if let SessionConfigKind::Select(sel) = &thought.kind {
+        assert_eq!(sel.current_value.0.as_ref(), "high");
+        if let SessionConfigSelectOptions::Ungrouped(options) = &sel.options {
+            let ids: Vec<&str> = options.iter().map(|o| o.value.0.as_ref()).collect();
+            assert_eq!(
+                ids,
+                vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert!(
+                options
+                    .iter()
+                    .all(|o| !o.name.is_empty() && o.description.is_some()),
+                "every level needs a label + description for Zed"
+            );
+        } else {
+            panic!("thought_level options must be ungrouped");
+        }
+    } else {
+        panic!("thought_level option must be a select");
+    }
+}
+
 /// A dead pi fails the in-flight turn with `PiExited` instead of a silent
 /// empty end_turn (fixes #82). `--mock-exit-after 2` lets the mock answer the
 /// session handshake `get_state` (command 1) and die on the `prompt` (2).
@@ -834,6 +1122,162 @@ async fn pi_exit_fails_the_running_turn() {
     match result {
         Err(AcpxError::PiExited { code, .. }) => assert_eq!(code, Some(42)),
         other => panic!("expected PiExited, got {other:?}"),
+    }
+}
+
+/// After pi dies, **later** prompts on the same session also fail loudly with
+/// `PiExited` (code/signal + hint), never a silent empty end_turn and never a
+/// generic "session closed" that hides what happened (S8 / fixes #82).
+#[tokio::test]
+async fn dead_session_reports_pi_exit_on_subsequent_prompts() {
+    let fx = fixture(&["--mock-exit-after", "2"]).await;
+    write_scenario(&fx.scenarios, 1, &[json!({"type":"turn_start"})]);
+
+    // First prompt dies mid-flight (command 2 = the prompt).
+    match prompt_turn(&fx, "hello").await {
+        Err(AcpxError::PiExited { code, .. }) => assert_eq!(code, Some(42)),
+        other => panic!("expected PiExited, got {other:?}"),
+    }
+
+    // The pump has torn down; the session remembers the exit and surfaces it.
+    match prompt_turn(&fx, "again").await {
+        Err(AcpxError::PiExited { code, signal }) => {
+            assert_eq!(code, Some(42), "exit code must survive the teardown");
+            assert_eq!(signal, None);
+        }
+        other => panic!("expected PiExited on subsequent prompt, got {other:?}"),
+    }
+
+    // Non-prompt commands fail the same loud way.
+    match fx.session.get_state().await {
+        Err(AcpxError::PiExited { code, .. }) => assert_eq!(code, Some(42)),
+        other => panic!("expected PiExited from get_state, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settle fallback (design §11 risk #84)
+// ---------------------------------------------------------------------------
+
+/// pi accepts the prompt but never emits `agent_settled` (the mock's
+/// `--mock-no-settle`): the settle deadline must resolve the turn with an
+/// explicit `SettleTimeout` instead of hanging `session/prompt` forever — the
+/// per-request RPC timeout only bounds the early response, not the settle
+/// wait.
+#[tokio::test]
+async fn missing_agent_settled_resolves_with_settle_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scenarios = tmp.path().join("scenarios");
+    fs::create_dir_all(&scenarios).unwrap();
+    let (outbound_tx, outbound_rx) = mpsc::channel(512);
+    let (answer_tx, answer_rx) = mpsc::channel(16);
+    let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+    let rec = recorded.clone();
+    tokio::spawn(run_recorder(outbound_rx, rec, answer_rx));
+    let _ = answer_tx;
+
+    let session = PiAcpSession::spawn(SessionParams {
+        pi_command: BIN.to_string(),
+        extra_args: vec!["--mock-rpc".to_string(), "--mock-no-settle".to_string()],
+        timeout: TIMEOUT,
+        // Short deadline so the test runs fast; 0 would disable the fallback.
+        settle_timeout: Duration::from_millis(500),
+        cwd: tmp.path().to_path_buf(),
+        outbound: outbound_tx,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
+    })
+    .await
+    .expect("session spawn");
+
+    // The early prompt response is accepted (Ok) but no settle follows; the
+    // fallback must resolve the turn rather than hang.
+    let result = tokio::time::timeout(
+        TIMEOUT,
+        session.prompt("hello".to_string(), Vec::<ImageContent>::new()),
+    )
+    .await
+    .expect("prompt must resolve (settle fallback)");
+    match result {
+        Err(AcpxError::SettleTimeout { .. }) => {}
+        other => panic!("expected SettleTimeout, got {other:?}"),
+    }
+
+    // The session is still alive and disposable after the fallback fired.
+    session.dispose().await;
+}
+
+/// A settle timeout must resolve and discard prompts queued behind the stuck
+/// turn; later prompts are rejected until the session is recreated.
+#[tokio::test]
+async fn settle_timeout_fails_queue_and_poison_session() {
+    let fx = fixture_with_settle_timeout(&["--mock-no-settle"], Duration::from_millis(200)).await;
+
+    let s = fx.session.clone();
+    let first = tokio::spawn(async move { s.prompt("first".into(), vec![]).await });
+    wait_for_command(&fx, "prompt").await;
+
+    let s = fx.session.clone();
+    let second = tokio::spawn(async move { s.prompt("second".into(), vec![]).await });
+    wait_until(&fx, |recorded| {
+        text_chunks(recorded).contains(&"Queued message (position 1).".to_string())
+    })
+    .await;
+
+    let first_result = tokio::time::timeout(TIMEOUT, first)
+        .await
+        .expect("stuck prompt must resolve")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(first_result, AcpxError::SettleTimeout { .. }));
+
+    let second_result = tokio::time::timeout(TIMEOUT, second)
+        .await
+        .expect("queued prompt must resolve after settle timeout")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(second_result, AcpxError::SessionClosed(_)));
+
+    let later = fx.session.prompt("later".into(), vec![]).await.unwrap_err();
+    assert!(matches!(later, AcpxError::SessionClosed(_)));
+    fx.session.dispose().await;
+}
+
+/// Restoring a file under one ACP id must fail when pi reports a different
+/// native id, and the rejected spawn must not leave its mock child running.
+#[tokio::test]
+async fn session_id_override_mismatch_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_file = tmp.path().join("native.jsonl");
+    let header = json!({
+        "type": "session",
+        "id": "native-session-id",
+        "cwd": tmp.path().to_string_lossy(),
+    });
+    fs::write(&session_file, format!("{header}\n")).unwrap();
+    let (outbound_tx, _outbound_rx) = mpsc::channel(16);
+
+    let result = PiAcpSession::spawn(SessionParams {
+        pi_command: BIN.to_string(),
+        extra_args: vec!["--mock-rpc".to_string()],
+        timeout: TIMEOUT,
+        settle_timeout: Duration::ZERO,
+        cwd: tmp.path().to_path_buf(),
+        outbound: outbound_tx,
+        session_path: Some(session_file),
+        session_id_override: Some("requested-session-id".into()),
+        file_commands: vec![],
+    })
+    .await;
+
+    match result {
+        Err(AcpxError::SessionIdMismatch { expected, actual }) => {
+            assert_eq!(expected, "requested-session-id");
+            assert_eq!(actual, "native-session-id");
+        }
+        Ok(_) => panic!("mismatched native session id must be rejected"),
+        Err(other) => panic!("expected SessionIdMismatch, got {other:?}"),
     }
 }
 
@@ -853,8 +1297,12 @@ async fn session_manager_registers_and_disposes_sessions() {
         pi_command: BIN.to_string(),
         extra_args: vec!["--mock-rpc".to_string()],
         timeout: TIMEOUT,
+        settle_timeout: Duration::ZERO,
         cwd: tmp.path().to_path_buf(),
         outbound: outbound_tx,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
     })
     .await
     .unwrap();
@@ -870,4 +1318,46 @@ async fn session_manager_registers_and_disposes_sessions() {
     // The session is gone: a prompt fails explicitly instead of hanging.
     let err = session.prompt("hi".into(), vec![]).await.unwrap_err();
     assert!(matches!(err, AcpxError::SessionClosed(_)), "got {err:?}");
+}
+
+/// Replacing an existing session id must dispose the old process without
+/// leaving the manager pointing at a dead instance. The mock intentionally
+/// returns the same id for every spawn, matching the collision this guards.
+#[tokio::test]
+async fn session_manager_replacement_disposes_previous_instance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (first_outbound, _first_receiver) = mpsc::channel(64);
+    let (second_outbound, _second_receiver) = mpsc::channel(64);
+    let manager = SessionManager::new();
+
+    let params = |outbound| SessionParams {
+        pi_command: BIN.to_string(),
+        extra_args: vec!["--mock-rpc".to_string()],
+        timeout: TIMEOUT,
+        settle_timeout: Duration::ZERO,
+        cwd: tmp.path().to_path_buf(),
+        outbound,
+        session_path: None,
+        session_id_override: None,
+        file_commands: vec![],
+    };
+    let first = PiAcpSession::spawn(params(first_outbound)).await.unwrap();
+    let session_id = first.session_id().clone();
+    manager.insert(first.clone()).await;
+
+    let second = PiAcpSession::spawn(params(second_outbound)).await.unwrap();
+    manager.insert(second.clone()).await;
+
+    let current = manager.maybe_get(&session_id).await.unwrap();
+    assert!(Arc::ptr_eq(&current, &second));
+    assert!(matches!(
+        first.prompt("old".into(), vec![]).await,
+        Err(AcpxError::SessionClosed(_))
+    ));
+    assert_eq!(
+        second.get_state().await.unwrap().session_id,
+        "mock-session-id"
+    );
+
+    manager.dispose_all().await;
 }

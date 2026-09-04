@@ -5,9 +5,19 @@
 //! - `PI_ACP_ENABLE_EMBEDDED_CONTEXT` — advertise ACP `embeddedContext` support (`true` to enable).
 //! - `PI_ACP_VERSION_CHECK` — enable the startup update notice (default: **off**, decision 2).
 //! - `PI_ACP_RPC_TIMEOUT_SECS` — per-request pi RPC deadline (default `30`).
+//! - `PI_ACP_SETTLE_TIMEOUT_SECS` — deadline for a turn's `agent_settled`
+//!   after pi accepts the prompt (default `600`; `0` disables — design §11
+//!   risk #84 mitigation).
 
 /// Default per-request pi RPC deadline in seconds (design D2).
 pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
+
+/// Default settle deadline for a turn's `agent_settled` in seconds (design
+/// §11 risk #84 mitigation): a pi that accepts a prompt but never settles
+/// (e.g. an extension slash command that never enters the agent loop) must
+/// not hang `session/prompt` forever. Generous enough to never fire on
+/// legitimate long turns; `PI_ACP_SETTLE_TIMEOUT_SECS=0` opts out.
+pub const DEFAULT_SETTLE_TIMEOUT_SECS: u64 = 600;
 
 /// Resolved runtime configuration.
 #[derive(Debug, Clone)]
@@ -20,6 +30,9 @@ pub struct Config {
     pub enable_version_check: bool,
     /// Per-request pi RPC deadline in seconds.
     pub rpc_timeout_secs: u64,
+    /// Deadline for a turn's `agent_settled` after pi accepts the prompt
+    /// (seconds; `0` disables — design §11 risk #84 mitigation).
+    pub settle_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -29,6 +42,7 @@ impl Default for Config {
             enable_embedded_context: false,
             enable_version_check: false,
             rpc_timeout_secs: DEFAULT_RPC_TIMEOUT_SECS,
+            settle_timeout_secs: DEFAULT_SETTLE_TIMEOUT_SECS,
         }
     }
 }
@@ -59,6 +73,11 @@ impl Config {
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_RPC_TIMEOUT_SECS);
 
+        cfg.settle_timeout_secs = std::env::var("PI_ACP_SETTLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SETTLE_TIMEOUT_SECS);
+
         cfg
     }
 }
@@ -75,5 +94,7 @@ mod tests {
         // Decision 2: version check is off by default.
         assert!(!cfg.enable_version_check);
         assert_eq!(cfg.rpc_timeout_secs, DEFAULT_RPC_TIMEOUT_SECS);
+        // Settle fallback is on by default with a generous bound (0 = off).
+        assert_eq!(cfg.settle_timeout_secs, DEFAULT_SETTLE_TIMEOUT_SECS);
     }
 }

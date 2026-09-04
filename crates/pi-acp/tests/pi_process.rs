@@ -10,6 +10,7 @@
 //! Acceptance per W-450: normal request/response / timeout / child mid-exit /
 //! prelude / `agent_settled`; no panics.
 
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,26 @@ async fn spawn_mock(extra: &[&str]) -> PiProcess {
     PiProcess::spawn_with_args(BIN, &args, None, FAST_TIMEOUT)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn spawn_in_dir_sets_pi_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd_log = tmp.path().join("cwd.log");
+    let mut pi = PiProcess::spawn_with_args_in_dir(
+        BIN,
+        &["--mock-rpc", "--mock-cwd-log", cwd_log.to_str().unwrap()],
+        None,
+        tmp.path(),
+        FAST_TIMEOUT,
+    )
+    .await
+    .unwrap();
+
+    pi.get_state().await.unwrap();
+    let reported = fs::canonicalize(fs::read_to_string(cwd_log).unwrap().trim()).unwrap();
+    assert_eq!(reported, fs::canonicalize(tmp.path()).unwrap());
+    pi.dispose().await;
 }
 
 /// Normal request/response round-trip with typed `get_state` payload.
@@ -63,9 +84,16 @@ async fn typed_wrappers_parse_payloads() {
     assert_eq!(state.session_id, "mock-session-id");
 
     let models = pi.get_available_models().await.unwrap();
-    assert_eq!(models.len(), 1);
+    assert_eq!(models.len(), 3);
     assert_eq!(models[0].id, "mock-model");
     assert_eq!(models[0].provider, "mock");
+    assert_eq!(models[1].id, "mock-fast");
+    assert_eq!(models[1].context_window, Some(8000));
+    // `mock-limited` carries a restricted `thinkingLevelMap` for the
+    // per-model dynamic selector tests (W-478).
+    assert_eq!(models[2].id, "mock-limited");
+    assert!(models[2].reasoning);
+    assert!(models[2].thinking_level_map.is_some());
 
     let path = pi.export_html(None).await.unwrap();
     assert_eq!(path, "/tmp/mock.html");

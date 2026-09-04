@@ -12,62 +12,157 @@
 //! under tokio (design D9 / §5.3).
 
 use anyhow::Result;
-use pi_acp::agent;
+use pi_acp::agent::AcpAgent;
 use pi_acp::config::Config;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::signal;
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Keep short-lived probes from creating a Tokio worker pool. These paths
+    // are used during every session handshake, so starting the runtime first
+    // needlessly raises the process/thread peak when pi is itself pi-acp.
+    if args.iter().any(|a| a == "--terminal-login") {
+        return terminal_login();
+    }
+    if args.iter().any(|a| a == "--version") {
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // The in-process mock is deliberately single-threaded. ACP integration
+    // tests nest a mock pi inside the adapter, and the mock only performs
+    // sequential stdin/stdout work; an extra worker pool needlessly raises
+    // the process/thread peak on Unix runners.
+    if is_mock_mode(&args) {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_mock_rpc());
+    }
+
+    // The adapter-side ACP fixture also sets `PI_ACP_MOCK`, even though it
+    // does not carry the `--mode` marker. Keep those short-lived test
+    // processes single-threaded too, so adjacent fixtures can be torn down
+    // without exhausting Unix runner process resources.
+    if std::env::var_os("PI_ACP_MOCK").is_some() {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async_main());
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+fn is_mock_mode(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--mock-rpc")
+        || (std::env::var_os("PI_ACP_MOCK").is_some() && args.iter().any(|a| a == "--mode"))
+}
+
+async fn async_main() -> Result<()> {
     // Structured logging (env-filter driven, e.g. RUST_LOG=pi_acp=debug).
+    // Logs go to stderr: stdout carries the ACP JSONL stream and any stray
+    // line breaks strict clients' framing (W-479 P1).
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .try_init();
 
-    if std::env::args().skip(1).any(|a| a == "--terminal-login") {
-        return terminal_login();
-    }
-
-    // Hidden test fixture (see tests/pi_process.rs): a mock `pi --mode rpc`
-    // server so the RPC client can be tested without a real pi + LLM backend.
-    if std::env::args().skip(1).any(|a| a == "--mock-rpc") {
-        return run_mock_rpc().await;
-    }
-
     let cfg = Config::from_env();
     tracing::info!(pi_command = %cfg.pi_command, "pi-acp (Rust) starting");
-    agent::run()
-        .await
-        .map_err(|e| anyhow::anyhow!("ACP error: {e:?}"))?;
+    let agent = Arc::new(AcpAgent::new(cfg));
+    tokio::select! {
+        result = agent.run() => {
+            result.map_err(|e| anyhow::anyhow!("ACP error: {e:?}"))?;
+        }
+        // Graceful shutdown on SIGINT/SIGTERM (design §8.3): the pi subprocess
+        // runs in its own process group, so a terminal Ctrl+C / `kill` on
+        // pi-acp never reaches it — dispose every session explicitly so no pi
+        // is orphaned. Without this branch the default signal disposition
+        // would kill the process mid-session.
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; disposing pi sessions");
+            let shutdown = agent.shutdown();
+            // Bound the graceful teardown: a pi that ignores SIGTERM must not
+            // block exit forever (PiProcess::dispose escalates to SIGKILL, but
+            // only after its own grace window).
+            tokio::select! {
+                _ = shutdown => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    tracing::warn!("graceful shutdown exceeded 10s; exiting anyway");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-/// Launch `pi` with inherited stdio for interactive login/setup.
+/// Wait for SIGINT (Ctrl+C) or SIGTERM — the graceful-shutdown trigger
+/// (design §8.3). Unix handles both; other platforms get Ctrl+C only.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
+}
+
+/// Launch `pi` with inherited stdio for interactive login/setup (ACP Terminal
+/// Auth, §6.3): spawn `pi` without any RPC flags so the user can configure API
+/// keys / OAuth in the interactive TUI, and propagate its exit code. A missing
+/// `pi` binary surfaces a clear install hint.
 fn terminal_login() -> Result<()> {
     let cfg = Config::from_env();
     let pi_command = cfg.pi_command.clone();
     tracing::info!(pi_command, "launching pi for terminal login");
 
-    // TODO(S3, W-450): spawn `pi` (inherited stdio) and propagate its exit code;
-    // surface a clear "install pi" message on ENOENT.
-    eprintln!(
-        "pi-acp (Rust): --terminal-login not yet wired (scaffold). Would launch: {pi_command}"
-    );
-    Ok(())
+    // Resolve for the Windows `pi.cmd` wrapper (fixes pi-acp #27): a bare `pi`
+    // expands to the npm global and is launched via `cmd.exe /d /s /c`.
+    let resolved = pi_acp::pi::resolve::resolve_current_env(&pi_command);
+    let status = std::process::Command::new(&resolved.program)
+        .args(&resolved.cmd_args)
+        .status()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to launch `{pi_command}` (resolved to {}) for terminal login: {e}. \n\
+                 Is pi installed? Install it with `npm i -g @earendil-works/pi-coding-agent` \n\
+                 or set PI_ACP_PI_COMMAND (on Windows this is the npm global `pi.cmd`).",
+                resolved.program
+            )
+        })?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Test-only mock `pi --mode rpc` server.
 ///
 /// Hidden fixture behind `--mock-rpc` (spawned by `tests/pi_process.rs` and
-/// `tests/session.rs`): speaks the same JSONL protocol as pi so
-/// [`pi_acp::pi::process::PiProcess`] and the session state machine can be
-/// exercised without a real pi + LLM backend. All other args (`--mode rpc
-/// --no-themes --session <path>`) are ignored.
+/// `tests/session.rs`) or the `PI_ACP_MOCK=1` env var (spawned by the ACP e2e
+/// tests, which cannot pass argv to the inner pi): speaks the same JSONL
+/// protocol as pi so [`pi_acp::pi::process::PiProcess`], the session state
+/// machine, and the ACP agent (S6) can be exercised without a real pi + LLM
+/// backend. All other args (`--mode rpc --no-themes --session <path>`) are
+/// ignored.
 ///
 /// Behavior flags (any combination):
 /// - `--mock-prelude <n>`   emit `n` ANSI-styled human-readable lines before NDJSON
@@ -76,8 +171,9 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-delay-ms <n>`  delay each response by `n` ms (concurrency tests)
 /// - `--mock-unknown-event` emit one unknown event type (protocol-evolution guard)
 /// - `--mock-scenario <dir>` per-prompt event replay from `<dir>/<n>.jsonl`
-///   (`n` = 1-based prompt ordinal). Each line is a JSON event emitted after
-///   the prompt response; `{"__directive__":"write_file",...}` /
+///   (`n` = 1-based prompt ordinal; also settable via `PI_ACP_MOCK_SCENARIO` so
+///   the ACP e2e can configure it without argv). Each line is a JSON event
+///   emitted after the prompt response; `{"__directive__":"write_file",...}` /
 ///   `{"__directive__":"delete_file",...}` lines mutate the filesystem
 ///   instead of emitting. `agent_settled` is auto-appended unless the file
 ///   already contains one or `--mock-no-settle` is set.
@@ -85,14 +181,28 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-event-delay-ms <n>` sleep `n` ms before each scenario event
 /// - `--mock-command-log <path>`  append each received command type
 /// - `--mock-extension-log <path>` append each received `extension_ui_response`
+/// - `--mock-cwd-log <path>`      write the mock's startup cwd
+/// - `--mock-prompt-error <text>`   answer `prompt` with `success:false` and this
+///   error text (auth/error-surfacing tests)
+/// - `--mock-prompt-hang`          accept/read `prompt` but withhold its response;
+///   a later `abort` is still processed (cancel race tests)
+/// - `--mock-prompt-response-after-events-ms <n>` delay each successful prompt
+///   response until its scenario events have been emitted (channel-order tests)
+/// - `--mock-models-error <text>`   answer `get_available_models` with
+///   `success:false` and this error text (authRequired-on-new tests)
+/// - `PI_ACP_MOCK_SESSION_FILE`     session file path for a new mock session;
+///   the mock writes a valid session header after the first successful prompt
 ///
 /// Default: respond `success: true` to every command (with a fixed `get_state`
 /// payload), and after a `prompt` command emit a `text_delta` message_update
-/// followed by `agent_settled` (mirroring pi's early-response + settled-event
-/// semantics, S2 constraint 2). After an `abort`, emit `agent_settled` (pi
-/// settles once the aborted turn unwinds).
+/// with an empty usage snapshot, the final assistant `message_end` with token
+/// usage, and then `agent_settled` (mirroring pi's early-response + settled-
+/// event semantics, S2 constraint 2). After an `abort`, emit `agent_settled`
+/// (pi settles once the aborted turn unwinds).
 async fn run_mock_rpc() -> Result<()> {
     use std::path::PathBuf;
+
+    let env_scenario = std::env::var_os("PI_ACP_MOCK_SCENARIO").map(PathBuf::from);
 
     let mut prelude = 0usize;
     let mut hang = false;
@@ -104,7 +214,22 @@ async fn run_mock_rpc() -> Result<()> {
     let mut event_delay_ms: u64 = 0;
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
+    let mut cwd_log: Option<PathBuf> = None;
+    let mut prompt_error: Option<String> = None;
+    let mut prompt_hang = false;
+    let mut prompt_response_after_events_ms: u64 = 0;
+    let mut models_error: Option<String> = None;
+    let env_session_file = std::env::var_os("PI_ACP_MOCK_SESSION_FILE").map(PathBuf::from);
+    let mut session_arg: Option<PathBuf> = None;
     let mut prompt_count: usize = 0;
+    // Stateful mock: real pi keeps these across RPC calls, and the agent's
+    // config-option / slash-command handlers read them back via get_state.
+    let mut mock_thinking_level = "medium".to_string();
+    let mut mock_model = "mock-model".to_string();
+    let mut mock_auto_compaction = false;
+    let mut mock_steering_mode = "one-at-a-time".to_string();
+    let mut mock_follow_up_mode = "one-at-a-time".to_string();
+    let mut mock_session_name = "Mock Session".to_string();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -122,7 +247,49 @@ async fn run_mock_rpc() -> Result<()> {
             }
             "--mock-command-log" => command_log = args.next().map(PathBuf::from),
             "--mock-extension-log" => extension_log = args.next().map(PathBuf::from),
+            "--mock-cwd-log" => cwd_log = args.next().map(PathBuf::from),
+            "--mock-prompt-error" => prompt_error = args.next(),
+            "--mock-prompt-hang" => prompt_hang = true,
+            "--mock-prompt-response-after-events-ms" => {
+                prompt_response_after_events_ms =
+                    args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
+            "--mock-models-error" => models_error = args.next(),
+            "--session" => session_arg = args.next().map(PathBuf::from),
             _ => {}
+        }
+    }
+    if scenario_dir.is_none() {
+        scenario_dir = env_scenario;
+    }
+    if command_log.is_none() {
+        command_log = std::env::var_os("PI_ACP_MOCK_COMMAND_LOG").map(PathBuf::from);
+    }
+    if prompt_error.is_none() {
+        prompt_error = std::env::var("PI_ACP_MOCK_PROMPT_ERROR").ok();
+    }
+    if models_error.is_none() {
+        models_error = std::env::var("PI_ACP_MOCK_MODELS_ERROR").ok();
+    }
+    if exit_after.is_none() {
+        exit_after = std::env::var("PI_ACP_MOCK_EXIT_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok());
+    }
+
+    let mock_session_file = session_arg
+        .clone()
+        .or_else(|| env_session_file.clone())
+        .unwrap_or_else(|| PathBuf::from("/tmp/mock-session.jsonl"));
+    let mock_session_id = session_arg
+        .as_deref()
+        .and_then(read_mock_session_id)
+        .unwrap_or_else(|| "mock-session-id".to_string());
+    let persist_new_session = session_arg.is_none() && env_session_file.is_some();
+
+    if let Some(log) = &cwd_log {
+        if let Ok(cwd) = std::env::current_dir() {
+            append_log(log, &cwd.to_string_lossy());
         }
     }
 
@@ -188,6 +355,14 @@ async fn run_mock_rpc() -> Result<()> {
             append_log(log, ty);
         }
 
+        // Keep reading after a prompt without producing its early response so
+        // the client can prove that cancellation does not wait on the prompt
+        // request's ownership guard. The abort branch below still settles it.
+        if prompt_hang && ty == "prompt" {
+            handled += 1;
+            continue;
+        }
+
         // Fire-and-forget extension answers: pi matches these by the request's
         // own id; record them and emit no response.
         if ty == "extension_ui_response" {
@@ -203,30 +378,118 @@ async fn run_mock_rpc() -> Result<()> {
 
         let data = match ty {
             "get_state" => serde_json::json!({
-                "model": {"id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
-                "thinkingLevel": "medium",
+                "model": mock_model_definition(&mock_model),
+                "thinkingLevel": mock_thinking_level,
                 "isStreaming": false,
                 "isCompacting": false,
-                "steeringMode": "one-at-a-time",
-                "followUpMode": "one-at-a-time",
-                "sessionFile": "/tmp/mock-session.jsonl",
-                "sessionId": "mock-session-id",
-                "sessionName": "Mock Session",
-                "autoCompactionEnabled": false,
-                "messageCount": 0,
+                "steeringMode": mock_steering_mode,
+                "followUpMode": mock_follow_up_mode,
+                "sessionFile": mock_session_file.to_string_lossy(),
+                "sessionId": mock_session_id,
+                "sessionName": mock_session_name,
+                "autoCompactionEnabled": mock_auto_compaction,
+                "messageCount": 3,
                 "pendingMessageCount": 0
             }),
             "get_available_models" => serde_json::json!({
                 "models": [
-                    {"id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100}
+                    mock_model_definition("mock-model"),
+                    mock_model_definition("mock-fast"),
+                    mock_model_definition("mock-limited")
                 ]
             }),
+            // Native per-model levels (pi `AgentSession.getAvailableThinkingLevels`).
+            "get_available_thinking_levels" => serde_json::json!({
+                "levels": mock_supported_levels(&mock_model)
+            }),
             "export_html" => serde_json::json!({"path": "/tmp/mock.html"}),
-            "set_model" => serde_json::json!({
-                "id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false
+            "set_model" => command
+                .get("modelId")
+                .and_then(serde_json::Value::as_str)
+                .map(mock_model_definition)
+                .unwrap_or_else(|| mock_model_definition(&mock_model)),
+            "compact" => serde_json::json!({
+                "tokensBefore": 1500,
+                "summary": "The conversation was summarized."
+            }),
+            "get_session_stats" => serde_json::json!({
+                "sessionId": mock_session_id,
+                "sessionFile": mock_session_file.to_string_lossy(),
+                "totalMessages": 3,
+                "cost": 0.0123,
+                "tokens": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "total": 165}
+            }),
+            "get_commands" => serde_json::json!({
+                "commands": [
+                    {"name": "review", "description": "Review the current diff", "source": "prompt"},
+                    {"name": "skill:deploy", "description": "Deploy to staging", "source": "skill"},
+                    {"name": "ext-thing", "description": "An extension command", "source": "extension"}
+                ]
+            }),
+            "get_messages" => serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "hello there"},
+                    {"role": "assistant", "content": [{"type": "text", "text": "hi! how can I help?"}]},
+                    {"role": "toolResult", "toolName": "bash", "toolCallId": "bash-1", "isError": false, "command": "ls", "content": {"stdout": "a.txt\nb.txt\n", "exitCode": 0}, "details": {}},
+                    {"role": "toolResult", "toolName": "read", "toolCallId": "read-1", "isError": false, "content": {"output": "file contents", "exitCode": 0}, "details": {"path": "a.txt"}}
+                ]
             }),
             _ => serde_json::Value::Null,
         };
+
+        // Apply stateful mutations (real pi persists these; the agent reads
+        // them back via get_state for configOptions / slash-command displays).
+        // Mirror pi: thinking changes clamp to the model's levels and only
+        // emit `thinking_level_changed` when the effective level moves.
+        let mut thinking_event: Option<serde_json::Value> = None;
+        match ty {
+            "set_thinking_level" => {
+                if let Some(l) = command.get("level").and_then(serde_json::Value::as_str) {
+                    let effective = mock_clamp_level(&mock_model, l);
+                    if effective != mock_thinking_level {
+                        mock_thinking_level = effective.clone();
+                        thinking_event = Some(serde_json::json!({
+                            "type": "thinking_level_changed", "level": effective
+                        }));
+                    }
+                }
+            }
+            "set_model" => {
+                if let Some(m) = command.get("modelId").and_then(serde_json::Value::as_str) {
+                    mock_model = m.to_string();
+                }
+                // pi re-resolves + clamps thinking on a model switch.
+                let effective = mock_clamp_level(&mock_model, &mock_thinking_level.clone());
+                if effective != mock_thinking_level {
+                    mock_thinking_level = effective.clone();
+                    thinking_event = Some(serde_json::json!({
+                        "type": "thinking_level_changed", "level": effective
+                    }));
+                }
+            }
+            "set_auto_compaction" => {
+                mock_auto_compaction = command
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            }
+            "set_steering_mode" => {
+                if let Some(m) = command.get("mode").and_then(serde_json::Value::as_str) {
+                    mock_steering_mode = m.to_string();
+                }
+            }
+            "set_follow_up_mode" => {
+                if let Some(m) = command.get("mode").and_then(serde_json::Value::as_str) {
+                    mock_follow_up_mode = m.to_string();
+                }
+            }
+            "set_session_name" => {
+                if let Some(n) = command.get("name").and_then(serde_json::Value::as_str) {
+                    mock_session_name = n.to_string();
+                }
+            }
+            _ => {}
+        }
 
         let mut response = serde_json::json!({
             "id": id,
@@ -234,15 +497,46 @@ async fn run_mock_rpc() -> Result<()> {
             "command": ty,
             "success": true,
         });
-        if !data.is_null() {
+        // Error injection: `success:false` responses with the configured text
+        // (auth / error-surfacing tests).
+        let (success, error) = match ty {
+            "prompt" => (prompt_error.is_none(), prompt_error.clone()),
+            "get_available_models" => (models_error.is_none(), models_error.clone()),
+            _ => (true, None),
+        };
+        response["success"] = serde_json::Value::Bool(success);
+        if let Some(e) = error {
+            response["error"] = serde_json::Value::String(e);
+        } else if !data.is_null() {
             response["data"] = data;
         }
-        mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
+        let delay_prompt_response =
+            success && ty == "prompt" && prompt_response_after_events_ms > 0;
+        if !delay_prompt_response {
+            mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
+        }
         handled += 1;
+
+        // Mirror pi: `setSessionName` emits `session_info_changed` on the event
+        // stream (pi-agent-core `AgentSessionEvent`), which the adapter
+        // forwards as ACP `session_info_update` (live thread title, #102/#24).
+        if success && ty == "set_session_name" {
+            let event =
+                serde_json::json!({ "type": "session_info_changed", "name": mock_session_name });
+            mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
+        }
+
+        // Mirror pi: a thinking change that moves the effective level emits
+        // `thinking_level_changed` (W-478 clamp parity).
+        if success {
+            if let Some(event) = thinking_event {
+                mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
+            }
+        }
 
         // Mirror pi: the prompt response arrives early; the streaming events
         // and the real turn-completion signal (`agent_settled`) follow after.
-        if ty == "prompt" {
+        if success && ty == "prompt" {
             prompt_count += 1;
             if let Some(dir) = &scenario_dir {
                 let scenario = dir.join(format!("{prompt_count}.jsonl"));
@@ -258,27 +552,147 @@ async fn run_mock_rpc() -> Result<()> {
                     )
                     .await?;
                 } else if !no_settle {
-                    mock_write_line(&mut stdout, b"{\"type\":\"agent_settled\"}").await?;
+                    emit_default_prompt_response(&mut stdout).await?;
                 }
             } else if !no_settle {
-                let update = serde_json::json!({
-                    "type": "message_update",
-                    "usage": {},
-                    "assistantMessageEvent": {
-                        "type": "text_delta",
-                        "contentIndex": 0,
-                        "delta": "hello from mock"
-                    }
-                });
-                mock_write_line(&mut stdout, update.to_string().as_bytes()).await?;
-                mock_write_line(&mut stdout, b"{\"type\":\"agent_settled\"}").await?;
+                emit_default_prompt_response(&mut stdout).await?;
             }
-        } else if ty == "abort" {
+            if delay_prompt_response {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    prompt_response_after_events_ms,
+                ))
+                .await;
+                mock_write_line(&mut stdout, response.to_string().as_bytes()).await?;
+            }
+            if persist_new_session {
+                persist_mock_session_file(&mock_session_file, &mock_session_id)?;
+            }
+        } else if success && ty == "abort" {
             // pi settles once an aborted turn unwinds.
             mock_write_line(&mut stdout, b"{\"type\":\"agent_settled\"}").await?;
         }
     }
 
+    Ok(())
+}
+
+/// Mock model definition for `get_state` / `get_available_models` /
+/// `set_model` responses. `mock-model` + `mock-fast` advertise the full pi
+/// thinking ladder; `mock-limited` only supports a subset (no `minimal`,
+/// `xhigh`, `max`) so tests can prove the per-model dynamic selector
+/// (W-478). Shapes mirror real pi payloads (`thinkingLevelMap` included).
+fn mock_model_definition(id: &str) -> serde_json::Value {
+    match id {
+        "mock-limited" => serde_json::json!({
+            "id": "mock-limited", "name": "Mock Limited", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "low": "low", "medium": "medium", "high": "high"},
+            "contextWindow": 4000, "maxTokens": 100
+        }),
+        "mock-fast" => serde_json::json!({
+            "id": "mock-fast", "name": "Mock Fast", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+            "contextWindow": 8000, "maxTokens": 100
+        }),
+        _ => serde_json::json!({
+            "id": "mock-model", "name": "Mock Model", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+            "contextWindow": 1000, "maxTokens": 100
+        }),
+    }
+}
+
+/// Native per-model thinking levels for the mock (`getSupportedThinkingLevels`
+/// parity: `null`/missing entries exclude `xhigh`/`max`; a `null` entry
+/// excludes its level everywhere). Unknown model ids get the full ladder.
+fn mock_supported_levels(id: &str) -> Vec<&'static str> {
+    match id {
+        "mock-limited" => vec!["off", "low", "medium", "high"],
+        _ => vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    }
+}
+
+/// Clamp a requested level to the mock model's levels (pi-ai
+/// `clampThinkingLevel` parity: exact hit, else nearest higher, else nearest
+/// lower). Unknown levels fall back to the first supported level.
+fn mock_clamp_level(id: &str, level: &str) -> String {
+    const LADDER: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let supported = mock_supported_levels(id);
+    if supported.contains(&level) {
+        return level.to_string();
+    }
+    let requested = LADDER.iter().position(|l| *l == level);
+    if let Some(i) = requested {
+        if let Some(up) = LADDER.iter().skip(i + 1).find(|l| supported.contains(*l)) {
+            return up.to_string();
+        }
+        if let Some(down) = LADDER[..i].iter().rev().find(|l| supported.contains(*l)) {
+            return down.to_string();
+        }
+    }
+    supported.first().unwrap_or(&"off").to_string()
+}
+
+/// Read the native id from a persisted pi session header. A missing or
+/// malformed file intentionally falls back to the default mock id, which lets
+/// restore tests exercise the adapter's mismatch check.
+fn read_mock_session_id(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let first = raw.lines().next()?.trim();
+    let value: serde_json::Value = serde_json::from_str(first).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session") {
+        return None;
+    }
+    let id = value.get("id").and_then(serde_json::Value::as_str)?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Simulate pi flushing a new session after its first successful turn. The
+/// caller can still use a scenario directive to provide richer file content;
+/// an existing file is therefore left untouched.
+fn persist_mock_session_file(path: &Path, session_id: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cwd = std::env::current_dir()?;
+    let header = serde_json::json!({
+        "type": "session",
+        "id": session_id,
+        "cwd": cwd.to_string_lossy(),
+    });
+    std::fs::write(path, format!("{header}\n"))?;
+    Ok(())
+}
+
+/// The default post-prompt event sequence: a `text_delta` message_update with
+/// an empty usage snapshot, the final assistant `message_end` with token
+/// usage, and `agent_settled`.
+async fn emit_default_prompt_response(stdout: &mut tokio::io::Stdout) -> Result<()> {
+    let update = serde_json::json!({
+        "type": "message_update",
+        "usage": {},
+        "assistantMessageEvent": {
+            "type": "text_delta",
+            "contentIndex": 0,
+            "delta": "hello from mock"
+        }
+    });
+    mock_write_line(stdout, update.to_string().as_bytes()).await?;
+    let end = serde_json::json!({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello from mock"}],
+            "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15}
+        }
+    });
+    mock_write_line(stdout, end.to_string().as_bytes()).await?;
+    mock_write_line(stdout, b"{\"type\":\"agent_settled\"}").await?;
     Ok(())
 }
 

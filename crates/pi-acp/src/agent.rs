@@ -301,7 +301,17 @@ impl AcpAgent {
                     cx.spawn(async move {
                         let result = agent.handle_prompt(&req, &cx_for_task).await;
                         match result {
-                            Ok(resp) => responder.respond(resp),
+                            Ok((resp, persisted)) => {
+                                let answered = responder.respond(resp);
+                                // Persist after the response is queued: the
+                                // session-map write (+ its `get_state`
+                                // round-trip) must not hold up prompt latency
+                                // (W-479 P1). Failures stay best-effort inside.
+                                if let Some(session) = persisted {
+                                    agent.persist_session_if_ready(&session).await;
+                                }
+                                answered
+                            }
                             Err(e) => responder.respond_with_error(e),
                         }
                     })?;
@@ -715,11 +725,15 @@ impl AcpAgent {
     // session/prompt
     // -----------------------------------------------------------------------
 
+    /// Run one prompt turn. Returns the response plus the session to persist
+    /// (`None` for headless built-in commands, which never persist — same as
+    /// before); the caller persists *after* queueing the response so the
+    /// map write stays off prompt latency (W-479 P1).
     async fn handle_prompt(
         &self,
         req: &PromptRequest,
         cx: &ConnectionTo<Client>,
-    ) -> std::result::Result<PromptResponse, AcpError> {
+    ) -> std::result::Result<(PromptResponse, Option<Arc<PiAcpSession>>), AcpError> {
         let session = self.restore_session(&req.session_id, None, cx).await?;
         let session_id = session.session_id().clone();
 
@@ -732,7 +746,7 @@ impl AcpAgent {
                 .handle_builtin_command(cx, &session, &session_id, &pi_prompt.message)
                 .await?
             {
-                return Ok(resp);
+                return Ok((resp, None));
             }
         }
 
@@ -756,10 +770,9 @@ impl AcpAgent {
             .prompt(pi_prompt.message, to_pi_images(pi_prompt.images))
             .await
             .map_err(acp_error_from_pi)?;
-        self.persist_session_if_ready(&session).await;
         let stop_reason = acp_stop_reason(reason);
         tracing::info!(session = %session_id, ?stop_reason, "prompt turn settled");
-        Ok(PromptResponse::new(stop_reason))
+        Ok((PromptResponse::new(stop_reason), Some(session)))
     }
 
     async fn handle_cancel(&self, notif: &CancelNotification) {

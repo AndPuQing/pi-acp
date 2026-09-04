@@ -83,6 +83,30 @@ pub enum StopReason {
 /// reported loudly on every later command (S8 / #82).
 type PiExitStatus = Option<(Option<i32>, Option<i32>)>;
 
+/// How long after our own thinking/model set a `thinking_level_changed` event
+/// counts as that set's echo (W-479 P1). The echoing event follows the set
+/// response by milliseconds; 2s is generous headroom for loaded runners while
+/// keeping genuinely pi-initiated later changes on the full-refresh path.
+const THINKING_SET_ECHO_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether a `thinking_level_changed` event observed at `now` is the echo of
+/// our own set at `last_set` (pure predicate for the pump's echo suppression).
+fn thinking_event_is_echo(last_set: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_set.is_some_and(|t| now.saturating_duration_since(t) <= THINKING_SET_ECHO_WINDOW)
+}
+
+/// Clear a thinking-set stamp recorded before a failed set — but only when it
+/// is still ours, so a concurrent newer set's stamp is never wiped.
+fn clear_thinking_stamp(
+    slot: &Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    stamp: std::time::Instant,
+) {
+    let mut guard = slot.lock().unwrap();
+    if guard.as_ref() == Some(&stamp) {
+        *guard = None;
+    }
+}
+
 /// Outbound ACP messages produced by the session pump.
 ///
 /// Everything the session sends to the ACP client travels this single ordered
@@ -162,6 +186,13 @@ pub struct PiAcpSession {
     /// round-trip on the session/new critical path). Later reads use the
     /// live [`PiAcpSession::get_state`] RPC.
     initial_state: RpcSessionState,
+    /// When our own `set_thinking_level` / `set_model` last succeeded.
+    /// A `thinking_level_changed` event arriving inside
+    /// [`THINKING_SET_ECHO_WINDOW`] is that set's echo: the agent's explicit
+    /// config refresh (which runs right after the set) already re-read the
+    /// same post-set state, so the pump skips its own re-read and emits only
+    /// the authoritative mode update (W-479 P1).
+    thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Commands the pump task accepts from the outside world.
@@ -277,6 +308,9 @@ struct Pump {
     /// Shared death record; set at teardown when pi exited unexpectedly so the
     /// [`PiAcpSession`] handle fails later commands with [`AcpxError::PiExited`].
     death: Arc<std::sync::Mutex<PiExitStatus>>,
+    /// Shared with the [`PiAcpSession`] handle: when our own thinking/model
+    /// set last succeeded (see the handle's field docs; W-479 P1).
+    thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// True when the pump loop exited because pi's stdout ended (process died).
     pi_died: bool,
 
@@ -366,6 +400,8 @@ impl PiAcpSession {
             }
         };
 
+        // Shared set-timestamp for thinking-echo suppression (W-479 P1).
+        let thinking_set_at = Arc::new(std::sync::Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (prompt_tx, prompt_rx) = mpsc::channel(4);
         let (extension_tx, extension_rx) = mpsc::channel(8);
@@ -383,6 +419,7 @@ impl PiAcpSession {
             prompt_rx,
             _prompt_tx: prompt_tx,
             death: death.clone(),
+            thinking_set_at: thinking_set_at.clone(),
             pi_died: false,
             queue: VecDeque::new(),
             pending_turn: None,
@@ -409,6 +446,7 @@ impl PiAcpSession {
             file_commands: params.file_commands,
             death,
             initial_state: state,
+            thinking_set_at,
         }))
     }
 
@@ -531,7 +569,19 @@ impl PiAcpSession {
     }
 
     /// `set_model`; refreshes the cached context window for `usage_update`.
+    /// A model switch can clamp thinking and emit `thinking_level_changed`,
+    /// so it shares `set_thinking_level`'s echo bookkeeping (W-479 P1).
     pub async fn set_model(&self, provider: &str, model_id: &str) -> Result<()> {
+        let stamp = std::time::Instant::now();
+        *self.thinking_set_at.lock().unwrap() = Some(stamp);
+        let result = self.set_model_inner(provider, model_id).await;
+        if result.is_err() {
+            clear_thinking_stamp(&self.thinking_set_at, stamp);
+        }
+        result
+    }
+
+    async fn set_model_inner(&self, provider: &str, model_id: &str) -> Result<()> {
         let data = self
             .rpc(RpcCommand::SetModel {
                 provider: provider.to_string(),
@@ -567,9 +617,19 @@ impl PiAcpSession {
         Ok(())
     }
 
-    /// `set_thinking_level`.
+    /// `set_thinking_level`. Records the set timestamp *before* sending the
+    /// RPC so a fast `thinking_level_changed` echo can never overtake the
+    /// stamp (the pump processes events concurrently); a failed set clears
+    /// its own stamp again so it can never suppress a later genuine refresh
+    /// (W-479 P1 echo suppression).
     pub async fn set_thinking_level(&self, level: crate::pi::rpc::ThinkingLevel) -> Result<()> {
-        self.rpc(RpcCommand::SetThinkingLevel { level }).await?;
+        let stamp = std::time::Instant::now();
+        *self.thinking_set_at.lock().unwrap() = Some(stamp);
+        let result = self.rpc(RpcCommand::SetThinkingLevel { level }).await;
+        if result.is_err() {
+            clear_thinking_stamp(&self.thinking_set_at, stamp);
+        }
+        result?;
         Ok(())
     }
 
@@ -1096,11 +1156,21 @@ impl Pump {
     /// round-trip must not turn an informational event into a turn failure,
     /// so the mode update still stands on its own. The thought-level options
     /// are the model's native available levels (W-478), not a static ladder.
+    ///
+    /// Echo suppression (W-479 P1): when this event closely follows our own
+    /// `set_thinking_level` / `set_model`, the agent's explicit refresh has
+    /// already re-read the same post-set state — skip the duplicate re-read.
     async fn on_thinking_level_changed(&mut self, level: ThinkingLevel) {
         self.emit(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
             level.id(),
         )))
         .await;
+        if thinking_event_is_echo(
+            *self.thinking_set_at.lock().unwrap(),
+            std::time::Instant::now(),
+        ) {
+            return;
+        }
         let (state_res, models_res, levels_res) = tokio::join!(
             self.rpc.request(&RpcCommand::GetState),
             self.rpc.request(&RpcCommand::GetAvailableModels),
@@ -2184,6 +2254,24 @@ fn resolve_path(cwd: &Path, p: &str) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn thinking_echo_window_classifies_set_echoes() {
+        let now = std::time::Instant::now();
+        // No set yet: never an echo (genuine pi-initiated change refreshes).
+        assert!(!thinking_event_is_echo(None, now));
+        // Fresh set: echo, skip the redundant re-read.
+        assert!(thinking_event_is_echo(Some(now), now));
+        assert!(thinking_event_is_echo(
+            Some(now - THINKING_SET_ECHO_WINDOW),
+            now
+        ));
+        // Stale set: full refresh again.
+        assert!(!thinking_event_is_echo(
+            Some(now - THINKING_SET_ECHO_WINDOW - Duration::from_millis(1)),
+            now
+        ));
+    }
 
     #[test]
     fn option_index_parses_choice_ids() {

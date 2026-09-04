@@ -627,11 +627,19 @@ async fn new_session_map_waits_for_persisted_session_file() {
                 .await?;
             assert_eq!(prompt.stop_reason, StopReason::EndTurn);
 
-            let map: Value = serde_json::from_str(
-                &fs::read_to_string(agent_dir.join("pi-acp/session-map.json"))
-                    .expect("first prompt must persist the session mapping"),
-            )
-            .expect("session map must be valid JSON");
+            // Persistence runs after the prompt response is queued (W-479
+            // P1: off prompt latency), so poll for the map entry.
+            let map_path = agent_dir.join("pi-acp/session-map.json");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while fs::read_to_string(&map_path).is_err() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first prompt must persist the session mapping"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let map: Value = serde_json::from_str(&fs::read_to_string(&map_path).unwrap())
+                .expect("session map must be valid JSON");
             let stored = &map["sessions"]["mock-session-id"];
             assert_eq!(stored["sessionId"], "mock-session-id");
             assert_eq!(stored["cwd"], cwd.to_string_lossy().as_ref());

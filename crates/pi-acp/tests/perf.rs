@@ -246,7 +246,6 @@ async fn e2e_handshake_and_refresh_rpc_budget() {
     let mut new_ms = 0u128;
     let mut init_ms = 0u128;
     let mut set_mode_ms = 0u128;
-    let mut counts_after_set_mode;
     let mut sid_holder: Option<SessionId> = None;
 
     Client
@@ -287,28 +286,15 @@ async fn e2e_handshake_and_refresh_rpc_budget() {
         })
         .await
         .expect("e2e perf client");
-    // The mock emits `thinking_level_changed` after set_thinking_level and
-    // the pump refreshes selectors on it; poll until that async work lands
-    // so the budget below covers the full chain deterministically.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        counts_after_set_mode = count_commands(&read_command_log(&command_log));
-        let settled = counts_after_set_mode.get("get_state").copied().unwrap_or(0) >= 3
-            && counts_after_set_mode
-                .get("get_available_models")
-                .copied()
-                .unwrap_or(0)
-                >= 3
-            && counts_after_set_mode
-                .get("get_available_thinking_levels")
-                .copied()
-                .unwrap_or(0)
-                >= 3;
-        if settled || Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // All set_mode RPCs complete before its response returns; the pump's
+    // `thinking_level_changed` echo adds zero pi RPCs (W-479 P1), so the
+    // counts below are already final. The mode update still reaches the
+    // client through the explicit refresh (asserted below).
+    let counts_after_set_mode = count_commands(&read_command_log(&command_log));
+    assert!(
+        log.lock().await.iter().any(|u| matches!(u, SessionUpdate::CurrentModeUpdate(m) if m.current_mode_id.0.as_ref() == "low")),
+        "client must observe the mode switch to low"
+    );
 
     let sid = sid_holder.expect("session/new must succeed");
     println!(
@@ -330,18 +316,17 @@ async fn e2e_handshake_and_refresh_rpc_budget() {
         Some(&1)
     );
 
-    // set_mode budget: one set_thinking_level, one triple-join refresh
-    // (models + state + levels), plus the pump's `thinking_level_changed`
-    // refresh (state + models + levels, already concurrent — P1 coalescing
-    // candidate, see the W-479 report).
+    // set_mode budget (W-479 P1): one set_thinking_level plus one triple-join
+    // refresh (models + state + levels). The pump's `thinking_level_changed`
+    // echo emits only the mode update — zero extra pi RPCs.
     let delta = |k: &str| {
         counts_after_set_mode.get(k).copied().unwrap_or(0)
             - counts_after_new.get(k).copied().unwrap_or(0)
     };
     assert_eq!(delta("set_thinking_level"), 1);
-    assert_eq!(delta("get_available_models"), 2);
-    assert_eq!(delta("get_state"), 2);
-    assert_eq!(delta("get_available_thinking_levels"), 2);
+    assert_eq!(delta("get_available_models"), 1);
+    assert_eq!(delta("get_state"), 1);
+    assert_eq!(delta("get_available_thinking_levels"), 1);
 
     // Loose latency bounds for CI (instant mock: everything is local IPC).
     assert!(init_ms < 10_000, "initialize took {init_ms}ms");

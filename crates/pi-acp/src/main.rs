@@ -71,7 +71,10 @@ fn is_mock_mode(args: &[String]) -> bool {
 
 async fn async_main() -> Result<()> {
     // Structured logging (env-filter driven, e.g. RUST_LOG=pi_acp=debug).
+    // Logs go to stderr: stdout carries the ACP JSONL stream and any stray
+    // line breaks strict clients' framing (W-479 P1).
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),

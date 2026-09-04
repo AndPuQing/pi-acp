@@ -77,9 +77,7 @@ jobs:
 
       - name: Install cross (Linux arm64)
         if: matrix.use_cross
-        run: |
-          curl -sSL https://github.com/cross-rs/cross/releases/latest/download/cross-init \
-            | CROSS_INIT_TARGET=aarch64-unknown-linux-musl sh
+        uses: taiki-e/install-action@cross
 
       - name: Build
         shell: bash

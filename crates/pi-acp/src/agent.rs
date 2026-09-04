@@ -536,47 +536,42 @@ impl AcpAgent {
         };
         let session_id = session.session_id().clone();
 
-        // Fetch state + models once (parallel) to reduce startup latency.
-        let (state_res, models_res) =
-            tokio::join!(session.get_state(), session.get_available_models());
-        let state = state_res.as_ref().ok().cloned();
+        // Reuse the spawn-time state: `PiAcpSession::spawn` already fetched
+        // `get_state`, and nothing mutates pi between spawn and here, so only
+        // the model list costs a round-trip on this path (W-479: one fewer
+        // pi RPC on the session/new critical path).
+        let state = session.initial_state().clone();
+        let models_res = session.get_available_models().await;
         let available_models = models_res.as_ref().ok().cloned();
 
         // Auth checks (parity with TS): a model-list failure that smells like
         // missing credentials, or zero models, both mean "authenticate first".
         if let Some(err) = models_res.as_ref().err() {
             if maybe_auth_required_error(&err.to_string()).is_some() {
-                self.cleanup_failed_new_session(&session, state.as_ref())
+                self.cleanup_failed_new_session(&session, Some(&state))
                     .await;
                 drain_startup_tasks(notice_task.take(), version_task.take()).await;
                 return Err(auth_required());
             }
-            self.cleanup_failed_new_session(&session, state.as_ref())
+            self.cleanup_failed_new_session(&session, Some(&state))
                 .await;
             drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(AcpError::new(ACP_INTERNAL_ERROR, err.to_string()));
         }
         let raw_models_count = available_models.as_ref().map(Vec::len).unwrap_or(0);
         if raw_models_count == 0 {
-            self.cleanup_failed_new_session(&session, state.as_ref())
+            self.cleanup_failed_new_session(&session, Some(&state))
                 .await;
             drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(auth_required());
         }
-        if let Some(err) = state_res.as_ref().err() {
-            if maybe_auth_required_error(&err.to_string()).is_some() {
-                self.cleanup_failed_new_session(&session, None).await;
-                drain_startup_tasks(notice_task.take(), version_task.take()).await;
-                return Err(auth_required());
-            }
-        }
 
         let (config_options, _models, modes) =
-            get_session_configuration(&session, state.as_ref(), available_models.as_ref()).await;
+            get_session_configuration(&session, Some(&state), available_models.as_ref()).await;
 
         if let Some(session_file) = state
-            .as_ref()
-            .and_then(|s| s.session_file.as_deref())
+            .session_file
+            .as_deref()
             .filter(|path| !path.trim().is_empty())
         {
             let path = resolve_session_file_path(&req.cwd, session_file);
@@ -1622,18 +1617,11 @@ async fn get_session_configuration(
     pre_state: Option<&RpcSessionState>,
     pre_models: Option<&Vec<Model>>,
 ) -> (Vec<SessionConfigOption>, Option<ModelState>, ModeState) {
-    let models = get_model_state(session, pre_state, pre_models).await;
-    let modes = get_mode_state(session, pre_state).await;
-    let config_options = build_config_options(models.as_ref(), &modes);
-    (config_options, models, modes)
-}
-
-async fn get_model_state(
-    session: &Arc<PiAcpSession>,
-    pre_state: Option<&RpcSessionState>,
-    pre_models: Option<&Vec<Model>>,
-) -> Option<ModelState> {
-    let (available, state) = tokio::join!(
+    // Fetch all three inputs concurrently in one join (W-479): the refresh
+    // path used to fetch `get_state` twice (once for the model state, once
+    // for the mode state). pi has no combined state+levels endpoint, so the
+    // native levels always cost one RPC.
+    let (available, state, levels) = tokio::join!(
         async {
             if let Some(models) = pre_models {
                 models.clone()
@@ -1647,9 +1635,23 @@ async fn get_model_state(
             } else {
                 session.get_state().await.ok()
             }
-        }
+        },
+        session.available_thinking_levels(),
     );
+    let models = model_state_from_parts(&available, state.as_ref());
+    let current = state
+        .as_ref()
+        .map(|s| s.thinking_level.id())
+        .unwrap_or("medium");
+    let modes = mode_state_from_levels(current, levels);
+    let config_options = build_config_options(models.as_ref(), &modes);
+    (config_options, models, modes)
+}
 
+fn model_state_from_parts(
+    available: &[Model],
+    state: Option<&RpcSessionState>,
+) -> Option<ModelState> {
     let available_models: Vec<AdvertisedModel> = available
         .iter()
         .filter_map(|m| {
@@ -1687,30 +1689,6 @@ async fn get_model_state(
         available_models,
         current_model_id,
     })
-}
-
-async fn get_mode_state(
-    session: &Arc<PiAcpSession>,
-    pre_state: Option<&RpcSessionState>,
-) -> ModeState {
-    // Native per-model levels (pi's `get_available_thinking_levels`); pi has
-    // no combined state+levels endpoint, so levels always cost one RPC.
-    let (state, levels) = match pre_state {
-        Some(state) => (
-            Some(state.clone()),
-            session.available_thinking_levels().await,
-        ),
-        None => {
-            let (state_res, levels) =
-                tokio::join!(session.get_state(), session.available_thinking_levels());
-            (state_res.ok(), levels)
-        }
-    };
-    let current = state
-        .as_ref()
-        .map(|s| s.thinking_level.id())
-        .unwrap_or("medium");
-    mode_state_from_levels(current, levels)
 }
 
 /// Build a [`ModeState`] from the current level id + native level list.

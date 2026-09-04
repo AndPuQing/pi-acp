@@ -156,6 +156,12 @@ pub struct PiAcpSession {
     /// with [`AcpxError::PiExited`] (code/signal + hint) instead of a generic
     /// "session closed" (S8 / fixes #82 — a dead pi is always loud).
     death: Arc<std::sync::Mutex<PiExitStatus>>,
+    /// The `get_state` snapshot taken during [`PiAcpSession::spawn`]. No pi
+    /// mutation happens between spawn and the `session/new` handshake, so the
+    /// agent reuses this instead of re-fetching state (W-479: saves one pi
+    /// round-trip on the session/new critical path). Later reads use the
+    /// live [`PiAcpSession::get_state`] RPC.
+    initial_state: RpcSessionState,
 }
 
 /// Commands the pump task accepts from the outside world.
@@ -402,11 +408,19 @@ impl PiAcpSession {
             first_prompt: AtomicBool::new(false),
             file_commands: params.file_commands,
             death,
+            initial_state: state,
         }))
     }
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// The spawn-time `get_state` snapshot (see the field docs). The
+    /// `session/new` handshake consumes this instead of a second `get_state`
+    /// round-trip (W-479).
+    pub fn initial_state(&self) -> &RpcSessionState {
+        &self.initial_state
     }
 
     /// The error to surface when the session's pump is gone: [`AcpxError::PiExited`]

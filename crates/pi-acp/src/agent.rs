@@ -121,11 +121,14 @@ struct ModelState {
     current_model_id: String,
 }
 
-/// Thought-level mode state (the fixed `off..max` ladder).
+/// Thought-level mode state (the model's native available levels, W-478).
 #[derive(Debug, Clone)]
 struct ModeState {
     current_mode_id: String,
     available_modes: Vec<SessionMode>,
+    /// The native level list behind `available_modes` (shared with the
+    /// `thought_level` config option so both selectors describe one ladder).
+    levels: Vec<ThinkingLevel>,
 }
 
 /// Notifications that must be sent only after the `session/new` response is
@@ -940,9 +943,8 @@ impl AcpAgent {
             .await
             .map_err(acp_error_from_pi)?;
 
-        // Let the client know the current mode changed (keeps the dropdown in sync).
-        send_current_mode_update(cx, &req.session_id, mode).await;
-
+        // Refreshes both selectors; the mode update carries pi's effective
+        // (possibly clamped) level.
         let _ = emit_config_options_update(cx, &req.session_id, &session).await;
         Ok(SetSessionModeResponse::new())
     }
@@ -978,7 +980,6 @@ impl AcpAgent {
                     .set_thinking_level(level)
                     .await
                     .map_err(acp_error_from_pi)?;
-                send_current_mode_update(cx, &req.session_id, &value).await;
             }
             other => {
                 return Err(invalid_params(&format!("Unknown config option: {other}")));
@@ -1576,12 +1577,17 @@ async fn advertise_commands(
 
 /// Rebuild and emit the `config_option_update` notification; returns the new
 /// options (also used in the `session/set_config_option` response).
+/// Refresh both selectors after a model/thinking change: the config options
+/// (dynamic per-model thought levels, W-478) plus the effective current mode
+/// (pi clamps thinking to the model's capabilities, so Zed must follow the
+/// read-back level, not the requested one).
 async fn emit_config_options_update(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     session: &Arc<PiAcpSession>,
 ) -> std::result::Result<Vec<SessionConfigOption>, AcpxError> {
-    let (config_options, _models, _modes) = get_session_configuration(session, None, None).await;
+    let (config_options, _models, modes) = get_session_configuration(session, None, None).await;
+    send_current_mode_update(cx, session_id, &modes.current_mode_id).await;
     let update = ConfigOptionUpdate::new(config_options.clone());
     cx.send_notification(SessionNotification::new(
         session_id.clone(),
@@ -1687,28 +1693,44 @@ async fn get_mode_state(
     session: &Arc<PiAcpSession>,
     pre_state: Option<&RpcSessionState>,
 ) -> ModeState {
-    let state: Option<RpcSessionState> = if let Some(state) = pre_state {
-        Some(state.clone())
-    } else {
-        session.get_state().await.ok()
+    // Native per-model levels (pi's `get_available_thinking_levels`); pi has
+    // no combined state+levels endpoint, so levels always cost one RPC.
+    let (state, levels) = match pre_state {
+        Some(state) => (
+            Some(state.clone()),
+            session.available_thinking_levels().await,
+        ),
+        None => {
+            let (state_res, levels) =
+                tokio::join!(session.get_state(), session.available_thinking_levels());
+            (state_res.ok(), levels)
+        }
     };
     let current = state
         .as_ref()
         .map(|s| s.thinking_level.id())
         .unwrap_or("medium");
+    mode_state_from_levels(current, levels)
+}
 
+/// Build a [`ModeState`] from the current level id + native level list.
+/// A current level outside the list (stale pi state) is kept as the current
+/// mode so the picker still reflects reality instead of silently flipping.
+fn mode_state_from_levels(current: &str, levels: Vec<ThinkingLevel>) -> ModeState {
+    let available_modes = levels
+        .iter()
+        .map(|level| {
+            SessionMode::new(
+                SessionModeId::new(level.id()),
+                format!("Thinking: {}", level.label()),
+            )
+            .description(level.description().to_string())
+        })
+        .collect();
     ModeState {
         current_mode_id: current.to_string(),
-        available_modes: ThinkingLevel::all()
-            .iter()
-            .map(|level| {
-                SessionMode::new(
-                    SessionModeId::new(level.id()),
-                    format!("Thinking: {}", level.label()),
-                )
-                .description(level.description().to_string())
-            })
-            .collect(),
+        available_modes,
+        levels,
     }
 }
 
@@ -1716,7 +1738,10 @@ fn build_config_options(
     models: Option<&ModelState>,
     modes: &ModeState,
 ) -> Vec<SessionConfigOption> {
-    let mut options = vec![thought_level_config_option(&modes.current_mode_id)];
+    let mut options = vec![thought_level_config_option(
+        &modes.current_mode_id,
+        &modes.levels,
+    )];
 
     if let Some(models) = models {
         let available: Vec<(String, String)> = models
@@ -1731,11 +1756,15 @@ fn build_config_options(
     options
 }
 
-/// Build the `thought_level` config option for `current_level_id` (shared
-/// with the session pump's `thinking_level_changed` handler so the ACP
-/// thinking dropdown and the mode picker always describe the same ladder).
-pub(crate) fn thought_level_config_option(current_level_id: &str) -> SessionConfigOption {
-    let options: Vec<SessionConfigSelectOption> = ThinkingLevel::all()
+/// Build the `thought_level` config option for `current_level_id` over the
+/// model's native `available` levels (shared with the session pump's
+/// `thinking_level_changed` handler so the ACP thinking dropdown and the
+/// mode picker always describe the same ladder).
+pub(crate) fn thought_level_config_option(
+    current_level_id: &str,
+    available: &[ThinkingLevel],
+) -> SessionConfigOption {
+    let options: Vec<SessionConfigSelectOption> = available
         .iter()
         .map(|level| {
             SessionConfigSelectOption::new(level.id().to_string(), level.label().to_string())

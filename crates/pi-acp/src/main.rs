@@ -375,7 +375,7 @@ async fn run_mock_rpc() -> Result<()> {
 
         let data = match ty {
             "get_state" => serde_json::json!({
-                "model": {"id": mock_model, "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
+                "model": mock_model_definition(&mock_model),
                 "thinkingLevel": mock_thinking_level,
                 "isStreaming": false,
                 "isCompacting": false,
@@ -390,14 +390,21 @@ async fn run_mock_rpc() -> Result<()> {
             }),
             "get_available_models" => serde_json::json!({
                 "models": [
-                    {"id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000, "maxTokens": 100},
-                    {"id": "mock-fast", "name": "Mock Fast", "provider": "mock", "reasoning": false, "contextWindow": 8000, "maxTokens": 100}
+                    mock_model_definition("mock-model"),
+                    mock_model_definition("mock-fast"),
+                    mock_model_definition("mock-limited")
                 ]
             }),
-            "export_html" => serde_json::json!({"path": "/tmp/mock.html"}),
-            "set_model" => serde_json::json!({
-                "id": "mock-model", "name": "Mock Model", "provider": "mock", "reasoning": false, "contextWindow": 1000
+            // Native per-model levels (pi `AgentSession.getAvailableThinkingLevels`).
+            "get_available_thinking_levels" => serde_json::json!({
+                "levels": mock_supported_levels(&mock_model)
             }),
+            "export_html" => serde_json::json!({"path": "/tmp/mock.html"}),
+            "set_model" => command
+                .get("modelId")
+                .and_then(serde_json::Value::as_str)
+                .map(mock_model_definition)
+                .unwrap_or_else(|| mock_model_definition(&mock_model)),
             "compact" => serde_json::json!({
                 "tokensBefore": 1500,
                 "summary": "The conversation was summarized."
@@ -429,15 +436,32 @@ async fn run_mock_rpc() -> Result<()> {
 
         // Apply stateful mutations (real pi persists these; the agent reads
         // them back via get_state for configOptions / slash-command displays).
+        // Mirror pi: thinking changes clamp to the model's levels and only
+        // emit `thinking_level_changed` when the effective level moves.
+        let mut thinking_event: Option<serde_json::Value> = None;
         match ty {
             "set_thinking_level" => {
                 if let Some(l) = command.get("level").and_then(serde_json::Value::as_str) {
-                    mock_thinking_level = l.to_string();
+                    let effective = mock_clamp_level(&mock_model, l);
+                    if effective != mock_thinking_level {
+                        mock_thinking_level = effective.clone();
+                        thinking_event = Some(serde_json::json!({
+                            "type": "thinking_level_changed", "level": effective
+                        }));
+                    }
                 }
             }
             "set_model" => {
                 if let Some(m) = command.get("modelId").and_then(serde_json::Value::as_str) {
                     mock_model = m.to_string();
+                }
+                // pi re-resolves + clamps thinking on a model switch.
+                let effective = mock_clamp_level(&mock_model, &mock_thinking_level.clone());
+                if effective != mock_thinking_level {
+                    mock_thinking_level = effective.clone();
+                    thinking_event = Some(serde_json::json!({
+                        "type": "thinking_level_changed", "level": effective
+                    }));
                 }
             }
             "set_auto_compaction" => {
@@ -499,6 +523,14 @@ async fn run_mock_rpc() -> Result<()> {
             mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
         }
 
+        // Mirror pi: a thinking change that moves the effective level emits
+        // `thinking_level_changed` (W-478 clamp parity).
+        if success {
+            if let Some(event) = thinking_event {
+                mock_write_line(&mut stdout, event.to_string().as_bytes()).await?;
+            }
+        }
+
         // Mirror pi: the prompt response arrives early; the streaming events
         // and the real turn-completion signal (`agent_settled`) follow after.
         if success && ty == "prompt" {
@@ -539,6 +571,65 @@ async fn run_mock_rpc() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Mock model definition for `get_state` / `get_available_models` /
+/// `set_model` responses. `mock-model` + `mock-fast` advertise the full pi
+/// thinking ladder; `mock-limited` only supports a subset (no `minimal`,
+/// `xhigh`, `max`) so tests can prove the per-model dynamic selector
+/// (W-478). Shapes mirror real pi payloads (`thinkingLevelMap` included).
+fn mock_model_definition(id: &str) -> serde_json::Value {
+    match id {
+        "mock-limited" => serde_json::json!({
+            "id": "mock-limited", "name": "Mock Limited", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "low": "low", "medium": "medium", "high": "high"},
+            "contextWindow": 4000, "maxTokens": 100
+        }),
+        "mock-fast" => serde_json::json!({
+            "id": "mock-fast", "name": "Mock Fast", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+            "contextWindow": 8000, "maxTokens": 100
+        }),
+        _ => serde_json::json!({
+            "id": "mock-model", "name": "Mock Model", "provider": "mock",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+            "contextWindow": 1000, "maxTokens": 100
+        }),
+    }
+}
+
+/// Native per-model thinking levels for the mock (`getSupportedThinkingLevels`
+/// parity: `null`/missing entries exclude `xhigh`/`max`; a `null` entry
+/// excludes its level everywhere). Unknown model ids get the full ladder.
+fn mock_supported_levels(id: &str) -> Vec<&'static str> {
+    match id {
+        "mock-limited" => vec!["off", "low", "medium", "high"],
+        _ => vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    }
+}
+
+/// Clamp a requested level to the mock model's levels (pi-ai
+/// `clampThinkingLevel` parity: exact hit, else nearest higher, else nearest
+/// lower). Unknown levels fall back to the first supported level.
+fn mock_clamp_level(id: &str, level: &str) -> String {
+    const LADDER: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let supported = mock_supported_levels(id);
+    if supported.contains(&level) {
+        return level.to_string();
+    }
+    let requested = LADDER.iter().position(|l| *l == level);
+    if let Some(i) = requested {
+        if let Some(up) = LADDER.iter().skip(i + 1).find(|l| supported.contains(*l)) {
+            return up.to_string();
+        }
+        if let Some(down) = LADDER[..i].iter().rev().find(|l| supported.contains(*l)) {
+            return down.to_string();
+        }
+    }
+    supported.first().unwrap_or(&"off").to_string()
 }
 
 /// Read the native id from a persisted pi session header. A missing or

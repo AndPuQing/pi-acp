@@ -84,11 +84,16 @@ async fn typed_wrappers_parse_payloads() {
     assert_eq!(state.session_id, "mock-session-id");
 
     let models = pi.get_available_models().await.unwrap();
-    assert_eq!(models.len(), 2);
+    assert_eq!(models.len(), 3);
     assert_eq!(models[0].id, "mock-model");
     assert_eq!(models[0].provider, "mock");
     assert_eq!(models[1].id, "mock-fast");
     assert_eq!(models[1].context_window, Some(8000));
+    // `mock-limited` carries a restricted `thinkingLevelMap` for the
+    // per-model dynamic selector tests (W-478).
+    assert_eq!(models[2].id, "mock-limited");
+    assert!(models[2].reasoning);
+    assert!(models[2].thinking_level_map.is_some());
 
     let path = pi.export_html(None).await.unwrap();
     assert_eq!(path, "/tmp/mock.html");

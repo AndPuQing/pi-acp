@@ -86,6 +86,12 @@ fn normalize_value(v: &mut Value, cwd: &str) {
             for (key, value) in map.iter_mut() {
                 if key == "updatedAt" && value.is_string() {
                     *value = Value::String("<TS>".to_string());
+                } else if key == "version" && is_bare_semver(value) {
+                    // The adapter's own version (initialize `agentInfo`): the
+                    // golden guards frame ordering, not releases — a version
+                    // bump must not drift it (broke CI when main went 0.1.0
+                    // → 0.2.1 while the golden still pinned 0.1.0).
+                    *value = Value::String("<VERSION>".to_string());
                 } else {
                     normalize_value(value, cwd);
                 }
@@ -98,6 +104,20 @@ fn normalize_value(v: &mut Value, cwd: &str) {
         }
         _ => {}
     }
+}
+
+/// A bare `X.Y[.Z...]` version string (the adapter's own version in
+/// `initialize`'s `agentInfo`; `protocolVersion` is a number and never
+/// matches). Anything else recurses untouched.
+fn is_bare_semver(v: &Value) -> bool {
+    let Some(s) = v.as_str() else {
+        return false;
+    };
+    let mut parts = s.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()) && parts.next().is_some()
 }
 
 /// `pi v<semver>` header → `pi v<VER>` (the golden guards ordering, not the
@@ -317,4 +337,14 @@ fn normalization_is_stable() {
     let mut windows = serde_json::json!({ "path": "C:\\tmp\\x\\AGENTS.md" });
     normalize_value(&mut windows, "C:\\tmp\\x");
     assert_eq!(windows["path"], "<CWD>/AGENTS.md");
+
+    // The adapter's own version is normalized (releases must not drift the
+    // golden); non-version strings under the same key shape are untouched.
+    let mut info = serde_json::json!({ "agentInfo": { "name": "pi-acp", "version": "0.2.1" } });
+    normalize_value(&mut info, "/tmp/x");
+    assert_eq!(info["agentInfo"]["version"], "<VERSION>");
+    assert_eq!(info["agentInfo"]["name"], "pi-acp");
+    let mut proto = serde_json::json!({ "protocolVersion": 1 });
+    normalize_value(&mut proto, "/tmp/x");
+    assert_eq!(proto["protocolVersion"], 1);
 }

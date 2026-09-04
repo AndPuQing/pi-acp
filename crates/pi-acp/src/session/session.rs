@@ -2600,17 +2600,21 @@ mod tests {
 
         let permission =
             request_permission(&session_id, "ui-1", "Pick", &request, Vec::new(), &outbound);
-        let (_, result) = tokio::join!(
-            async {
-                let Some(OutboundMessage::RequestPermission(_, _responder)) =
-                    outbound_rx.recv().await
-                else {
-                    panic!("permission request was not sent");
-                };
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            },
-            permission,
-        );
+        // Receive the request and then never answer: park forever holding the
+        // responder so the extension timeout — not a racy drop — is the only
+        // way the permission future can resolve. The old 25ms-drop raced the
+        // 10ms timeout under coarse OS timer granularity (Windows ~15.6ms),
+        // flaking with "permission responder dropped".
+        let waiter = tokio::spawn(async move {
+            let Some(OutboundMessage::RequestPermission(_, responder)) = outbound_rx.recv().await
+            else {
+                panic!("permission request was not sent");
+            };
+            let _hold = responder;
+            std::future::pending::<()>().await;
+        });
+        let result = permission.await;
+        waiter.abort();
 
         match result {
             Err(AcpxError::RpcFailed { command, message }) => {

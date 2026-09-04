@@ -1208,10 +1208,13 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
     session.dispose().await;
 }
 
-/// A settle timeout must resolve and discard prompts queued behind the stuck
-/// turn; later prompts are rejected until the session is recreated.
+/// A settle timeout resolves the stuck turn (and everything queued behind it)
+/// with `SettleTimeout` — but the session stays usable (W-480): later prompts
+/// run instead of failing with `SessionClosed`, and `cancel` keeps working.
+/// (Regression: the session used to be poisoned, forcing `session/new` — or a
+/// client reload when the client reuses the id — to recover.)
 #[tokio::test]
-async fn settle_timeout_fails_queue_and_poison_session() {
+async fn settle_timeout_fails_stuck_turns_and_stays_recoverable() {
     let fx = fixture_with_settle_timeout(&["--mock-no-settle"], Duration::from_millis(200)).await;
 
     let s = fx.session.clone();
@@ -1232,15 +1235,51 @@ async fn settle_timeout_fails_queue_and_poison_session() {
         .unwrap_err();
     assert!(matches!(first_result, AcpxError::SettleTimeout { .. }));
 
+    // Queued turns never reached pi: the same timeout (retryable), not
+    // `SessionClosed`.
     let second_result = tokio::time::timeout(TIMEOUT, second)
         .await
         .expect("queued prompt must resolve after settle timeout")
         .unwrap()
         .unwrap_err();
-    assert!(matches!(second_result, AcpxError::SessionClosed(_)));
+    assert!(matches!(second_result, AcpxError::SettleTimeout { .. }));
 
-    let later = fx.session.prompt("later".into(), vec![]).await.unwrap_err();
-    assert!(matches!(later, AcpxError::SessionClosed(_)));
+    // `cancel` still works after a settle timeout (the `SettleTimeout` hint
+    // promises "cancel and retry").
+    fx.session
+        .cancel()
+        .await
+        .expect("cancel after settle timeout");
+
+    // The session accepts new turns: with `--mock-no-settle` the retry also
+    // times out — with `SettleTimeout`, never `SessionClosed`.
+    let later = tokio::time::timeout(TIMEOUT, fx.session.prompt("later".into(), vec![]))
+        .await
+        .expect("later prompt must resolve")
+        .unwrap_err();
+    assert!(matches!(later, AcpxError::SettleTimeout { .. }));
+    fx.session.dispose().await;
+}
+
+/// After a settle timeout the aborted turn's late `agent_settled` is absorbed
+/// by the recovery drain, and a retry on the SAME session id completes
+/// normally (W-480: no `session/new` required).
+#[tokio::test]
+async fn settle_timeout_retry_succeeds_on_same_session() {
+    let fx =
+        fixture_with_settle_timeout(&["--mock-no-settle-first"], Duration::from_millis(200)).await;
+
+    // Only the first prompt never settles: the fallback resolves it explicitly.
+    let first = fx.session.prompt("stuck".into(), vec![]).await.unwrap_err();
+    assert!(matches!(first, AcpxError::SettleTimeout { .. }));
+
+    // Retry immediately — it queues behind the recovery drain, the abort's
+    // stale settle is absorbed, and the retry runs to a normal `EndTurn`.
+    let reason = tokio::time::timeout(TIMEOUT, fx.session.prompt("retry".into(), vec![]))
+        .await
+        .expect("retry must resolve")
+        .expect("retry on the same session must succeed");
+    assert_eq!(reason, StopReason::EndTurn);
     fx.session.dispose().await;
 }
 

@@ -9,7 +9,11 @@
 //!   completing only on pi's `agent_settled` event (**not** `agent_end`, which
 //!   pi may emit repeatedly for retries/compaction/continuations). `cancel()`
 //!   clears the queue (each queued turn resolves `Cancelled`) and aborts the
-//!   in-flight turn.
+//!   in-flight turn. A settle timeout (pi accepted the prompt but never
+//!   settled) does **not** retire the session: the stuck turn fails with
+//!   `SettleTimeout`, pi is aborted, and new prompts queue behind a bounded
+//!   drain until the aborted turn's late `agent_settled` arrives — so the
+//!   stale settle can never complete a fresh turn (W-480).
 //! - **Event pump**: a single `tokio::select!` loop consumes pi events and
 //!   session commands; every outbound ACP notification goes through one
 //!   ordered channel (`[`OutboundMessage`]`), so `session/update` frames leave
@@ -88,6 +92,13 @@ type PiExitStatus = Option<(Option<i32>, Option<i32>)>;
 /// response by milliseconds; 2s is generous headroom for loaded runners while
 /// keeping genuinely pi-initiated later changes on the full-refresh path.
 const THINKING_SET_ECHO_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a settle-timeout recovery waits for pi's stale `agent_settled`
+/// before letting queued retries start anyway (W-480). An `abort` settles pi
+/// promptly when pi is healthy, so 30s bounds the wait for a pi that never
+/// settles the aborted turn without stalling retries for the full settle
+/// timeout again.
+const STALE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether a `thinking_level_changed` event observed at `now` is the echo of
 /// our own set at `last_set` (pure predicate for the pump's echo suppression).
@@ -320,10 +331,21 @@ struct Pump {
     next_turn_id: u64,
     /// Maps abort semantics to the ACP stop reason for the running turn.
     cancel_requested: bool,
-    /// A turn failure leaves pi's event stream ambiguous (late settle events
-    /// have no turn id), so the session rejects later prompts until it is
-    /// disposed and recreated.
+    /// A turn failure that leaves pi's event stream ambiguous with no bounded
+    /// recovery (a rejected `prompt` RPC, or an `abort` that never confirmed)
+    /// retires the session: later prompts fail with `SessionClosed` until the
+    /// session is disposed and recreated. A settle timeout is NOT poisoned —
+    /// it recovers through [`Pump::recovering`] instead (W-480).
     poisoned: bool,
+    /// Settle-timeout recovery (W-480): pi accepted a prompt but never
+    /// settled, so the turn failed with `SettleTimeout` and pi was aborted.
+    /// The aborted turn's late `agent_settled` carries no turn id and must
+    /// never complete a fresh turn, so new prompts queue until the stale
+    /// settle arrives (absorbed) or [`Pump::recover_deadline`] elapses.
+    recovering: bool,
+    /// End of the stale-settle drain (see [`Pump::recovering`]). `None` while
+    /// not recovering.
+    recover_deadline: Option<tokio::time::Instant>,
     /// True while pi's agent loop is running (`agent_start` .. `agent_end`).
     in_agent_loop: bool,
     /// Deadline by which the in-flight turn's `agent_settled` must arrive
@@ -426,6 +448,8 @@ impl PiAcpSession {
             next_turn_id: 0,
             cancel_requested: false,
             poisoned: false,
+            recovering: false,
+            recover_deadline: None,
             in_agent_loop: false,
             settle_deadline: None,
             settle_timeout: params.settle_timeout,
@@ -800,6 +824,20 @@ async fn pump_loop(mut pump: Pump) {
             } => {
                 pump.on_settle_timeout().await;
             }
+            // Stale-settle drain (W-480 recovery): bound the wait for the
+            // aborted turn's late `agent_settled` before queued retries run.
+            // Same borrow discipline as the settle deadline above.
+            _recover_deadline = {
+                let deadline = pump.recover_deadline;
+                async move {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                }
+            } => {
+                pump.on_recover_timeout().await;
+            }
         }
     }
 
@@ -863,12 +901,15 @@ impl Pump {
             images,
             resolve: respond,
         };
-        if self.pending_turn.is_some() {
-            // One-at-a-time: a turn is running, queue this one.
+        if self.pending_turn.is_some() || self.recovering {
+            // One-at-a-time: a turn is running, queue this one. While
+            // recovering from a settle timeout (W-480) no turn is running,
+            // but queued prompts still wait for the aborted turn's stale
+            // `agent_settled` so it can never complete a fresh turn.
             self.queue.push_back(queued);
             self.emit_text(&format!("Queued message (position {}).", self.queue.len()))
                 .await;
-            self.emit_queue_depth(true).await;
+            self.emit_queue_depth(self.pending_turn.is_some()).await;
         } else {
             self.start_turn(queued).await;
         }
@@ -881,6 +922,13 @@ impl Pump {
         }
         if self.pending_turn.is_none() {
             self.cancel_requested = false;
+            // While recovering from a settle timeout (W-480), retries wait
+            // queued with no turn running: cancel clears them so a stray
+            // cancel never leaves stale retries behind. The recovery itself
+            // still runs to absorb the aborted turn's late settle.
+            while let Some(t) = self.queue.pop_front() {
+                let _ = t.resolve.send(Ok(StopReason::Cancelled));
+            }
             let _ = respond.send(Ok(()));
             return;
         }
@@ -1353,6 +1401,25 @@ impl Pump {
     /// that response confirms the turn. During cancellation, the abort is the
     /// confirmation that an early response is no longer required.
     async fn on_agent_settled(&mut self) {
+        if self.pending_turn.is_none() && self.recovering {
+            // The aborted turn's late settle (W-480 recovery): absorb it —
+            // it belongs to the timed-out turn, never to a fresh one — then
+            // run whatever retries queued behind the drain.
+            tracing::debug!("absorbed stale agent_settled during settle-timeout recovery");
+            self.recovering = false;
+            self.recover_deadline = None;
+            if let Some(next) = self.queue.pop_front() {
+                self.emit_text(&format!(
+                    "Starting queued message. ({} remaining)",
+                    self.queue.len()
+                ))
+                .await;
+                self.start_turn(next).await;
+            } else {
+                self.emit_queue_depth(false).await;
+            }
+            return;
+        }
         if let Some(pending) = self.pending_turn.as_mut() {
             if !pending.prompt_accepted && !self.cancel_requested {
                 pending.settled_before_accept = true;
@@ -1429,9 +1496,16 @@ impl Pump {
     /// The settle deadline fired: pi accepted the prompt but never emitted
     /// `agent_settled` (design §11 risk #84). Resolve the pending turn with an
     /// explicit [`AcpxError::SettleTimeout`] so `session/prompt` can never
-    /// hang forever, and fire a best-effort `abort` to unstick pi. Queued
-    /// turns are not auto-started (pi may be unhealthy — same policy as the
-    /// prompt-rejection path).
+    /// hang forever, and fire a best-effort `abort` to unstick pi.
+    ///
+    /// Unlike a rejected `prompt` RPC, this path stays recoverable (W-480):
+    /// the session is NOT poisoned. Queued turns fail with the same
+    /// `SettleTimeout` (they never ran — the client retries them), and new
+    /// prompts queue behind a bounded drain until the aborted turn's late
+    /// `agent_settled` arrives, so the stale settle can never complete a
+    /// fresh turn. `cancel` keeps working (it clears the drain queue), and a
+    /// retry on the same ACP session id runs once the drain completes — no
+    /// `session/new` (and no client reload) required.
     async fn on_settle_timeout(&mut self) {
         self.settle_deadline = None;
         let Some(pending) = self.pending_turn.take() else {
@@ -1441,21 +1515,64 @@ impl Pump {
         self.flush_outbound().await;
         let secs = self.settle_timeout.as_secs();
         let _ = pending.resolve.send(Err(AcpxError::SettleTimeout { secs }));
-        self.fail_queued_turns();
-        self.poisoned = true;
+        // Queued turns never reached pi: fail them with the same timeout so
+        // the client retries them on this same session (they are not
+        // session-closed — the session recovers below).
+        while let Some(t) = self.queue.pop_front() {
+            let _ = t.resolve.send(Err(AcpxError::SettleTimeout { secs }));
+        }
         self.cancel_requested = false;
         self.in_agent_loop = false;
+        self.recovering = true;
+        self.recover_deadline = Some(tokio::time::Instant::now() + STALE_DRAIN_TIMEOUT);
         self.emit_queue_depth(false).await;
 
         // Best-effort: tell pi to stop whatever it accepted (it may still be
-        // inside an agent loop; the resulting late `agent_settled` is ignored
-        // — the pending turn is already resolved).
+        // inside an agent loop; the resulting late `agent_settled` is
+        // absorbed by the drain — the pending turn is already resolved).
         let rpc = self.rpc.clone();
         tokio::spawn(async move {
             if let Err(e) = rpc.request(&RpcCommand::Abort).await {
                 tracing::warn!(error = %e, "abort after settle timeout failed");
             }
         });
+    }
+
+    /// The stale-settle drain elapsed without the aborted turn settling
+    /// (W-480 recovery): pi never answered the post-timeout `abort` with an
+    /// `agent_settled`, so there is no stale settle left to absorb. Absorb
+    /// any settle already buffered (it can only belong to the aborted turn —
+    /// no fresh turn has started yet), then run the queued retries. If pi is
+    /// truly stuck, the retry times out on its own settle deadline instead of
+    /// hanging, and the session stays usable throughout.
+    async fn on_recover_timeout(&mut self) {
+        if !self.recovering {
+            return;
+        }
+        self.recovering = false;
+        self.recover_deadline = None;
+        // A stale settle buffered alongside the timer belongs to the aborted
+        // turn; absorb it here so it cannot complete the fresh turn below.
+        // Other buffered events are real pi output — process them in order.
+        while let Ok(ev) = self.event_rx.try_recv() {
+            if matches!(ev, RpcEvent::AgentSettled) {
+                tracing::debug!(
+                    "absorbed buffered stale agent_settled at end of settle-timeout recovery"
+                );
+                break;
+            }
+            self.on_event(ev).await;
+        }
+        if let Some(next) = self.queue.pop_front() {
+            self.emit_text(&format!(
+                "Starting queued message. ({} remaining)",
+                self.queue.len()
+            ))
+            .await;
+            self.start_turn(next).await;
+        } else {
+            self.emit_queue_depth(false).await;
+        }
     }
 
     // --- streaming assistant messages ---

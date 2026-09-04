@@ -1,6 +1,6 @@
 {
   "name": "@puqing-works/pi-acp-rs-linux-x64",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Linux x64 binary for pi-acp-rs",
   "license": "MIT",
   "repository": {

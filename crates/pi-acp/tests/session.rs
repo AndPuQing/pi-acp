@@ -88,6 +88,7 @@ async fn fixture_with_settle_timeout(extra_args: &[&str], settle_timeout: Durati
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
+        extra_env: vec![],
     })
     .await
     .expect("session spawn");
@@ -1229,6 +1230,7 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
+        extra_env: vec![],
     })
     .await
     .expect("session spawn");
@@ -1422,6 +1424,7 @@ async fn session_id_override_mismatch_is_rejected() {
         session_path: Some(session_file),
         session_id_override: Some("requested-session-id".into()),
         file_commands: vec![],
+        extra_env: vec![],
     })
     .await;
 
@@ -1457,6 +1460,7 @@ async fn session_manager_registers_and_disposes_sessions() {
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
+        extra_env: vec![],
     })
     .await
     .unwrap();
@@ -1494,6 +1498,7 @@ async fn session_manager_replacement_disposes_previous_instance() {
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
+        extra_env: vec![],
     };
     let first = PiAcpSession::spawn(params(first_outbound)).await.unwrap();
     let session_id = first.session_id().clone();

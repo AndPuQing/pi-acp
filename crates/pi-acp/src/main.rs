@@ -326,6 +326,41 @@ async fn run_mock_rpc() -> Result<()> {
         mock_write_line(&mut stdout, b"{\"type\":\"brand_new_event\",\"payload\":1}").await?;
     }
 
+    // W-483 fixture: simulate the in-pi MCP registrar. When the adapter
+    // passes a session payload (`PI_ACP_MCP_SERVERS_JSON`, set per child by
+    // the MCP handshake), the mock emits one `PI_ACP_MCP:*` marker per
+    // requested server — exactly the lines the real registrar prints.
+    // Markers go to stderr, mirroring real pi (which routes everything its
+    // extensions print to the child's stderr); pi-acp scrapes them there.
+    // `PI_ACP_MOCK_MCP_FAIL=<name>` makes that server report failure
+    // instead (explicit per-server error path).
+    if let Ok(payload) = std::env::var("PI_ACP_MCP_SERVERS_JSON") {
+        use tokio::io::AsyncWriteExt as _;
+        let fail_name = std::env::var("PI_ACP_MOCK_MCP_FAIL").ok();
+        if let Ok(specs) = serde_json::from_str::<serde_json::Value>(&payload) {
+            if let Some(items) = specs.as_array() {
+                let mut stderr = tokio::io::stderr();
+                for item in items {
+                    let name = item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let line = if fail_name.as_deref() == Some(name) {
+                        format!("PI_ACP_MCP:failed:{name}:mock registration refused")
+                    } else {
+                        format!("PI_ACP_MCP:registered:{name}")
+                    };
+                    stderr.write_all(line.as_bytes()).await?;
+                    stderr.write_all(b"\n").await?;
+                }
+                stderr.flush().await?;
+            }
+        }
+    }
+
     if exit_after == Some(0) {
         std::process::exit(42);
     }

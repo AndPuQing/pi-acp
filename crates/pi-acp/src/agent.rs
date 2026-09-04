@@ -37,6 +37,7 @@
 //! ACP `usage_update` notifications (decision 3 / #106) are emitted by the
 //! session pump from pi's assistant-message usage (see [`PiAcpSession`]).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,7 +46,7 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate,
     DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
+    LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse,
     PromptCapabilities, PromptRequest, PromptResponse, ResourceLink, SessionCapabilities,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionId,
     SessionInfo, SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState,
@@ -65,6 +66,7 @@ use crate::auth::{get_auth_methods, maybe_auth_required_error};
 use crate::commands::{self, FileSlashCommand};
 use crate::config::Config;
 use crate::error::{AcpxError, Result};
+use crate::mcp::{self, McpServerSpec};
 use crate::pi::rpc::{ImageContent, Model, QueueMode, RpcSessionState, ThinkingLevel};
 use crate::pi::sessions::{
     find_pi_session, list_pi_sessions, session_file_matches_id, title_from_session_file,
@@ -229,6 +231,11 @@ pub struct AcpAgent {
     last_session_cwd: Mutex<Option<PathBuf>>,
     /// Cached startup update notice (D6: async + cache, off the critical path).
     version_check: Mutex<VersionCheck>,
+    /// Per-session MCP wiring (W-483): validated `mcp_servers` specs keyed
+    /// by ACP session id. Present only for sessions created with non-empty
+    /// `mcp_servers`; consulted on restore so a respawned pi re-registers
+    /// instead of silently dropping the caller's menu.
+    mcp_configs: Mutex<HashMap<String, Vec<McpServerSpec>>>,
 }
 
 impl AcpAgent {
@@ -240,6 +247,7 @@ impl AcpAgent {
             session_lifecycle: Mutex::new(()),
             last_session_cwd: Mutex::new(None),
             version_check: Mutex::new(VersionCheck::Pending),
+            mcp_configs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -433,6 +441,7 @@ impl AcpAgent {
             });
 
         self.sessions.dispose_all().await;
+        self.mcp_configs.lock().await.clear();
         result
     }
 
@@ -441,7 +450,11 @@ impl AcpAgent {
     /// its pi subprocesses (they run in their own process group and would not
     /// receive the terminal's signal).
     pub async fn shutdown(&self) {
+        // Disposing the pi processes also disposes their in-pi MCP
+        // registrations (registrar `session_shutdown` hook + process-local
+        // state); the spec map is forgotten so nothing can be resurrected.
         self.sessions.dispose_all().await;
+        self.mcp_configs.lock().await.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -463,7 +476,16 @@ impl AcpAgent {
 
         let capabilities = AgentCapabilities::new()
             .load_session(true)
-            .mcp_capabilities(McpCapabilities::new().http(false).sse(false))
+            .mcp_capabilities({
+                // W-483: advertise the transports only when MCP wiring is
+                // switched on AND a pi-mcp-adapter is installed. `initialize`
+                // carries no cwd, so only the global install is probed —
+                // never a project directory. There is no `acp` item:
+                // MCP-over-ACP is out of scope.
+                let (http, sse) =
+                    mcp::advertise_mcp_capabilities(self.cfg.enable_mcp, mcp::adapter_available());
+                McpCapabilities::new().http(http).sse(sse)
+            })
             .prompt_capabilities(
                 PromptCapabilities::new()
                     .image(true)
@@ -499,6 +521,10 @@ impl AcpAgent {
                 req.cwd.display()
             )));
         }
+        // W-483: validate the caller's MCP menu before any side effect.
+        // Rejections name the offending server; unsupported transports are
+        // an explicit error, never a silent drop.
+        let mcp_specs = check_mcp_servers("session/new", &req.mcp_servers, self.cfg.enable_mcp)?;
         let _lifecycle = self.session_lifecycle.lock().await;
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
@@ -535,7 +561,14 @@ impl AcpAgent {
         }
 
         let session = match self
-            .spawn_session(Some(&req.cwd), None, None, cx, file_commands.clone())
+            .spawn_session(
+                Some(&req.cwd),
+                None,
+                None,
+                cx,
+                file_commands.clone(),
+                &mcp_specs,
+            )
             .await
         {
             Ok(session) => session,
@@ -574,6 +607,24 @@ impl AcpAgent {
                 .await;
             drain_startup_tasks(notice_task.take(), version_task.take()).await;
             return Err(auth_required());
+        }
+
+        // W-483: gate the handshake on the in-pi registrations. Every
+        // requested server must report back (registered or failed); a
+        // failure disposes the new session and names the failed servers —
+        // the old session is untouched (failure atomicity, same as the
+        // models checks above).
+        if !mcp_specs.is_empty() {
+            if let Err(err) = gate_mcp_registered(&session, &mcp_specs).await {
+                self.cleanup_failed_new_session(&session, Some(&state))
+                    .await;
+                drain_startup_tasks(notice_task.take(), version_task.take()).await;
+                return Err(err);
+            }
+            self.mcp_configs
+                .lock()
+                .await
+                .insert(session_id.0.to_string(), mcp_specs);
         }
 
         let (config_options, _models, modes) =
@@ -626,6 +677,18 @@ impl AcpAgent {
         // subprocess (TS parity — avoids leaking subprocesses when clients
         // start new sessions without closing old ones).
         self.sessions.close_all_except(&session_id).await;
+        // W-483: the retired sessions' MCP registrations die with their pi
+        // processes (registrations are process-local); forget their specs
+        // too, so a later restore cannot resurrect another session's menu.
+        // No spawn-first reorder is needed: registrations live in separate
+        // pi processes, so same-named servers in old and new sessions can
+        // never collide — the old teardown only has to happen, not precede.
+        // (W-480 settle-timeout recovery is untouched: this runs only after
+        // a fully successful handshake.)
+        self.mcp_configs
+            .lock()
+            .await
+            .retain(|id, _| id == session_id.0.as_ref());
 
         let mut meta = serde_json::Map::new();
         if !prelude_text.is_empty() {
@@ -802,6 +865,9 @@ impl AcpAgent {
                 req.cwd.display()
             )));
         }
+        // W-483: same validation as `session/new`; the replacement menu is
+        // stored before restore so the respawned pi registers it.
+        let mcp_specs = check_mcp_servers("session/load", &req.mcp_servers, self.cfg.enable_mcp)?;
 
         let _lifecycle = self.session_lifecycle.lock().await;
 
@@ -811,6 +877,23 @@ impl AcpAgent {
         // fixtures are used.
         self.sessions.close(&req.session_id).await;
         self.sessions.close_all_except(&req.session_id).await;
+        // Retired sessions' MCP specs are forgotten with their processes;
+        // the replacement menu (possibly empty) takes their place.
+        self.mcp_configs
+            .lock()
+            .await
+            .retain(|id, _| id == req.session_id.0.as_ref());
+        if mcp_specs.is_empty() {
+            self.mcp_configs
+                .lock()
+                .await
+                .remove(req.session_id.0.as_ref());
+        } else {
+            self.mcp_configs
+                .lock()
+                .await
+                .insert(req.session_id.0.to_string(), mcp_specs);
+        }
 
         *self.last_session_cwd.lock().await = Some(req.cwd.clone());
 
@@ -822,9 +905,21 @@ impl AcpAgent {
         let enable_skill_commands = get_enable_skill_commands(&req.cwd);
         let file_commands = commands::load_slash_commands(&req.cwd);
 
-        let session = self
+        let session = match self
             .restore_session(&req.session_id, Some(&req.cwd), cx)
-            .await?;
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                // The replacement never became usable: drop its menu too so
+                // a later prompt cannot resurrect a load the client saw fail.
+                self.mcp_configs
+                    .lock()
+                    .await
+                    .remove(req.session_id.0.as_ref());
+                return Err(err);
+            }
+        };
 
         self.store
             .upsert(&req.session_id.0, &stored_cwd, &stored_file);
@@ -911,6 +1006,12 @@ impl AcpAgent {
         &self,
         req: &DeleteSessionRequest,
     ) -> std::result::Result<DeleteSessionResponse, AcpError> {
+        // W-483: forget any MCP menu even when the session itself is already
+        // gone (idempotent delete must not leave a resurrectable menu).
+        self.mcp_configs
+            .lock()
+            .await
+            .remove(req.session_id.0.as_ref());
         let stored = self.store.get(&req.session_id.0);
         let pi_session = find_pi_session(&req.session_id.0);
 
@@ -929,6 +1030,11 @@ impl AcpAgent {
         }
         self.sessions.close(&req.session_id).await;
         self.store.delete(&req.session_id.0);
+        // W-483: forget the session's MCP menu with the session itself.
+        self.mcp_configs
+            .lock()
+            .await
+            .remove(req.session_id.0.as_ref());
         Ok(DeleteSessionResponse::new())
     }
 
@@ -1063,6 +1169,15 @@ impl AcpAgent {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from(&stored_cwd));
         let file_commands = commands::load_slash_commands(&effective_cwd);
+        // W-483: a respawned pi starts without the caller's menu — re-apply
+        // the stored specs instead of silently dropping them.
+        let mcp_specs = self
+            .mcp_configs
+            .lock()
+            .await
+            .get(session_id.0.as_ref())
+            .cloned()
+            .unwrap_or_default();
 
         let session = self
             .spawn_session(
@@ -1071,8 +1186,19 @@ impl AcpAgent {
                 Some(session_id.clone()),
                 cx,
                 file_commands,
+                &mcp_specs,
             )
             .await?;
+
+        if !mcp_specs.is_empty() {
+            // Re-registration gate: loud on failure (the stored specs stay
+            // so a retry is explicit, never a silent downgrade), and the
+            // half-restored session is closed so no residue survives.
+            if let Err(err) = gate_mcp_registered(&session, &mcp_specs).await {
+                self.sessions.close(session_id).await;
+                return Err(err);
+            }
+        }
 
         *self.last_session_cwd.lock().await = Some(effective_cwd.clone());
         self.store.upsert(
@@ -1084,7 +1210,10 @@ impl AcpAgent {
     }
 
     /// Spawn a session (new or restored) and register it, wiring its outbound
-    /// channel to the SDK connection.
+    /// channel to the SDK connection. When `mcp_specs` is non-empty the pi
+    /// child additionally loads the MCP registrar extension with the
+    /// session-scoped payload (W-483); the registration gate itself runs in
+    /// the caller (`handle_new_session` / `restore_session`).
     async fn spawn_session(
         &self,
         cwd: Option<&Path>,
@@ -1092,14 +1221,37 @@ impl AcpAgent {
         session_id_override: Option<SessionId>,
         cx: &ConnectionTo<Client>,
         file_commands: Vec<FileSlashCommand>,
+        mcp_specs: &[McpServerSpec],
     ) -> std::result::Result<Arc<PiAcpSession>, AcpError> {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(512);
         let conn = cx.clone();
         spawn_outbound_connector(conn, outbound_rx)?;
 
+        let mut extra_args: Vec<String> = Vec::new();
+        let mut extra_env: Vec<(String, String)> = Vec::new();
+        if !mcp_specs.is_empty() {
+            let registrar = mcp::materialize_registrar().map_err(|e| {
+                AcpError::new(
+                    ACP_INTERNAL_ERROR,
+                    format!("failed to stage the MCP registrar extension: {e}"),
+                )
+            })?;
+            let payload = mcp::McpSessionManager::new(mcp_specs.to_vec())
+                .payload_json()
+                .map_err(|e| {
+                    AcpError::new(
+                        ACP_INTERNAL_ERROR,
+                        format!("failed to serialize the MCP session payload: {e}"),
+                    )
+                })?;
+            extra_args.push("--extension".to_string());
+            extra_args.push(registrar.to_string_lossy().to_string());
+            extra_env.push((mcp::MCP_SERVERS_ENV.to_string(), payload));
+        }
+
         let session = PiAcpSession::spawn(SessionParams {
             pi_command: self.cfg.pi_command.clone(),
-            extra_args: vec![],
+            extra_args,
             timeout: std::time::Duration::from_secs(self.cfg.rpc_timeout_secs),
             settle_timeout: std::time::Duration::from_secs(self.cfg.settle_timeout_secs),
             cwd: cwd.unwrap_or_else(|| Path::new(".")).to_path_buf(),
@@ -1107,6 +1259,7 @@ impl AcpAgent {
             session_path,
             session_id_override,
             file_commands,
+            extra_env,
         })
         .await?;
         self.sessions.insert(session.clone()).await;
@@ -1505,6 +1658,82 @@ fn resolve_session_file_path(cwd: &Path, session_file: &str) -> PathBuf {
 
 fn invalid_params(msg: &str) -> AcpError {
     AcpError::new(ACP_INVALID_PARAMS, msg.to_string())
+}
+
+/// Validate an ACP `mcp_servers` menu (W-483). Pure validation runs before
+/// any side effect; every rejection names the offending server so the caller
+/// can fix exactly that entry. An empty menu is the common case and returns
+/// an empty vec (the pre-MCP path is then byte-for-byte untouched).
+fn check_mcp_servers(
+    method: &str,
+    servers: &[McpServer],
+    mcp_enabled: bool,
+) -> std::result::Result<Vec<McpServerSpec>, AcpError> {
+    let specs = mcp::normalize_mcp_servers(servers)
+        .map_err(|msg| invalid_params(&format!("{method}: {msg}")))?;
+    if specs.is_empty() {
+        return Ok(specs);
+    }
+    if !mcp_enabled {
+        return Err(invalid_params(&format!(
+            "{method} requested MCP servers, but MCP wiring is disabled \
+             (set PI_ACP_ENABLE_MCP=true and install pi-mcp-adapter as a pi \
+             package with `pi install npm:pi-mcp-adapter`)"
+        )));
+    }
+    if !mcp::adapter_available() {
+        return Err(invalid_params(&format!(
+            "{method} requested MCP servers, but no pi-mcp-adapter is installed \
+             for pi (run `pi install npm:pi-mcp-adapter`); refusing to silently drop \
+             the requested servers"
+        )));
+    }
+    Ok(specs)
+}
+
+/// Wait for the in-pi registrar's per-server markers (W-483 handshake gate).
+///
+/// Resolves once every requested server reported `registered` or `failed`.
+/// A `failed` marker becomes `invalidParams` naming exactly the failed
+/// servers (per-server isolation: one server's failure is that server's
+/// error); a marker that never arrives (registrar/adapter missing or dead
+/// pi) becomes an internal error naming the pending servers. Never resolves
+/// silently with a partial menu.
+async fn gate_mcp_registered(
+    session: &Arc<PiAcpSession>,
+    specs: &[McpServerSpec],
+) -> std::result::Result<(), AcpError> {
+    let mut manager = mcp::McpSessionManager::new(specs.to_vec());
+    let deadline = tokio::time::Instant::now() + mcp::MCP_REGISTER_TIMEOUT;
+    loop {
+        match session.mcp_marker_snapshot().await {
+            Ok(lines) => manager.apply_markers(&lines),
+            // The pump is gone (pi died mid-handshake): stop polling and
+            // report what is still missing below.
+            Err(_) => break,
+        }
+        if manager.is_settled() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if let Some(msg) = manager.failure_message() {
+        return Err(invalid_params(&msg));
+    }
+    let pending = manager.pending();
+    if !pending.is_empty() {
+        return Err(AcpError::new(
+            ACP_INTERNAL_ERROR,
+            format!(
+                "MCP registration timed out after {}s waiting for pi to confirm: {}. \
+                 The pi-mcp-adapter may be missing or failed to load; \
+                 not retrying automatically.",
+                mcp::MCP_REGISTER_TIMEOUT.as_secs(),
+                pending.join(", "),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn auth_required() -> AcpError {

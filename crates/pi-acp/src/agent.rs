@@ -147,7 +147,7 @@ impl NewSessionPostResponse {
     async fn send(self, cx: &ConnectionTo<Client>) {
         let session_id = self.session.session_id().clone();
         if !self.prelude_text.is_empty() {
-            send_startup_text_chunk(cx, &session_id, &self.prelude_text).await;
+            send_text_chunk(cx, &session_id, &self.prelude_text).await;
         }
         advertise_commands(
             cx,
@@ -1856,22 +1856,6 @@ async fn send_text_chunk(cx: &ConnectionTo<Client>, session_id: &SessionId, text
         session_id.clone(),
         SessionUpdate::AgentMessageChunk(chunk),
     ));
-}
-
-async fn send_startup_text_chunk(cx: &ConnectionTo<Client>, session_id: &SessionId, text: &str) {
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())))
-        .meta(startup_info_meta());
-    let _ = cx.send_notification(SessionNotification::new(
-        session_id.clone(),
-        SessionUpdate::AgentMessageChunk(chunk),
-    ));
-}
-
-fn startup_info_meta() -> serde_json::Map<String, Value> {
-    json!({ "piAcp": { "startupInfo": true } })
-        .as_object()
-        .expect("static startup info meta")
-        .clone()
 }
 
 /// Fetch `session_configuration`: configOptions + model/mode states.

@@ -5,8 +5,8 @@
 //! settings `sessionDir` override), read the first line (header: `id`, `cwd`,
 //! `type: "session"`) and the tail for the latest `session_info.name` (title)
 //! and `message.timestamp` (updatedAt). Used by `session/list` / `session/delete`
-//! / `session/load` (S6, W-453); `~` expansion of `PI_CODING_AGENT_DIR` is
-//! unified through `settings::agent_dir` (see upstream svkozak/pi-acp#88).
+//! / `session/load` (S6, W-453); `~` expansion is unified through
+//! `settings::agent_dir` (fixes #88).
 
 use std::fs;
 use std::io::Read;

@@ -261,6 +261,15 @@ async fn full_method_set_against_mock_pi() {
                 unreachable!()
             };
             assert!(st.text.contains("## Context"), "startup info: {}", st.text);
+            assert_eq!(
+                sc.meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("piAcp"))
+                    .and_then(|meta| meta.get("startupInfo"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "startup info chunk must be tagged"
+            );
 
             // available_commands_update: pi commands + builtins, no extensions.
             let commands = wait_for(&log, |u| {
@@ -335,7 +344,13 @@ async fn full_method_set_against_mock_pi() {
                     if matches!(&c.content, ContentBlock::Text(t) if t.text.contains("hello from mock")))
             })
             .await;
-            let _ = chunk;
+            let SessionUpdate::AgentMessageChunk(assistant_chunk) = chunk else {
+                unreachable!()
+            };
+            assert!(
+                assistant_chunk.meta.is_none(),
+                "ordinary assistant chunks must not carry startup metadata"
+            );
             // usage_update (decision 3): used=15 from the final assistant
             // message_end, size=1000 from the mock model's contextWindow.
             let usage = wait_for(&log, |u| {

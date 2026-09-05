@@ -115,9 +115,109 @@ in the environment that launches `pi-acp-rs`:
 | `PI_ACP_PI_COMMAND` | `pi` | Path or command name for pi. On Windows, use the full path to the npm-generated `pi.cmd` when it is not on `PATH`. |
 | `PI_ACP_VERSION_CHECK` | `false` | Set to `true` to show a startup notice when a newer pi version is available. |
 | `PI_ACP_ENABLE_EMBEDDED_CONTEXT` | `false` | Set to `true` for ACP clients that send embedded context. |
+| `PI_ACP_ENABLE_MCP` | `false` | Set to `true` to accept and wire non-empty ACP `mcpServers` through `pi-mcp-adapter`. |
 | `PI_ACP_RPC_TIMEOUT_SECS` | `30` | Maximum time to wait for an individual pi request. |
 | `PI_ACP_SETTLE_TIMEOUT_SECS` | `600` | Maximum time to wait for pi to finish a turn after accepting a prompt. Set to `0` to disable this fallback. |
 | `RUST_LOG` | `warn` | Set to `pi_acp=debug` for diagnostic logs. Logs are written to stderr so ACP stdout remains available for protocol messages. |
+
+## MCP support
+
+MCP support is opt-in. `pi-acp-rs` does not discover Zed's MCP settings and does
+not read or write `.pi/mcp.json`. The supported path is:
+
+```text
+Zed -- ACP session/new|load mcpServers --> pi-acp-rs
+    -- runtime-register --> pi-mcp-adapter inside pi
+    -- stdio/http/sse --> MCP servers
+```
+
+To enable this path:
+
+1. Install the adapter as a global pi package in the same environment and pi
+   agent directory used by Zed:
+
+   ```bash
+   pi install npm:pi-mcp-adapter
+   ```
+
+2. Set the flag in the Zed `agent_servers` entry. Putting it only in a shell
+   that was not used to launch Zed may have no effect:
+
+   ```json
+   {
+     "agent_servers": {
+       "pi": {
+         "command": "pi-acp-rs",
+         "args": [],
+         "env": {
+           "PI_ACP_ENABLE_MCP": "true"
+         }
+       }
+     }
+   }
+   ```
+
+3. Configure servers in Zed's `context_servers` settings. A custom stdio
+   server uses `source: "stdio"`; an HTTP server uses `source: "http"`:
+
+   ```json
+   {
+     "context_servers": {
+       "my-local-server": {
+         "source": "stdio",
+         "command": "/path/to/my-mcp-server",
+         "args": [],
+         "env": {}
+       },
+       "my-http-server": {
+         "source": "http",
+         "url": "https://example.example/mcp"
+       }
+     }
+   }
+   ```
+
+   Create a new ACP session after changing either configuration. The server
+   command, arguments, and environment must be usable by the process that runs
+   pi. MCP registrations are session-scoped and are not persisted to disk.
+
+### Remote development
+
+For a remote Zed project, Zed only sends stdio servers that have
+`"remote": true`. This applies to both custom and extension-provided context
+servers. Set that flag only when the command is installed and can run in the
+remote agent environment:
+
+```json
+{
+  "source": "stdio",
+  "remote": true,
+  "command": "/usr/local/bin/my-mcp-server",
+  "args": []
+}
+```
+
+If the server must keep running on the local machine while the agent is remote,
+use an HTTP endpoint reachable by the remote agent. A local stdio process needs
+a Zed-side relay or MCP-over-ACP support; `pi-acp-rs` cannot recover it from an
+empty ACP `mcpServers` list.
+
+### Diagnose an empty server list
+
+Inspect the raw ACP `session/new` or `session/load` request:
+
+- `"mcpServers": []` means Zed did not pass any server. Changing
+  `PI_ACP_ENABLE_MCP` cannot add one; check Zed `context_servers`, enabled
+  state, project scope, and the `remote` flag.
+- A non-empty list with `MCP wiring is disabled` means
+  `PI_ACP_ENABLE_MCP=true` was not inherited by pi-acp.
+- A non-empty list with an adapter error means `pi-mcp-adapter` is not
+  installed in the pi agent directory used by that session.
+
+The default is `false` deliberately: accepting an ACP MCP menu can start
+external commands and connect to network services. Explicit opt-in preserves
+existing pi behavior and keeps the advertised ACP capabilities honest when the
+optional adapter is unavailable.
 
 ## Troubleshooting
 

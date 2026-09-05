@@ -154,7 +154,11 @@ pub fn build_startup_info_at(
                     for pkg in pkgs {
                         if let Some(s) = pkg.as_str() {
                             if let Some(npm) = s.strip_prefix("npm:") {
-                                ext_items.push(format!("{npm}\n  - index.ts"));
+                                // W-491 (upstream #23): never fabricate package
+                                // contents. The startup layer does not resolve
+                                // npm packages, so render only the specifier
+                                // with no `index.ts` sub-item.
+                                ext_items.push(npm.to_string());
                             } else {
                                 ext_items.push(s.to_string());
                             }
@@ -437,10 +441,10 @@ mod tests {
         let out = build_startup_info_at(&agent, &cwd, None, None);
 
         assert!(out.contains("## Extensions"), "{out}");
-        assert!(
-            out.contains("@earendil-works/pi-codex\n  - index.ts"),
-            "{out}"
-        );
+        assert!(out.contains("- @earendil-works/pi-codex"), "{out}");
         assert!(out.contains("local-ext"), "{out}");
+        // W-491 (upstream #23): package contents are unknown here, so no
+        // fabricated `index.ts` sub-item may be rendered.
+        assert!(!out.contains("index.ts"), "{out}");
     }
 }

@@ -1227,7 +1227,13 @@ impl AcpAgent {
         let conn = cx.clone();
         spawn_outbound_connector(conn, outbound_rx)?;
 
-        let mut extra_args: Vec<String> = Vec::new();
+        // User-configured pi flags first (W-496: `PI_ACP_PI_EXTRA_ARGS`),
+        // then the generated MCP registrar `--extension` pair, so the
+        // registrar flags stay adjacent and are never split by user args.
+        // Both travel as separate argv entries through the existing
+        // `resolve` spawn path — no shell quoting is built here (Windows
+        // batch-wrapper quoting stays in `resolve.rs`).
+        let mut extra_args: Vec<String> = self.cfg.pi_extra_args.clone();
         let mut extra_env: Vec<(String, String)> = Vec::new();
         if !mcp_specs.is_empty() {
             let registrar = mcp::materialize_registrar().map_err(|e| {

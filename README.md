@@ -117,6 +117,8 @@ in the environment that launches `pi-acp-rs`:
 | `PI_ACP_ENABLE_EMBEDDED_CONTEXT` | `false` | Set to `true` for ACP clients that send embedded context. |
 | `PI_ACP_ENABLE_MCP` | `false` | Set to `true` to accept and wire non-empty ACP `mcpServers` through `pi-mcp-adapter`. |
 | `PI_ACP_SESSION_MAP` | `<agent dir>/pi-acp/session-map.json` | Full file path for `session-map.json`. Missing parent directories are created on first write. Unset or empty keeps the default. |
+| `PI_CODING_AGENT_SKILL_DIR` | _(unset)_ | Skill directory for spawned pi processes. When set, pi-acp passes `--no-skills --skill <dir>` so the child loads exactly that directory instead of the ambient skills. `~` and relative paths expand like `PI_CODING_AGENT_DIR`. Unset or empty keeps the default. |
+| `PI_CODING_AGENT_SESSION_DIR` | `<agent dir>/sessions` (or settings `sessionDir`) | Sessions directory scanned by `session/list|load|delete`. Takes priority over the settings `sessionDir` override. `~` and relative paths expand like `PI_CODING_AGENT_DIR`. Unset or empty keeps the default. |
 | `PI_ACP_RPC_TIMEOUT_SECS` | `30` | Maximum time to wait for an individual pi request. |
 | `PI_ACP_SETTLE_TIMEOUT_SECS` | `600` | Maximum time to wait for pi to finish a turn after accepting a prompt. Set to `0` to disable this fallback. |
 | `RUST_LOG` | `warn` | Set to `pi_acp=debug` for diagnostic logs. Logs are written to stderr so ACP stdout remains available for protocol messages. |

@@ -64,6 +64,31 @@ const PRELUDE_CAP: usize = 200;
 /// defensive — a menu with hundreds of servers is already unreasonable).
 const MCP_MARKER_CAP: usize = 128;
 
+/// Environment variable letting the embedder pin the pi skill directory
+/// (upstream svkozak/pi-acp#99: multi-tenant servers isolate skills per
+/// pi process). When set to a non-empty value, spawn passes
+/// `--no-skills --skill <dir>` so the child loads exactly that directory
+/// instead of the host user's ambient skills. Unset or empty keeps the
+/// default behavior (zero behavior change).
+pub const SKILL_DIR_ENV: &str = "PI_CODING_AGENT_SKILL_DIR";
+
+/// Extra spawn flags for the embedder-configured skill directory: `[]` when
+/// [`SKILL_DIR_ENV`] is unset/empty, else `["--no-skills", "--skill", dir]`.
+/// `~` and relative paths expand exactly like `PI_CODING_AGENT_DIR` (#88).
+pub fn skill_dir_extra_args() -> Vec<String> {
+    let Some(dir) = std::env::var(SKILL_DIR_ENV)
+        .ok()
+        .and_then(|raw| crate::settings::expand_dir_env_value(&raw))
+    else {
+        return Vec::new();
+    };
+    vec![
+        "--no-skills".to_string(),
+        "--skill".to_string(),
+        dir.to_string_lossy().into_owned(),
+    ]
+}
+
 /// Shared state between the client handle and the two background tasks
 /// (reader + watcher).
 struct Shared {
@@ -201,6 +226,10 @@ impl PiProcess {
         let mut cmd = Command::new(&resolved.program);
         cmd.args(&resolved.cmd_args);
         cmd.args(["--mode", "rpc", "--no-themes"]);
+        // Embedder skill-dir override (upstream #99): drop the ambient skill
+        // set first so the child loads exactly the named directory. Empty
+        // unless the env var is set, so default spawns are byte-identical.
+        cmd.args(skill_dir_extra_args());
         if let Some(path) = session_path {
             cmd.arg("--session").arg(path);
         }
@@ -995,6 +1024,81 @@ pub fn text_delta_of(event: &RpcEvent) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::pi::rpc::AssistantMessageEvent;
+
+    /// Serializes the skill-dir tests: `std::env` is process-global and the
+    /// harness runs tests on threads in the same process.
+    fn skill_dir_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        &LOCK
+    }
+
+    fn stash_skill_dir_env() -> Option<std::ffi::OsString> {
+        std::env::var_os(SKILL_DIR_ENV)
+    }
+
+    fn restore_skill_dir_env(prev: Option<std::ffi::OsString>) {
+        match prev {
+            // SAFETY: the caller holds `skill_dir_env_lock`.
+            Some(v) => unsafe { std::env::set_var(SKILL_DIR_ENV, v) },
+            None => unsafe { std::env::remove_var(SKILL_DIR_ENV) },
+        }
+    }
+
+    #[test]
+    fn skill_dir_unset_means_no_extra_args() {
+        let _guard = skill_dir_env_lock().lock().unwrap();
+        let prev = stash_skill_dir_env();
+        // SAFETY: under `skill_dir_env_lock`.
+        unsafe { std::env::remove_var(SKILL_DIR_ENV) };
+        assert!(skill_dir_extra_args().is_empty());
+        restore_skill_dir_env(prev);
+    }
+
+    #[test]
+    fn skill_dir_empty_or_whitespace_means_no_extra_args() {
+        let _guard = skill_dir_env_lock().lock().unwrap();
+        let prev = stash_skill_dir_env();
+        for raw in ["", "   "] {
+            // SAFETY: under `skill_dir_env_lock`.
+            unsafe { std::env::set_var(SKILL_DIR_ENV, raw) };
+            assert!(skill_dir_extra_args().is_empty(), "raw: {raw:?}");
+        }
+        restore_skill_dir_env(prev);
+    }
+
+    #[test]
+    fn skill_dir_set_yields_no_skills_plus_skill() {
+        let _guard = skill_dir_env_lock().lock().unwrap();
+        let prev = stash_skill_dir_env();
+        // A real absolute dir (portable: TempDir is absolute on every CI
+        // target; a literal `/tmp/...` is not absolute on Windows).
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_dir = dir.path().join("tenant-skills");
+        // SAFETY: under `skill_dir_env_lock`.
+        unsafe { std::env::set_var(SKILL_DIR_ENV, &skill_dir) };
+        assert_eq!(
+            skill_dir_extra_args(),
+            vec![
+                "--no-skills".to_string(),
+                "--skill".to_string(),
+                skill_dir.to_string_lossy().into_owned(),
+            ]
+        );
+        restore_skill_dir_env(prev);
+    }
+
+    #[test]
+    fn skill_dir_expands_tilde_like_agent_dir() {
+        let _guard = skill_dir_env_lock().lock().unwrap();
+        let prev = stash_skill_dir_env();
+        let home = dirs::home_dir().expect("test requires a home dir");
+        // SAFETY: under `skill_dir_env_lock`.
+        unsafe { std::env::set_var(SKILL_DIR_ENV, "~/tenant-skills") };
+        let args = skill_dir_extra_args();
+        assert_eq!(&args[..2], &["--no-skills", "--skill"]);
+        assert_eq!(args[2], home.join("tenant-skills").to_string_lossy());
+        restore_skill_dir_env(prev);
+    }
 
     #[test]
     fn strips_csi_color_codes() {

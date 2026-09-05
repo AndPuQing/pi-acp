@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::settings::agent_dir;
+use crate::settings::expand_dir_env_value;
 
 /// Tail window read for title/updatedAt extraction (bytes).
 const TAIL_BYTES: u64 = 256 * 1024;
@@ -31,14 +32,39 @@ pub struct PiSessionListItem {
     pub session_file: String,
 }
 
-/// The pi sessions directory: settings `sessionDir` override (resolved against
-/// the agent dir), else `<agent dir>/sessions`.
+/// Environment variable letting the embedder pin the pi sessions directory
+/// (upstream svkozak/pi-acp#99: multi-tenant servers isolate session files
+/// per pi process). Takes priority over the settings `sessionDir` override.
+/// Unset or empty keeps the default behavior (zero behavior change).
+pub const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
+
+/// The pi sessions directory: [`SESSION_DIR_ENV`] when set to a non-empty
+/// value (resolved like `PI_CODING_AGENT_DIR`: `~` expansion, relative
+/// against the cwd), else the settings `sessionDir` override (resolved
+/// against the agent dir), else `<agent dir>/sessions`.
 pub fn pi_sessions_dir() -> PathBuf {
-    let agent = agent_dir();
-    if let Some(dir) = read_session_dir_from_settings(&agent) {
+    resolve_sessions_dir(session_dir_from_env(), &agent_dir())
+}
+
+/// Pure core of [`pi_sessions_dir`] (testable without touching the real
+/// `~/.pi` or the process environment): the env value wins over the
+/// settings override, which wins over the `<agent dir>/sessions` default.
+fn resolve_sessions_dir(env: Option<PathBuf>, agent: &Path) -> PathBuf {
+    if let Some(dir) = env {
+        return dir;
+    }
+    if let Some(dir) = read_session_dir_from_settings(agent) {
         return dir;
     }
     agent.join("sessions")
+}
+
+/// [`SESSION_DIR_ENV`] expanded as a directory value; `None` when unset,
+/// empty, or whitespace-only.
+fn session_dir_from_env() -> Option<PathBuf> {
+    std::env::var(SESSION_DIR_ENV)
+        .ok()
+        .and_then(|raw| expand_dir_env_value(&raw))
 }
 
 /// `sessionDir` from `<agent dir>/settings.json`, resolved against the agent
@@ -708,5 +734,105 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list_pi_sessions_from(&custom).len(), 1);
+    }
+
+    /// Serializes the env-override tests: `std::env` is process-global and
+    /// the harness runs tests on threads in the same process.
+    fn session_dir_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        &LOCK
+    }
+
+    fn stash_session_dir_env() -> Option<std::ffi::OsString> {
+        std::env::var_os(SESSION_DIR_ENV)
+    }
+
+    fn restore_session_dir_env(prev: Option<std::ffi::OsString>) {
+        match prev {
+            // SAFETY: the caller holds `session_dir_env_lock`.
+            Some(v) => unsafe { std::env::set_var(SESSION_DIR_ENV, v) },
+            None => unsafe { std::env::remove_var(SESSION_DIR_ENV) },
+        }
+    }
+
+    fn agent_dir_with_session_dir(agent: &Path, session_dir: &Path) {
+        fs::create_dir_all(agent).unwrap();
+        // Serialize via serde_json so Windows backslashes are valid JSON
+        // escapes (a raw interpolated path would not parse).
+        fs::write(
+            agent.join("settings.json"),
+            serde_json::json!({ "sessionDir": session_dir.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_env_wins_over_settings_override() {
+        let dir = TempDir::new().unwrap();
+        let agent = dir.path().join("agent");
+        let from_settings = dir.path().join("from-settings");
+        agent_dir_with_session_dir(&agent, &from_settings);
+        let from_env = dir.path().join("from-env");
+        assert_eq!(
+            resolve_sessions_dir(Some(from_env.clone()), &agent),
+            from_env
+        );
+    }
+
+    #[test]
+    fn resolve_settings_override_wins_over_default() {
+        let dir = TempDir::new().unwrap();
+        let agent = dir.path().join("agent");
+        let from_settings = dir.path().join("from-settings");
+        agent_dir_with_session_dir(&agent, &from_settings);
+        assert_eq!(resolve_sessions_dir(None, &agent), from_settings);
+    }
+
+    #[test]
+    fn resolve_default_is_agent_sessions() {
+        let dir = TempDir::new().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        assert_eq!(resolve_sessions_dir(None, &agent), agent.join("sessions"));
+    }
+
+    #[test]
+    fn session_dir_from_env_rejects_unset_and_empty() {
+        let _guard = session_dir_env_lock().lock().unwrap();
+        let prev = stash_session_dir_env();
+        // SAFETY: under `session_dir_env_lock`.
+        unsafe { std::env::remove_var(SESSION_DIR_ENV) };
+        assert_eq!(session_dir_from_env(), None);
+        for raw in ["", "   "] {
+            // SAFETY: under `session_dir_env_lock`.
+            unsafe { std::env::set_var(SESSION_DIR_ENV, raw) };
+            assert_eq!(session_dir_from_env(), None, "raw: {raw:?}");
+        }
+        restore_session_dir_env(prev);
+    }
+
+    #[test]
+    fn pi_sessions_dir_honors_env_override() {
+        let _guard = session_dir_env_lock().lock().unwrap();
+        let prev = stash_session_dir_env();
+        let dir = TempDir::new().unwrap();
+        let custom = dir.path().join("custom-sessions");
+        // SAFETY: under `session_dir_env_lock`.
+        unsafe { std::env::set_var(SESSION_DIR_ENV, &custom) };
+        // The env branch wins without consulting the agent dir at all, so
+        // this holds regardless of the ambient `PI_CODING_AGENT_DIR`.
+        assert_eq!(pi_sessions_dir(), custom);
+        restore_session_dir_env(prev);
+    }
+
+    #[test]
+    fn pi_sessions_dir_expands_tilde_in_env() {
+        let _guard = session_dir_env_lock().lock().unwrap();
+        let prev = stash_session_dir_env();
+        let home = dirs::home_dir().expect("test requires a home dir");
+        // SAFETY: under `session_dir_env_lock`.
+        unsafe { std::env::set_var(SESSION_DIR_ENV, "~/tenant-sessions") };
+        assert_eq!(pi_sessions_dir(), home.join("tenant-sessions"));
+        restore_session_dir_env(prev);
     }
 }

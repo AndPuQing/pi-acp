@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use pi_acp::error::AcpxError;
 use pi_acp::pi::process::PiProcess;
+use pi_acp::pi::process::SKILL_DIR_ENV;
 use pi_acp::pi::rpc::{QueueMode, RpcCommand, RpcEvent, RpcSessionState};
 
 /// Path to the `pi-acp` binary under test (set by cargo for integration tests).
@@ -52,6 +53,100 @@ async fn spawn_in_dir_sets_pi_cwd() {
     let reported = fs::canonicalize(fs::read_to_string(cwd_log).unwrap().trim()).unwrap();
     assert_eq!(reported, fs::canonicalize(tmp.path()).unwrap());
     pi.dispose().await;
+}
+
+/// Serializes the skill-dir spawn tests: `std::env` is process-global and
+/// the harness runs tests on threads in the same process (async-aware mutex
+/// so the guard may be held across awaits).
+static SKILL_DIR_ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn acquire_skill_dir_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    SKILL_DIR_ENV_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// W-495 (upstream #99): with `PI_CODING_AGENT_SKILL_DIR` set, the spawned
+/// pi child receives `--no-skills --skill <dir>` before `--session`.
+#[tokio::test]
+async fn spawn_passes_skill_dir_flags_to_pi() {
+    let _guard = acquire_skill_dir_env_lock().await;
+    let prev = std::env::var_os(SKILL_DIR_ENV);
+    let tmp = tempfile::tempdir().unwrap();
+    let skill_dir = tmp.path().join("tenant-skills");
+    let argv_log = tmp.path().join("argv.log");
+    let session_file = tmp.path().join("s.jsonl");
+    // SAFETY: under `skill_dir_env_lock`; restored below.
+    unsafe { std::env::set_var(SKILL_DIR_ENV, &skill_dir) };
+
+    let argv_log_arg = argv_log.to_string_lossy().into_owned();
+    let mut pi = PiProcess::spawn_with_args(
+        BIN,
+        &["--mock-rpc", "--mock-argv-log", &argv_log_arg],
+        Some(&session_file),
+        FAST_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    pi.get_state().await.unwrap();
+    pi.dispose().await;
+
+    match prev {
+        Some(v) => unsafe { std::env::set_var(SKILL_DIR_ENV, v) },
+        None => unsafe { std::env::remove_var(SKILL_DIR_ENV) },
+    }
+
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    let lines: Vec<&str> = argv.lines().collect();
+    let pos = |flag: &str| lines.iter().position(|l| *l == flag).unwrap();
+    let no_skills = pos("--no-skills");
+    let skill = pos("--skill");
+    let session = pos("--session");
+    assert_eq!(lines[skill + 1], skill_dir.to_string_lossy());
+    assert_eq!(
+        lines[session + 1],
+        session_file.to_string_lossy(),
+        "argv:\n{argv}"
+    );
+    assert!(
+        no_skills < skill && skill + 1 < session,
+        "skill flags must precede --session, argv:\n{argv}"
+    );
+}
+
+/// W-495 default: without the env var the spawn argv carries no skill flags.
+#[tokio::test]
+async fn spawn_without_skill_dir_passes_no_skill_flags() {
+    let _guard = acquire_skill_dir_env_lock().await;
+    let prev = std::env::var_os(SKILL_DIR_ENV);
+    // SAFETY: under `skill_dir_env_lock`; restored below.
+    unsafe { std::env::remove_var(SKILL_DIR_ENV) };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let argv_log = tmp.path().join("argv.log");
+    let argv_log_arg = argv_log.to_string_lossy().into_owned();
+    let mut pi = PiProcess::spawn_with_args(
+        BIN,
+        &["--mock-rpc", "--mock-argv-log", &argv_log_arg],
+        None,
+        FAST_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    pi.get_state().await.unwrap();
+    pi.dispose().await;
+
+    match prev {
+        Some(v) => unsafe { std::env::set_var(SKILL_DIR_ENV, v) },
+        None => unsafe { std::env::remove_var(SKILL_DIR_ENV) },
+    }
+
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    assert!(
+        !argv.lines().any(|l| l == "--skill" || l == "--no-skills"),
+        "argv:\n{argv}"
+    );
 }
 
 /// Normal request/response round-trip with typed `get_state` payload.

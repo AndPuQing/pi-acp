@@ -189,6 +189,8 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-command-log <path>`  append each received command type
 /// - `--mock-extension-log <path>` append each received `extension_ui_response`
 /// - `--mock-cwd-log <path>`      write the mock's startup cwd
+/// - `--mock-argv-log <path>`     write the mock's full argv (one per line;
+///   used to assert which flags pi-acp passed to the child)
 /// - `--mock-prompt-error <text>`   answer `prompt` with `success:false` and this
 ///   error text (auth/error-surfacing tests)
 /// - `--mock-prompt-hang`          accept/read `prompt` but withhold its response;
@@ -225,6 +227,7 @@ async fn run_mock_rpc() -> Result<()> {
     let mut command_log: Option<PathBuf> = None;
     let mut extension_log: Option<PathBuf> = None;
     let mut cwd_log: Option<PathBuf> = None;
+    let mut argv_log: Option<PathBuf> = None;
     let mut prompt_error: Option<String> = None;
     let mut prompt_hang = false;
     let mut prompt_response_after_events_ms: u64 = 0;
@@ -263,6 +266,7 @@ async fn run_mock_rpc() -> Result<()> {
             "--mock-command-log" => command_log = args.next().map(PathBuf::from),
             "--mock-extension-log" => extension_log = args.next().map(PathBuf::from),
             "--mock-cwd-log" => cwd_log = args.next().map(PathBuf::from),
+            "--mock-argv-log" => argv_log = args.next().map(PathBuf::from),
             "--mock-prompt-error" => prompt_error = args.next(),
             "--mock-prompt-hang" => prompt_hang = true,
             "--mock-prompt-response-after-events-ms" => {
@@ -302,6 +306,13 @@ async fn run_mock_rpc() -> Result<()> {
         .unwrap_or_else(|| "mock-session-id".to_string());
     let persist_new_session = session_arg.is_none() && env_session_file.is_some();
 
+    if argv_log.is_none() {
+        argv_log = std::env::var_os("PI_ACP_MOCK_ARGV_LOG").map(PathBuf::from);
+    }
+    if let Some(log) = &argv_log {
+        let argv = std::env::args().skip(1).collect::<Vec<_>>().join("\n");
+        append_log(log, &argv);
+    }
     if let Some(log) = &cwd_log {
         if let Ok(cwd) = std::env::current_dir() {
             append_log(log, &cwd.to_string_lossy());

@@ -1397,17 +1397,8 @@ impl Pump {
                 self.emit_text(&format_auto_retry_message(attempt, max_attempts, delay_ms))
                     .await;
             }
-            RpcEvent::AutoRetryEnd {
-                success,
-                attempt,
-                final_error,
-            } => {
-                self.emit_text(&format_auto_retry_end_message(
-                    success,
-                    attempt,
-                    final_error.as_deref(),
-                ))
-                .await;
+            RpcEvent::AutoRetryEnd { .. } => {
+                self.emit_text("Retry finished, resuming.").await;
             }
             RpcEvent::CompactionStart { reason } => {
                 if matches!(
@@ -2472,18 +2463,6 @@ fn raw_input_of_tool_call(tool_call: &Value) -> Option<Value> {
     }
 }
 
-/// Auto-retry end notice text. Mirrors the upstream #98-Bug2 fix: a failed
-/// retry must never claim to have resumed.
-fn format_auto_retry_end_message(success: bool, attempt: u32, final_error: Option<&str>) -> String {
-    if success {
-        return format!("Retry succeeded after {attempt} attempts, resuming.");
-    }
-    match final_error.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(err) => format!("Retry failed after {attempt} attempts: {err}"),
-        None => format!("Retry failed after {attempt} attempts."),
-    }
-}
-
 /// Auto-retry notice text (TS `formatAutoRetryMessage`).
 fn format_auto_retry_message(attempt: u32, max_attempts: u32, delay_ms: u64) -> String {
     if attempt == 0 || max_attempts == 0 {
@@ -2565,29 +2544,6 @@ mod tests {
         // missing/zero fields fall back
         assert_eq!(format_auto_retry_message(0, 3, 1000), "Retrying...");
         assert_eq!(format_auto_retry_message(1, 0, 1000), "Retrying...");
-    }
-
-    #[test]
-    fn format_auto_retry_end_branches_on_success() {
-        // success carries the attempt count and claims resumption
-        assert_eq!(
-            format_auto_retry_end_message(true, 2, None),
-            "Retry succeeded after 2 attempts, resuming."
-        );
-        // failure surfaces finalError and never claims resumption
-        assert_eq!(
-            format_auto_retry_end_message(false, 3, Some("boom")),
-            "Retry failed after 3 attempts: boom"
-        );
-        // missing/blank finalError falls back to a generic failure text
-        assert_eq!(
-            format_auto_retry_end_message(false, 3, None),
-            "Retry failed after 3 attempts."
-        );
-        assert_eq!(
-            format_auto_retry_end_message(false, 1, Some("   ")),
-            "Retry failed after 1 attempts."
-        );
     }
 
     #[test]

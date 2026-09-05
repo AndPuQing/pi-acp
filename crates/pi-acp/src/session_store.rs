@@ -56,10 +56,26 @@ impl Default for SessionMapFile {
     }
 }
 
-/// Default location of the session map: `<agent dir>/pi-acp/session-map.json`
-/// (the TS reference uses `~/.pi/pi-acp/session-map.json`; the agent dir is
-/// used so `PI_CODING_AGENT_DIR` overrides are honored, fixes #88).
+/// Env var overriding the session map file location (full file path).
+///
+/// Mirrors upstream `svkozak/pi-acp` #32: when set to a non-empty value the
+/// store lives at that path instead of the default below. Unset or empty
+/// keeps the default behavior (fully backward compatible).
+pub const SESSION_MAP_ENV: &str = "PI_ACP_SESSION_MAP";
+
+/// Location of the session map: `PI_ACP_SESSION_MAP` when set to a non-empty
+/// value, else `<agent dir>/pi-acp/session-map.json` (the TS reference uses
+/// `~/.pi/pi-acp/session-map.json`; the agent dir is used so
+/// `PI_CODING_AGENT_DIR` overrides are honored, fixes #88).
+///
+/// A custom path whose parent directory does not exist yet is created on the
+/// first write by the store's atomic-write path (`create_dir_all`).
 pub fn session_map_path() -> PathBuf {
+    if let Some(path) = std::env::var_os(SESSION_MAP_ENV) {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     agent_dir().join("pi-acp").join("session-map.json")
 }
 
@@ -227,7 +243,29 @@ pub fn map_as_json(store: &SessionStore) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
+
+    /// Serializes the env-override tests: `std::env` is process-global and
+    /// the test harness runs tests on threads in the same process.
+    fn session_map_env_lock() -> &'static StdMutex<()> {
+        static LOCK: StdMutex<()> = StdMutex::new(());
+        &LOCK
+    }
+
+    /// Save the current override so each test can restore it afterwards.
+    fn stash_session_map_env() -> Option<std::ffi::OsString> {
+        std::env::var_os(SESSION_MAP_ENV)
+    }
+
+    fn restore_session_map_env(prev: Option<std::ffi::OsString>) {
+        match prev {
+            // SAFETY: the caller holds `session_map_env_lock`, so no other
+            // test in this module races on this variable.
+            Some(v) => unsafe { std::env::set_var(SESSION_MAP_ENV, v) },
+            None => unsafe { std::env::remove_var(SESSION_MAP_ENV) },
+        }
+    }
 
     #[test]
     fn upsert_get_delete_roundtrip() {
@@ -326,6 +364,61 @@ mod tests {
         let fresh = SessionStore::at(path);
         assert!(fresh.get("first").is_some());
         assert!(fresh.get("second").is_some());
+    }
+
+    #[test]
+    fn session_map_path_defaults_without_env() {
+        let _guard = session_map_env_lock().lock().unwrap();
+        let prev = stash_session_map_env();
+        // SAFETY: under `session_map_env_lock`.
+        unsafe { std::env::remove_var(SESSION_MAP_ENV) };
+        assert_eq!(
+            session_map_path(),
+            agent_dir().join("pi-acp").join("session-map.json")
+        );
+        restore_session_map_env(prev);
+    }
+
+    #[test]
+    fn session_map_path_empty_env_keeps_default() {
+        let _guard = session_map_env_lock().lock().unwrap();
+        let prev = stash_session_map_env();
+        // SAFETY: under `session_map_env_lock`.
+        unsafe { std::env::set_var(SESSION_MAP_ENV, "") };
+        assert_eq!(
+            session_map_path(),
+            agent_dir().join("pi-acp").join("session-map.json")
+        );
+        restore_session_map_env(prev);
+    }
+
+    #[test]
+    fn session_map_path_honors_env_override() {
+        let _guard = session_map_env_lock().lock().unwrap();
+        let prev = stash_session_map_env();
+        let dir = TempDir::new().unwrap();
+        let custom = dir.path().join("custom").join("sessions.json");
+        // SAFETY: under `session_map_env_lock`.
+        unsafe { std::env::set_var(SESSION_MAP_ENV, &custom) };
+        assert_eq!(session_map_path(), custom);
+        restore_session_map_env(prev);
+    }
+
+    #[test]
+    fn default_store_writes_through_env_override_and_creates_parents() {
+        let _guard = session_map_env_lock().lock().unwrap();
+        let prev = stash_session_map_env();
+        let dir = TempDir::new().unwrap();
+        // Nested path whose parents do not exist yet.
+        let custom = dir.path().join("nested").join("deep").join("map.json");
+        assert!(!custom.parent().unwrap().exists());
+        // SAFETY: under `session_map_env_lock`.
+        unsafe { std::env::set_var(SESSION_MAP_ENV, &custom) };
+        let store = SessionStore::new();
+        store.upsert("env-1", "/work", "/tmp/env-1.jsonl");
+        assert!(custom.exists());
+        assert_eq!(SessionStore::new().get("env-1").unwrap().cwd, "/work");
+        restore_session_map_env(prev);
     }
 
     #[test]

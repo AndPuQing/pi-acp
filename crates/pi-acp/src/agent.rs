@@ -147,7 +147,7 @@ impl NewSessionPostResponse {
     async fn send(self, cx: &ConnectionTo<Client>) {
         let session_id = self.session.session_id().clone();
         if !self.prelude_text.is_empty() {
-            send_startup_text_chunk(cx, &session_id, &self.prelude_text).await;
+            send_text_chunk(cx, &session_id, &self.prelude_text).await;
         }
         advertise_commands(
             cx,
@@ -1227,13 +1227,7 @@ impl AcpAgent {
         let conn = cx.clone();
         spawn_outbound_connector(conn, outbound_rx)?;
 
-        // User-configured pi flags first (W-496: `PI_ACP_PI_EXTRA_ARGS`),
-        // then the generated MCP registrar `--extension` pair, so the
-        // registrar flags stay adjacent and are never split by user args.
-        // Both travel as separate argv entries through the existing
-        // `resolve` spawn path — no shell quoting is built here (Windows
-        // batch-wrapper quoting stays in `resolve.rs`).
-        let mut extra_args: Vec<String> = self.cfg.pi_extra_args.clone();
+        let mut extra_args: Vec<String> = Vec::new();
         let mut extra_env: Vec<(String, String)> = Vec::new();
         if !mcp_specs.is_empty() {
             let registrar = mcp::materialize_registrar().map_err(|e| {
@@ -1856,22 +1850,6 @@ async fn send_text_chunk(cx: &ConnectionTo<Client>, session_id: &SessionId, text
         session_id.clone(),
         SessionUpdate::AgentMessageChunk(chunk),
     ));
-}
-
-async fn send_startup_text_chunk(cx: &ConnectionTo<Client>, session_id: &SessionId, text: &str) {
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())))
-        .meta(startup_info_meta());
-    let _ = cx.send_notification(SessionNotification::new(
-        session_id.clone(),
-        SessionUpdate::AgentMessageChunk(chunk),
-    ));
-}
-
-fn startup_info_meta() -> serde_json::Map<String, Value> {
-    json!({ "piAcp": { "startupInfo": true } })
-        .as_object()
-        .expect("static startup info meta")
-        .clone()
 }
 
 /// Fetch `session_configuration`: configOptions + model/mode states.

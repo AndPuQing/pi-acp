@@ -15,11 +15,6 @@ use serde_json::Value;
 pub fn agent_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PI_CODING_AGENT_DIR") {
         if !dir.is_empty() {
-            if let Some(s) = dir.to_str() {
-                if let Some(expanded) = expand_dir_env_value(s) {
-                    return expanded;
-                }
-            }
             let p = PathBuf::from(dir);
             if p.is_absolute() {
                 return p;
@@ -32,39 +27,6 @@ pub fn agent_dir() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".pi").join("agent"))
         .unwrap_or_else(|| PathBuf::from(".pi/agent"))
-}
-
-/// Expand a directory-valued environment variable.
-///
-/// Trims surrounding whitespace (empty/whitespace-only → `None`, i.e. unset).
-/// A leading `~` is never expanded by the OS when the value comes from the
-/// environment directly (upstream svkozak/pi-acp#88), so expand it here: bare
-/// `~` is the home dir, `~/rest` joins `rest` onto it. Anything else
-/// (e.g. `~other`) keeps the historical relative-to-cwd behavior. Absolute
-/// paths are used as-is; relative paths resolve against the current working
-/// directory (matching TS `path.resolve` semantics).
-pub fn expand_dir_env_value(raw: &str) -> Option<PathBuf> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if s == "~" || s.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            if s.len() == 1 {
-                return Some(home);
-            }
-            return Some(home.join(&s[2..]));
-        }
-    }
-    let p = PathBuf::from(s);
-    if p.is_absolute() {
-        return Some(p);
-    }
-    Some(
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(p),
-    )
 }
 
 /// Deep-merge two JSON values, mirroring TS `deepMerge`: when both sides are
@@ -180,56 +142,6 @@ mod tests {
         let merged = deep_merge(&Value::Null, &json!({ "a": 1 }));
         assert_eq!(merged, json!({ "a": 1 }));
         assert_eq!(deep_merge(&json!({ "a": 1 }), &Value::Null), Value::Null);
-    }
-
-    // --- agent_dir ---
-
-    #[test]
-    fn agent_dir_expands_tilde_from_env_without_shell() {
-        let home = dirs::home_dir().expect("test requires a home dir");
-        let prev = std::env::var_os("PI_CODING_AGENT_DIR");
-        // Env injected directly (no shell), so no shell `~` expansion runs.
-        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", "~/.x") };
-        assert_eq!(agent_dir(), home.join(".x"));
-        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", "~") };
-        assert_eq!(agent_dir(), home);
-        match prev {
-            Some(v) => unsafe { std::env::set_var("PI_CODING_AGENT_DIR", v) },
-            None => unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") },
-        }
-    }
-
-    #[test]
-    fn expand_dir_env_value_trims_and_rejects_empty() {
-        assert_eq!(expand_dir_env_value(""), None);
-        assert_eq!(expand_dir_env_value("   "), None);
-        assert_eq!(expand_dir_env_value(" \t\n "), None);
-    }
-
-    #[test]
-    fn expand_dir_env_value_expands_tilde_and_trims() {
-        let home = dirs::home_dir().expect("test requires a home dir");
-        assert_eq!(expand_dir_env_value("~"), Some(home.clone()));
-        assert_eq!(expand_dir_env_value("~/skills"), Some(home.join("skills")));
-        // Surrounding whitespace is trimmed before expansion.
-        assert_eq!(
-            expand_dir_env_value("  ~/skills  "),
-            Some(home.join("skills"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_env_value_absolute_and_relative() {
-        // Portable absolute dir (`/tmp/...` is not absolute on Windows).
-        let abs = std::env::temp_dir().join("pi-acp-test-skills");
-        assert_eq!(expand_dir_env_value(&abs.to_string_lossy()), Some(abs));
-        // `~other` is not a home expansion: historical relative-to-cwd.
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(expand_dir_env_value("~other"), Some(cwd.join("~other")));
-        assert_eq!(
-            expand_dir_env_value("rel/skills"),
-            Some(cwd.join("rel/skills"))
-        );
     }
 
     // --- read_json_file ---

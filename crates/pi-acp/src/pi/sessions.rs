@@ -757,9 +757,11 @@ mod tests {
 
     fn agent_dir_with_session_dir(agent: &Path, session_dir: &Path) {
         fs::create_dir_all(agent).unwrap();
+        // Serialize via serde_json so Windows backslashes are valid JSON
+        // escapes (a raw interpolated path would not parse).
         fs::write(
             agent.join("settings.json"),
-            format!(r#"{{"sessionDir": "{}"}}"#, session_dir.to_string_lossy()),
+            serde_json::json!({ "sessionDir": session_dir.to_string_lossy() }).to_string(),
         )
         .unwrap();
     }

@@ -1070,14 +1070,18 @@ mod tests {
     fn skill_dir_set_yields_no_skills_plus_skill() {
         let _guard = skill_dir_env_lock().lock().unwrap();
         let prev = stash_skill_dir_env();
+        // A real absolute dir (portable: TempDir is absolute on every CI
+        // target; a literal `/tmp/...` is not absolute on Windows).
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_dir = dir.path().join("tenant-skills");
         // SAFETY: under `skill_dir_env_lock`.
-        unsafe { std::env::set_var(SKILL_DIR_ENV, "/tmp/tenant-skills") };
+        unsafe { std::env::set_var(SKILL_DIR_ENV, &skill_dir) };
         assert_eq!(
             skill_dir_extra_args(),
             vec![
                 "--no-skills".to_string(),
                 "--skill".to_string(),
-                "/tmp/tenant-skills".to_string(),
+                skill_dir.to_string_lossy().into_owned(),
             ]
         );
         restore_skill_dir_env(prev);

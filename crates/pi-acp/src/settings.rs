@@ -220,10 +220,9 @@ mod tests {
 
     #[test]
     fn expand_dir_env_value_absolute_and_relative() {
-        assert_eq!(
-            expand_dir_env_value("/tmp/skills"),
-            Some(PathBuf::from("/tmp/skills"))
-        );
+        // Portable absolute dir (`/tmp/...` is not absolute on Windows).
+        let abs = std::env::temp_dir().join("pi-acp-test-skills");
+        assert_eq!(expand_dir_env_value(&abs.to_string_lossy()), Some(abs));
         // `~other` is not a home expansion: historical relative-to-cwd.
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(expand_dir_env_value("~other"), Some(cwd.join("~other")));

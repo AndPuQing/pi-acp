@@ -8,7 +8,7 @@
 //! `agent.rs` (they need the pi RPC + outbound channel); this module owns the
 //! pure building blocks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -267,6 +267,48 @@ fn describe_fallback(source: &str, location: &str) -> String {
     }
 }
 
+/// Return the command entries from pi's `get_commands` payload.
+///
+/// pi has used both `{commands: [...]}` and `{data: {commands: [...]}}`
+/// response shapes. Keeping the shape handling in one place makes the
+/// advertised-command and extension allowlist paths agree.
+fn pi_get_commands(data: &Value) -> &[Value] {
+    data.get("commands")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            data.get("data")
+                .and_then(|nested| nested.get("commands"))
+                .and_then(Value::as_array)
+        })
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// Extract the names of extension slash commands from pi's `get_commands`
+/// response. These commands are intentionally omitted from ACP's advertised
+/// list, but they still need to bypass local prompt-file expansion and do not
+/// emit an `agent_settled` event.
+pub fn extension_command_names(data: &Value) -> HashSet<String> {
+    pi_get_commands(data)
+        .iter()
+        .filter(|command| command.get("source").and_then(Value::as_str) == Some("extension"))
+        .filter_map(|command| {
+            let name = command.get("name").and_then(Value::as_str)?.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Parse the command token from a leading slash prompt.
+pub fn slash_command_name(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    let end = rest
+        .find(|character: char| character.is_whitespace())
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty()).then_some(name)
+}
+
 /// Convert pi's `get_commands` payload into ACP `AvailableCommand`s.
 ///
 /// Mirrors TS `toAvailableCommandsFromPiGetCommands` (`acp/pi-commands.ts`):
@@ -279,19 +321,8 @@ pub fn to_available_commands_from_pi_get_commands(
     enable_skill_commands: bool,
     include_extension_commands: bool,
 ) -> Vec<AvailableCommand> {
-    let commands_raw: Vec<&Value> = data
-        .get("commands")
-        .and_then(Value::as_array)
-        .or_else(|| {
-            data.get("data")
-                .and_then(|d| d.get("commands"))
-                .and_then(Value::as_array)
-        })
-        .map(|a| a.iter().collect::<Vec<_>>())
-        .unwrap_or_default();
-
     let mut out = Vec::new();
-    for c in commands_raw {
+    for c in pi_get_commands(data) {
         let name = c
             .get("name")
             .and_then(Value::as_str)
@@ -753,5 +784,22 @@ mod tests {
 
         // no commands at all
         assert!(to_available_commands_from_pi_get_commands(&json!({}), true, false).is_empty());
+
+        let extension_names = extension_command_names(&data);
+        assert_eq!(extension_names, HashSet::from(["ext-tool".to_string()]));
+        assert_eq!(
+            extension_command_names(&nested),
+            HashSet::new(),
+            "nested non-extension commands must not enter the allowlist"
+        );
+    }
+
+    #[test]
+    fn slash_command_name_matches_only_the_command_token() {
+        assert_eq!(slash_command_name("/review"), Some("review"));
+        assert_eq!(slash_command_name("/review some args"), Some("review"));
+        assert_eq!(slash_command_name("/review\t some args"), Some("review"));
+        assert_eq!(slash_command_name("review"), None);
+        assert_eq!(slash_command_name("/"), None);
     }
 }

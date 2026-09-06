@@ -1299,6 +1299,40 @@ async fn dead_session_reports_pi_exit_on_subsequent_prompts() {
 // Settle fallback (design §11 risk #84)
 // ---------------------------------------------------------------------------
 
+/// Extension slash commands are acknowledged by pi without entering its
+/// agent loop, so the prompt response itself must complete the ACP turn.
+#[tokio::test]
+async fn extension_command_resolves_without_agent_settled() {
+    let fx = fixture(&["--mock-no-settle"]).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        fx.session.prompt("/ext-thing".to_string(), vec![]),
+    )
+    .await
+    .expect("extension command must not wait for agent_settled")
+    .expect("extension command prompt must succeed");
+    assert_eq!(result, StopReason::EndTurn);
+
+    let commands = read_log(&fx.command_log);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.as_str() == "get_commands")
+            .count(),
+        1,
+        "the first slash prompt should lazily discover pi commands"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.as_str() == "prompt")
+            .count(),
+        1
+    );
+    fx.session.dispose().await;
+}
+
 /// pi accepts the prompt but never emits `agent_settled` (the mock's
 /// `--mock-no-settle`): the settle deadline must resolve the turn with an
 /// explicit `SettleTimeout` instead of hanging `session/prompt` forever — the

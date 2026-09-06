@@ -10,7 +10,8 @@
 //! S8 (W-455) additions: every mapping carries a structured `data` payload so
 //! clients can distinguish failure classes programmatically; `PiExited` and
 //! `PiSpawn` messages carry actionable hints (no-auto-respawn per decision 1,
-//! install hint per design §8.2).
+//! install hint per design §8.2); exit messages also carry raw stderr text when
+//! the child produced it.
 
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -23,6 +24,8 @@ pub enum AcpxError {
     /// The message carries an actionable, cross-platform install hint: the
     /// npm package, the `PI_ACP_PI_COMMAND` override, and the Windows note
     /// that pi's entry point is the npm global `pi.cmd` (fixes pi-acp #27).
+    /// Callers with a child-side diagnostic source can append its raw tail to
+    /// the message with [`append_stderr_tail`].
     #[error(
         "failed to spawn pi: {0}. Install pi with `npm i -g \
          @earendil-works/pi-coding-agent` (on Windows the entry point is the npm \
@@ -45,11 +48,15 @@ pub enum AcpxError {
     /// automatically (decision 1); the client should start a new session.
     #[error(
         "pi process exited (code={code:?}, signal={signal:?}) — pi-acp does not restart pi \
-         automatically; start a new session (session/new) or restart pi-acp to recover"
+         automatically; start a new session (session/new) or restart pi-acp to recover{stderr_tail}",
+        stderr_tail = format_stderr_tail(stderr.as_deref())
     )]
     PiExited {
         code: Option<i32>,
         signal: Option<i32>,
+        /// Raw tail of pi's stderr, if any. It is included as text only; the
+        /// adapter does not parse or interpret diagnostic contents.
+        stderr: Option<String>,
     },
 
     /// The ACP id supplied while restoring a session does not match the id
@@ -103,6 +110,19 @@ const ACP_INTERNAL_ERROR: i32 = -32603;
 /// JSON-RPC error code for ACP `authRequired` (reserved range).
 const ACP_AUTH_REQUIRED: i32 = -32000;
 
+fn format_stderr_tail(stderr: Option<&str>) -> String {
+    stderr
+        .filter(|tail| !tail.is_empty())
+        .map(|tail| format!("; stderr tail:\n{tail}"))
+        .unwrap_or_default()
+}
+
+/// Append a raw stderr tail to an existing diagnostic. Spawn failures that
+/// have a child-side stderr source can use this without interpreting it.
+pub(crate) fn append_stderr_tail(message: String, stderr: Option<&str>) -> String {
+    format!("{message}{}", format_stderr_tail(stderr))
+}
+
 impl AcpxError {
     /// The stable `errorType` discriminator for this variant (carried in the
     /// ACP error `data` so clients can branch programmatically).
@@ -139,9 +159,16 @@ impl AcpxError {
                 obj.insert("command".to_string(), json!(cmd));
                 obj.insert("secs".to_string(), json!(secs));
             }
-            AcpxError::PiExited { code, signal } => {
+            AcpxError::PiExited {
+                code,
+                signal,
+                stderr,
+            } => {
                 obj.insert("code".to_string(), json!(code));
                 obj.insert("signal".to_string(), json!(signal));
+                if let Some(stderr) = stderr {
+                    obj.insert("stderr".to_string(), json!(stderr));
+                }
                 obj.insert(
                     "hint".to_string(),
                     json!("pi-acp does not restart pi automatically; start a new session (session/new) or restart pi-acp to recover"),
@@ -219,6 +246,7 @@ mod tests {
         let msg = AcpxError::PiExited {
             code: Some(42),
             signal: None,
+            stderr: None,
         }
         .to_string();
         assert!(msg.contains("code=Some(42)"), "{msg}");
@@ -234,6 +262,25 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("PI_ACP_PI_COMMAND"), "{msg}");
+
+        let msg = AcpxError::PiSpawn(append_stderr_tail(
+            "pi: startup failed".into(),
+            Some("provider diagnostic"),
+        ))
+        .to_string();
+        assert!(msg.contains("provider diagnostic"), "{msg}");
+    }
+
+    #[test]
+    fn pi_exited_display_carries_stderr_tail() {
+        let msg = AcpxError::PiExited {
+            code: Some(42),
+            signal: None,
+            stderr: Some("first diagnostic\nlast diagnostic".into()),
+        }
+        .to_string();
+        assert!(msg.contains("stderr tail:"), "{msg}");
+        assert!(msg.contains("last diagnostic"), "{msg}");
     }
 
     #[test]
@@ -255,12 +302,14 @@ mod tests {
         let err: AcpError = AcpxError::PiExited {
             code: Some(42),
             signal: None,
+            stderr: Some("provider diagnostic".into()),
         }
         .into();
         let data = err.data.as_ref().expect("error data");
         assert_eq!(data["errorType"], "piExited");
         assert_eq!(data["code"], 42);
         assert_eq!(data["signal"], serde_json::Value::Null);
+        assert_eq!(data["stderr"], "provider diagnostic");
         assert!(
             data["hint"]
                 .as_str()

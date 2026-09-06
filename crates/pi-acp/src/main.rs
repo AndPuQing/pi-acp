@@ -168,6 +168,7 @@ fn terminal_login() -> Result<()> {
 /// - `--mock-prelude <n>`   emit `n` ANSI-styled human-readable lines before NDJSON
 /// - `--mock-hang`          read commands but never respond (request-timeout tests)
 /// - `--mock-exit-after <n>` exit(42) after reading `n` commands, without responding
+/// - `--mock-stderr <text>`  write one diagnostic line to stderr at startup
 /// - `--mock-delay-ms <n>`  delay each response by `n` ms (concurrency tests)
 /// - `--mock-unknown-event` emit one unknown event type (protocol-evolution guard)
 /// - `--mock-scenario <dir>` per-prompt event replay from `<dir>/<n>.jsonl`
@@ -214,6 +215,7 @@ async fn run_mock_rpc() -> Result<()> {
     let mut prelude = 0usize;
     let mut hang = false;
     let mut exit_after: Option<usize> = None;
+    let mut stderr_lines: Vec<String> = Vec::new();
     let mut delay_ms: u64 = 0;
     let mut unknown_event = false;
     let mut scenario_dir: Option<PathBuf> = None;
@@ -248,6 +250,11 @@ async fn run_mock_rpc() -> Result<()> {
             "--mock-prelude" => prelude = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--mock-hang" => hang = true,
             "--mock-exit-after" => exit_after = args.next().and_then(|v| v.parse().ok()),
+            "--mock-stderr" => {
+                if let Some(line) = args.next() {
+                    stderr_lines.push(line);
+                }
+            }
             "--mock-delay-ms" => delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--mock-unknown-event" => unknown_event = true,
             "--mock-scenario" => scenario_dir = args.next().map(PathBuf::from),
@@ -367,6 +374,16 @@ async fn run_mock_rpc() -> Result<()> {
                 stderr.flush().await?;
             }
         }
+    }
+
+    if !stderr_lines.is_empty() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut stderr = tokio::io::stderr();
+        for line in stderr_lines {
+            stderr.write_all(line.as_bytes()).await?;
+            stderr.write_all(b"\n").await?;
+        }
+        stderr.flush().await?;
     }
 
     if exit_after == Some(0) {

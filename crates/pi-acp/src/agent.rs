@@ -2295,6 +2295,7 @@ mod tests {
         let exited = acp_error_from_pi(AcpxError::PiExited {
             code: Some(42),
             signal: None,
+            stderr: None,
         });
         assert_eq!(exited.code, ACP_INTERNAL_ERROR.into());
         let data = exited.data.as_ref().expect("error data");

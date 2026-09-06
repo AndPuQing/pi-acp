@@ -219,10 +219,15 @@ async fn child_exit_rejects_pending_and_marks_dead() {
     let mut pi = spawn_mock(&["--mock-exit-after", "1"]).await;
 
     let err = pi.request(&RpcCommand::GetState).await.unwrap_err();
-    match err {
-        AcpxError::PiExited { code, signal } => {
-            assert_eq!(code, Some(42));
-            assert_eq!(signal, None);
+    match &err {
+        AcpxError::PiExited {
+            code,
+            signal,
+            stderr,
+        } => {
+            assert_eq!(*code, Some(42));
+            assert_eq!(*signal, None);
+            assert!(stderr.is_none());
         }
         other => panic!("expected PiExited, got {other:?}"),
     }
@@ -233,6 +238,31 @@ async fn child_exit_rejects_pending_and_marks_dead() {
     // Fail-fast on the dead process (no silent empty end_turn).
     let err2 = pi.request(&RpcCommand::GetState).await.unwrap_err();
     assert!(matches!(err2, AcpxError::PiExited { .. }), "got {err2:?}");
+}
+
+/// A transient startup failure keeps the child's stderr tail in the surfaced
+/// `PiExited` error instead of losing the provider's root cause.
+#[tokio::test]
+async fn child_exit_includes_stderr_tail() {
+    let mut pi = spawn_mock(&[
+        "--mock-exit-after",
+        "1",
+        "--mock-stderr",
+        "pi.cmd: 'pi' is not recognized as an internal or external command",
+    ])
+    .await;
+
+    let err = pi.request(&RpcCommand::GetState).await.unwrap_err();
+    match &err {
+        AcpxError::PiExited { stderr, .. } => {
+            assert_eq!(
+                stderr.as_deref(),
+                Some("pi.cmd: 'pi' is not recognized as an internal or external command")
+            );
+        }
+        other => panic!("expected PiExited, got {other:?}"),
+    }
+    assert!(err.to_string().contains("is not recognized"), "{err}");
 }
 
 /// A turn ends at `agent_settled`, streaming text deltas along the way

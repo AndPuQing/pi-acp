@@ -675,7 +675,9 @@ pub enum AssistantMessageEvent {
         message: Value,
     },
     Error {
+        #[serde(default)]
         reason: String,
+        #[serde(default)]
         error: Value,
     },
 }
@@ -828,6 +830,44 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_pi_error_event_payload_variants_without_requiring_all_fields() {
+        let object_error = parse_event(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"error","reason":"error","error":{"errorMessage":"quota exceeded","newField":{"version":2}}}}"#,
+        );
+        assert!(matches!(
+            object_error,
+            RpcEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::Error { reason, error },
+                ..
+            } if reason == "error" && error["errorMessage"] == "quota exceeded"
+        ));
+
+        let string_error = parse_event(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"error","reason":"error","error":"legacy provider failure"}}"#,
+        );
+        assert!(matches!(
+            string_error,
+            RpcEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::Error { error, .. },
+                ..
+            } if error.as_str() == Some("legacy provider failure")
+        ));
+
+        // A future pi may add fields without retaining the current reason/error
+        // pair. Defaults keep the event in the stream for generic fallback text.
+        let future_error = parse_event(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"error","diagnostic":{"provider":"new-pi"}}}"#,
+        );
+        assert!(matches!(
+            future_error,
+            RpcEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::Error { reason, error },
+                ..
+            } if reason.is_empty() && error.is_null()
+        ));
     }
 
     #[test]

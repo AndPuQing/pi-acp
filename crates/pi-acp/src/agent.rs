@@ -76,7 +76,9 @@ use crate::session::{
     StopReason as SessionStopReason,
 };
 use crate::session_store::SessionStore;
-use crate::settings::{get_enable_skill_commands, get_quiet_startup};
+use crate::settings::{
+    get_enable_skill_commands, get_enabled_models, get_quiet_startup, is_model_enabled,
+};
 use crate::startup::{build_startup_info, build_update_notice, fetch_pi_version};
 use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
@@ -1859,6 +1861,8 @@ async fn get_session_configuration(
     pre_state: Option<&RpcSessionState>,
     pre_models: Option<&Vec<Model>>,
 ) -> (Vec<SessionConfigOption>, Option<ModelState>, ModeState) {
+    let enabled_models = get_enabled_models(session.cwd());
+
     // Fetch all three inputs concurrently in one join (W-479): the refresh
     // path used to fetch `get_state` twice (once for the model state, once
     // for the mode state). pi has no combined state+levels endpoint, so the
@@ -1880,7 +1884,7 @@ async fn get_session_configuration(
         },
         session.available_thinking_levels(),
     );
-    let models = model_state_from_parts(&available, state.as_ref());
+    let models = model_state_from_parts(&available, state.as_ref(), enabled_models.as_deref());
     let current = state
         .as_ref()
         .map(|s| s.thinking_level.id())
@@ -1893,9 +1897,11 @@ async fn get_session_configuration(
 fn model_state_from_parts(
     available: &[Model],
     state: Option<&RpcSessionState>,
+    enabled_models: Option<&[String]>,
 ) -> Option<ModelState> {
-    let available_models: Vec<AdvertisedModel> = available
+    let mut available_models: Vec<AdvertisedModel> = available
         .iter()
+        .filter(|m| is_model_enabled(&m.provider, &m.id, enabled_models))
         .filter_map(|m| {
             let provider = m.provider.trim();
             let id = m.id.trim();
@@ -1909,15 +1915,31 @@ fn model_state_from_parts(
         })
         .collect();
 
-    let current_model_id = state.as_ref().and_then(|s| s.model.as_ref()).and_then(|m| {
+    let current_model = state.as_ref().and_then(|s| s.model.as_ref()).and_then(|m| {
         let provider = m.provider.trim();
         let id = m.id.trim();
         if provider.is_empty() || id.is_empty() {
             None
         } else {
-            Some(format!("{provider}/{id}"))
+            Some(AdvertisedModel {
+                model_id: format!("{provider}/{id}"),
+                name: format!("{provider}/{}", m.name),
+            })
         }
     });
+
+    // Keep pi's active model selectable even when enabledModels excludes it;
+    // otherwise the ACP response would advertise an invalid current value.
+    if let Some(current) = current_model.as_ref() {
+        let already_advertised = available_models
+            .iter()
+            .any(|model| model.model_id.eq_ignore_ascii_case(&current.model_id));
+        if !already_advertised {
+            available_models.push(current.clone());
+        }
+    }
+
+    let current_model_id = current_model.map(|m| m.model_id);
 
     if available_models.is_empty() && current_model_id.is_none() {
         return None;
@@ -2368,5 +2390,49 @@ mod tests {
         assert!(!is_bare_pi_command("/opt/pi/bin/pi"));
         assert!(!is_bare_pi_command("C:\\tools\\pi.cmd"));
         assert!(is_bare_pi_command("pi"));
+    }
+
+    #[test]
+    fn enabled_models_keep_the_current_model_when_it_is_filtered() {
+        let model = |provider: &str, id: &str, name: &str| Model {
+            id: id.to_string(),
+            name: name.to_string(),
+            provider: provider.to_string(),
+            reasoning: false,
+            thinking_level_map: None,
+            base_url: None,
+            context_window: None,
+            max_tokens: None,
+            input: None,
+        };
+        let current = model("openai", "gpt-5", "GPT-5");
+        let available = vec![
+            current.clone(),
+            model("anthropic", "claude-sonnet-4", "Claude Sonnet"),
+        ];
+        let state = RpcSessionState {
+            model: Some(current),
+            thinking_level: ThinkingLevel::Medium,
+            is_streaming: false,
+            is_compacting: false,
+            steering_mode: QueueMode::All,
+            follow_up_mode: QueueMode::All,
+            session_file: None,
+            session_id: "test-session".to_string(),
+            session_name: None,
+            auto_compaction_enabled: false,
+            message_count: 0,
+            pending_message_count: 0,
+        };
+        let patterns = vec!["anthropic/*".to_string()];
+
+        let models = model_state_from_parts(&available, Some(&state), Some(&patterns)).unwrap();
+        let ids: Vec<&str> = models
+            .available_models
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["anthropic/claude-sonnet-4", "openai/gpt-5"]);
+        assert_eq!(models.current_model_id, "openai/gpt-5");
     }
 }

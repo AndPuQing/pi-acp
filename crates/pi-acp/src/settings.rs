@@ -104,6 +104,184 @@ pub fn enable_skill_commands(merged: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// Read the optional `enabledModels` model patterns from merged settings.
+/// Empty or non-string entries are ignored; an empty result means no filter.
+pub fn enabled_models(merged: &Value) -> Option<Vec<String>> {
+    let patterns = merged
+        .get("enabledModels")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    (!patterns.is_empty()).then_some(patterns)
+}
+
+/// `enabledModels` lookup for a working directory.
+pub fn get_enabled_models(cwd: &Path) -> Option<Vec<String>> {
+    enabled_models(&get_merged_settings(cwd))
+}
+
+/// Check one model against an `enabledModels` pattern.
+///
+/// This follows pi CLI's model-scope matching: patterns are case-insensitive
+/// globs checked against both `provider/id` and the bare model id. A thinking
+/// level suffix such as `:high` is not part of the model identity.
+pub fn model_matches_enabled_pattern(provider: &str, model_id: &str, pattern: &str) -> bool {
+    let provider = provider.trim();
+    let model_id = strip_thinking_suffix(model_id.trim());
+    let pattern = strip_thinking_suffix(pattern.trim());
+    if provider.is_empty() || model_id.is_empty() || pattern.is_empty() {
+        return false;
+    }
+
+    let full_id = format!("{provider}/{model_id}");
+    glob_matches(&full_id, pattern) || glob_matches(model_id, pattern)
+}
+
+/// Return whether a model is allowed by an optional `enabledModels` list.
+/// Missing or empty settings preserve pi's unrestricted behavior.
+pub fn is_model_enabled(provider: &str, model_id: &str, patterns: Option<&[String]>) -> bool {
+    match patterns {
+        Some(patterns) if !patterns.is_empty() => patterns
+            .iter()
+            .any(|pattern| model_matches_enabled_pattern(provider, model_id, pattern)),
+        _ => true,
+    }
+}
+
+const THINKING_SUFFIXES: [&str; 8] = [
+    "off", "minimal", "low", "medium", "high", "xhigh", "max", "thinking",
+];
+
+fn strip_thinking_suffix(value: &str) -> &str {
+    let Some(colon) = value.rfind(':') else {
+        return value;
+    };
+    let suffix = &value[colon + 1..];
+    if THINKING_SUFFIXES
+        .iter()
+        .any(|candidate| suffix.eq_ignore_ascii_case(candidate))
+    {
+        &value[..colon]
+    } else {
+        value
+    }
+}
+
+/// Match the small glob language used by pi's model patterns. `*` and `?`
+/// stay within one slash-delimited segment; `**` can span segments and
+/// bracket classes support the usual `[abc]`, `[a-z]`, `[!a]` forms.
+fn glob_matches(value: &str, pattern: &str) -> bool {
+    let value = value.to_lowercase().chars().collect::<Vec<_>>();
+    let pattern = pattern.to_lowercase().chars().collect::<Vec<_>>();
+    let mut memo = vec![vec![None; value.len() + 1]; pattern.len() + 1];
+    glob_matches_at(&value, &pattern, 0, 0, &mut memo)
+}
+
+fn glob_matches_at(
+    value: &[char],
+    pattern: &[char],
+    pattern_index: usize,
+    value_index: usize,
+    memo: &mut [Vec<Option<bool>>],
+) -> bool {
+    if let Some(result) = memo[pattern_index][value_index] {
+        return result;
+    }
+
+    let result = if pattern_index == pattern.len() {
+        value_index == value.len()
+    } else {
+        match pattern[pattern_index] {
+            '*' => {
+                let mut next_pattern = pattern_index + 1;
+                while next_pattern < pattern.len() && pattern[next_pattern] == '*' {
+                    next_pattern += 1;
+                }
+                let crosses_slashes = next_pattern - pattern_index > 1;
+                let max_value = if crosses_slashes {
+                    value.len()
+                } else {
+                    value[value_index..]
+                        .iter()
+                        .position(|ch| *ch == '/')
+                        .map_or(value.len(), |offset| value_index + offset)
+                };
+                (value_index..=max_value).any(|next_value| {
+                    glob_matches_at(value, pattern, next_pattern, next_value, memo)
+                })
+            }
+            '?' if value_index < value.len() && value[value_index] != '/' => {
+                glob_matches_at(value, pattern, pattern_index + 1, value_index + 1, memo)
+            }
+            '[' if value_index < value.len() => {
+                if let Some((next_pattern, matches)) =
+                    char_class_match(pattern, pattern_index, value[value_index])
+                {
+                    matches && glob_matches_at(value, pattern, next_pattern, value_index + 1, memo)
+                } else {
+                    value[value_index] == '['
+                        && glob_matches_at(value, pattern, pattern_index + 1, value_index + 1, memo)
+                }
+            }
+            '\\' if pattern_index + 1 < pattern.len() => {
+                value_index < value.len()
+                    && value[value_index] == pattern[pattern_index + 1]
+                    && glob_matches_at(value, pattern, pattern_index + 2, value_index + 1, memo)
+            }
+            literal => {
+                value_index < value.len()
+                    && value[value_index] == literal
+                    && glob_matches_at(value, pattern, pattern_index + 1, value_index + 1, memo)
+            }
+        }
+    };
+
+    memo[pattern_index][value_index] = Some(result);
+    result
+}
+
+fn char_class_match(pattern: &[char], start: usize, value: char) -> Option<(usize, bool)> {
+    let mut end = start + 1;
+    while end < pattern.len() && pattern[end] != ']' {
+        end += 1;
+    }
+    if end == pattern.len() {
+        return None;
+    }
+
+    let mut cursor = start + 1;
+    let negated = matches!(pattern.get(cursor), Some('!') | Some('^'));
+    if negated {
+        cursor += 1;
+    }
+    if cursor == end {
+        return None;
+    }
+
+    let mut matched = false;
+    while cursor < end {
+        let first = pattern[cursor];
+        if first == '\\' && cursor + 1 < end {
+            matched |= pattern[cursor + 1] == value;
+            cursor += 2;
+        } else if cursor + 2 < end && pattern[cursor + 1] == '-' {
+            let last = pattern[cursor + 2];
+            matched |= first <= value && value <= last;
+            cursor += 3;
+        } else {
+            matched |= first == value;
+            cursor += 1;
+        }
+    }
+
+    Some((end + 1, if negated { !matched } else { matched }))
+}
+
 /// `getQuietStartup(cwd)` convenience wrapper.
 pub fn get_quiet_startup(cwd: &Path) -> bool {
     quiet_startup(&get_merged_settings(cwd))
@@ -233,5 +411,80 @@ mod tests {
         // default true
         assert!(enable_skill_commands(&json!({ "other": 1 })));
         assert!(enable_skill_commands(&Value::Null));
+    }
+
+    // --- enabled models ---
+
+    #[test]
+    fn enabled_models_reads_non_empty_string_patterns() {
+        assert_eq!(
+            enabled_models(&json!({
+                "enabledModels": [" anthropic/* ", 42, "", "claude-*"]
+            })),
+            Some(vec!["anthropic/*".to_string(), "claude-*".to_string()])
+        );
+        assert_eq!(enabled_models(&json!({ "enabledModels": [] })), None);
+        assert_eq!(
+            enabled_models(&json!({ "enabledModels": "claude-*" })),
+            None
+        );
+        assert_eq!(enabled_models(&Value::Null), None);
+    }
+
+    #[test]
+    fn enabled_model_patterns_match_pi_cli_forms() {
+        // Canonical provider/id and bare id are both exact matches.
+        assert!(model_matches_enabled_pattern(
+            "Anthropic",
+            "claude-sonnet-4",
+            "anthropic/claude-sonnet-4"
+        ));
+        assert!(model_matches_enabled_pattern(
+            "anthropic",
+            "claude-sonnet-4",
+            "claude-sonnet-4"
+        ));
+
+        // Prefix and provider globs use the same case-insensitive matcher.
+        assert!(model_matches_enabled_pattern(
+            "anthropic",
+            "claude-sonnet-4",
+            "CLAUDE-*"
+        ));
+        assert!(model_matches_enabled_pattern(
+            "anthropic",
+            "claude-sonnet-4",
+            "anthropic/*"
+        ));
+        assert!(!model_matches_enabled_pattern(
+            "openai",
+            "gpt-5",
+            "anthropic/*"
+        ));
+
+        // Thinking is a selector suffix, not part of the model identity.
+        assert!(model_matches_enabled_pattern(
+            "anthropic",
+            "claude-sonnet-4",
+            "anthropic/claude-sonnet-4:thinking"
+        ));
+        assert!(model_matches_enabled_pattern(
+            "anthropic",
+            "claude-sonnet-4:high",
+            "claude-sonnet-4"
+        ));
+    }
+
+    #[test]
+    fn missing_or_empty_enabled_models_leave_models_unrestricted() {
+        assert!(is_model_enabled("openai", "gpt-5", None));
+        assert!(is_model_enabled("openai", "gpt-5", Some(&[])));
+        let patterns = vec!["anthropic/*".to_string()];
+        assert!(!is_model_enabled("openai", "gpt-5", Some(&patterns)));
+        assert!(is_model_enabled(
+            "anthropic",
+            "claude-sonnet-4",
+            Some(&patterns)
+        ));
     }
 }

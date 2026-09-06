@@ -45,7 +45,24 @@ pub fn build_startup_info(
     pi_version: Option<&str>,
     update_notice: Option<&str>,
 ) -> String {
-    build_startup_info_at(&agent_dir(), cwd, pi_version, update_notice)
+    build_startup_info_with_roots(cwd, &[], pi_version, update_notice)
+}
+
+/// Build startup info for the primary cwd plus ACP additional workspace roots.
+/// The roots only affect discovery; `cwd` remains the base for relative paths.
+pub fn build_startup_info_with_roots(
+    cwd: &Path,
+    additional_directories: &[PathBuf],
+    pi_version: Option<&str>,
+    update_notice: Option<&str>,
+) -> String {
+    build_startup_info_at_with_roots(
+        &agent_dir(),
+        cwd,
+        additional_directories,
+        pi_version,
+        update_notice,
+    )
 }
 
 /// [`build_startup_info`] against an explicit agent dir (testable without
@@ -53,6 +70,17 @@ pub fn build_startup_info(
 pub fn build_startup_info_at(
     agent: &Path,
     cwd: &Path,
+    pi_version: Option<&str>,
+    update_notice: Option<&str>,
+) -> String {
+    build_startup_info_at_with_roots(agent, cwd, &[], pi_version, update_notice)
+}
+
+/// [`build_startup_info_with_roots`] against an explicit agent dir.
+pub fn build_startup_info_at_with_roots(
+    agent: &Path,
+    cwd: &Path,
+    additional_directories: &[PathBuf],
     pi_version: Option<&str>,
     update_notice: Option<&str>,
 ) -> String {
@@ -66,11 +94,15 @@ pub fn build_startup_info_at(
 
     let agent = agent.to_path_buf();
 
+    let roots = workspace_roots(cwd, additional_directories);
+
     // Context
     let mut context_items = Vec::new();
-    let context_path = cwd.join("AGENTS.md");
-    if context_path.exists() {
-        context_items.push(context_path.to_string_lossy().to_string());
+    for root in &roots {
+        let context_path = root.join("AGENTS.md");
+        if context_path.exists() {
+            context_items.push(context_path.to_string_lossy().to_string());
+        }
     }
     add_section(
         &mut md,
@@ -89,7 +121,9 @@ pub fn build_startup_info_at(
             &mut skills_items,
         );
     }
-    push_skills_from_root(&cwd.join(".pi").join("skills"), &mut skills_items);
+    for root in &roots {
+        push_skills_from_root(&root.join(".pi").join("skills"), &mut skills_items);
+    }
     add_section(
         &mut md,
         &Section {
@@ -100,22 +134,12 @@ pub fn build_startup_info_at(
 
     // Prompts
     let mut prompts_items = Vec::new();
-    let prompts_dir = agent.join("prompts");
-    if let Ok(entries) = std::fs::read_dir(&prompts_dir) {
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter(|e| {
-                e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                    && e.file_name().to_string_lossy().ends_with(".md")
-            })
-            .map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                format!("/{}", name.trim_end_matches(".md"))
-            })
-            .collect();
-        names.sort();
-        prompts_items.extend(names);
+    push_prompt_names(&agent.join("prompts"), &mut prompts_items);
+    for root in &roots {
+        push_prompt_names(&root.join(".pi").join("prompts"), &mut prompts_items);
     }
+    prompts_items.sort();
+    prompts_items.dedup();
     add_section(
         &mut md,
         &Section {
@@ -141,10 +165,13 @@ pub fn build_startup_info_at(
         ext_items.extend(files);
     }
     // npm packages from settings (global + project)
-    for settings_path in [
-        agent.join("settings.json"),
-        cwd.join(".pi").join("settings.json"),
-    ] {
+    let mut settings_paths = vec![agent.join("settings.json")];
+    settings_paths.extend(
+        roots
+            .iter()
+            .map(|root| root.join(".pi").join("settings.json")),
+    );
+    for settings_path in settings_paths {
         if let Ok(raw) = std::fs::read_to_string(&settings_path) {
             if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(pkgs) = settings
@@ -180,6 +207,35 @@ pub fn build_startup_info_at(
 
     let joined = md.join("\n");
     joined.trim().to_string() + "\n"
+}
+
+/// Return the primary cwd followed by unique additional roots, preserving the
+/// request order. A duplicate cwd does not produce duplicate startup entries.
+fn workspace_roots(cwd: &Path, additional_directories: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.to_path_buf()];
+    for root in additional_directories {
+        if !roots.iter().any(|existing| existing == root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
+}
+
+fn push_prompt_names(dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    out.extend(entries.flatten().filter_map(|entry| {
+        let is_md = entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false)
+            && entry.file_name().to_string_lossy().ends_with(".md");
+        is_md.then(|| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            format!("/{}", name.trim_end_matches(".md"))
+        })
+    }));
 }
 
 /// Scan a skills root: direct `.md` files at the top level plus recursive
@@ -442,5 +498,33 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("local-ext"), "{out}");
+    }
+
+    #[test]
+    fn startup_info_discovers_additional_workspace_roots() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("primary");
+        let extra = dir.path().join("secondary");
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(extra.join("AGENTS.md"), "secondary context").unwrap();
+        fs::create_dir_all(extra.join(".pi/skills")).unwrap();
+        fs::write(extra.join(".pi/skills/secondary.md"), "skill").unwrap();
+        fs::create_dir_all(extra.join(".pi/prompts")).unwrap();
+        fs::write(extra.join(".pi/prompts/secondary.md"), "prompt").unwrap();
+
+        let out = build_startup_info_at_with_roots(
+            &agent,
+            &cwd,
+            std::slice::from_ref(&extra),
+            None,
+            None,
+        );
+
+        assert!(out.contains(&extra.join("AGENTS.md").to_string_lossy().to_string()));
+        assert!(out.contains("secondary.md"));
+        assert!(out.contains("/secondary"));
     }
 }

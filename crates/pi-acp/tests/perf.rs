@@ -96,6 +96,7 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
         timeout: TIMEOUT,
         settle_timeout: Duration::ZERO,
         cwd: tmp.path().to_path_buf(),
+        additional_directories: vec![],
         outbound: outbound_tx,
         session_path: None,
         session_id_override: None,

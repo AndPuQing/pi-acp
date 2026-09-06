@@ -47,13 +47,13 @@ use agent_client_protocol::schema::v1::{
     DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ResourceLink, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionId,
-    SessionInfo, SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionInfo,
+    SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{
     on_receive_dispatch, on_receive_notification, on_receive_request, Agent, ConnectionTo,
@@ -75,11 +75,11 @@ use crate::session::{
     spawn_outbound_connector, PiAcpSession, SessionManager, SessionParams,
     StopReason as SessionStopReason,
 };
-use crate::session_store::SessionStore;
+use crate::session_store::{SessionStore, StoredSession};
 use crate::settings::{
     get_enable_skill_commands, get_enabled_models, get_quiet_startup, is_model_enabled,
 };
-use crate::startup::{build_startup_info, build_update_notice, fetch_pi_version};
+use crate::startup::{build_startup_info_with_roots, build_update_notice, fetch_pi_version};
 use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
     bash_exit_code, bash_terminal_content, bash_terminal_exit_meta, bash_terminal_info_meta,
@@ -134,6 +134,16 @@ struct ModeState {
     /// `thought_level` config option so both selectors describe one ladder).
     levels: Vec<ThinkingLevel>,
 }
+
+struct SpawnSessionOptions<'a> {
+    file_commands: Vec<FileSlashCommand>,
+    mcp_specs: &'a [McpServerSpec],
+    additional_directories: &'a [PathBuf],
+}
+
+/// Location and workspace roots needed to restore a persisted ACP session.
+/// `additional_directories` is empty for legacy session-map entries.
+type SessionLocation = StoredSession;
 
 /// Notifications that must be sent only after the `session/new` response is
 /// queued. ACP clients such as Zed ignore session updates for an id they have
@@ -497,7 +507,8 @@ impl AcpAgent {
             .session_capabilities(
                 SessionCapabilities::new()
                     .list(agent_client_protocol::schema::v1::SessionListCapabilities::new())
-                    .delete(agent_client_protocol::schema::v1::SessionDeleteCapabilities::new()),
+                    .delete(agent_client_protocol::schema::v1::SessionDeleteCapabilities::new())
+                    .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
             );
 
         InitializeResponse::new(protocol_version)
@@ -523,6 +534,7 @@ impl AcpAgent {
                 req.cwd.display()
             )));
         }
+        validate_additional_directories("session/new", &req.additional_directories)?;
         // W-483: validate the caller's MCP menu before any side effect.
         // Rejections name the offending server; unsupported transports are
         // an explicit error, never a silent drop.
@@ -545,7 +557,8 @@ impl AcpAgent {
             }
         }
 
-        let file_commands = commands::load_slash_commands(&req.cwd);
+        let file_commands =
+            commands::load_slash_commands_with_roots(&req.cwd, &req.additional_directories);
         let enable_skill_commands = get_enable_skill_commands(&req.cwd);
         let quiet_startup = get_quiet_startup(&req.cwd);
 
@@ -568,8 +581,11 @@ impl AcpAgent {
                 None,
                 None,
                 cx,
-                file_commands.clone(),
-                &mcp_specs,
+                SpawnSessionOptions {
+                    file_commands: file_commands.clone(),
+                    mcp_specs: &mcp_specs,
+                    additional_directories: &req.additional_directories,
+                },
             )
             .await
         {
@@ -639,8 +655,12 @@ impl AcpAgent {
         {
             let path = resolve_session_file_path(&req.cwd, session_file);
             if session_file_matches_id(&path, &session_id.0) {
-                self.store
-                    .upsert(&session_id.0, &req.cwd.to_string_lossy(), session_file);
+                self.store.upsert_with_additional_directories(
+                    &session_id.0,
+                    &req.cwd.to_string_lossy(),
+                    session_file,
+                    &req.additional_directories,
+                );
             } else {
                 tracing::debug!(
                     session = %session_id,
@@ -669,6 +689,7 @@ impl AcpAgent {
             };
             build_startup_prelude(
                 &req.cwd,
+                &req.additional_directories,
                 pi_version.as_deref(),
                 quiet_startup,
                 update_notice.as_deref(),
@@ -772,10 +793,11 @@ impl AcpAgent {
             return;
         }
         if session_file_matches_id(&path, &state.session_id) {
-            self.store.upsert(
+            self.store.upsert_with_additional_directories(
                 session.session_id().0.as_ref(),
                 &session.cwd().to_string_lossy(),
                 session_file,
+                session.additional_directories(),
             );
         } else {
             tracing::debug!(
@@ -799,7 +821,9 @@ impl AcpAgent {
         req: &PromptRequest,
         cx: &ConnectionTo<Client>,
     ) -> std::result::Result<(PromptResponse, Option<Arc<PiAcpSession>>), AcpError> {
-        let session = self.restore_session(&req.session_id, None, cx).await?;
+        let session = self
+            .restore_session(&req.session_id, None, None, cx)
+            .await?;
         let session_id = session.session_id().clone();
 
         let pi_prompt = prompt_to_pi_message(&req.prompt);
@@ -867,6 +891,7 @@ impl AcpAgent {
                 req.cwd.display()
             )));
         }
+        validate_additional_directories("session/load", &req.additional_directories)?;
         // W-483: same validation as `session/new`; the replacement menu is
         // stored before restore so the respawned pi registers it.
         let mcp_specs = check_mcp_servers("session/load", &req.mcp_servers, self.cfg.enable_mcp)?;
@@ -902,13 +927,26 @@ impl AcpAgent {
         let stored = self
             .find_stored_session(&req.session_id.0)
             .ok_or_else(|| invalid_params(&format!("Unknown sessionId: {}", req.session_id.0)))?;
-        let (stored_cwd, stored_file) = stored;
+        if !paths_match(Path::new(&stored.cwd), &req.cwd) {
+            return Err(invalid_params(&format!(
+                "session/load cwd must match the stored session cwd: {}",
+                stored.cwd
+            )));
+        }
+        let stored_cwd = stored.cwd.clone();
+        let stored_file = stored.session_file.clone();
 
         let enable_skill_commands = get_enable_skill_commands(&req.cwd);
-        let file_commands = commands::load_slash_commands(&req.cwd);
+        let file_commands =
+            commands::load_slash_commands_with_roots(&req.cwd, &req.additional_directories);
 
         let session = match self
-            .restore_session(&req.session_id, Some(&req.cwd), cx)
+            .restore_session(
+                &req.session_id,
+                Some(&req.cwd),
+                Some(&req.additional_directories),
+                cx,
+            )
             .await
         {
             Ok(session) => session,
@@ -923,8 +961,12 @@ impl AcpAgent {
             }
         };
 
-        self.store
-            .upsert(&req.session_id.0, &stored_cwd, &stored_file);
+        self.store.upsert_with_additional_directories(
+            &req.session_id.0,
+            &stored_cwd,
+            &stored_file,
+            &req.additional_directories,
+        );
 
         // Fetch full conversation history. It is replayed after the response so
         // the client has registered the restored session first. Failures still
@@ -965,16 +1007,14 @@ impl AcpAgent {
 
         // ACP: filter by cwd if provided. Zed sends `{}`, so default to the
         // last session cwd to emulate pi's project-scoped `/resume` picker.
-        let effective_cwd = req.cwd.clone().or_else(|| {
-            self.last_session_cwd
-                .try_lock()
-                .ok()
-                .and_then(|l| l.clone())
-        });
+        let effective_cwd = match req.cwd.clone() {
+            Some(cwd) => Some(cwd),
+            None => self.last_session_cwd.lock().await.clone(),
+        };
         let filtered: Vec<_> = match &effective_cwd {
             Some(cwd) => all
                 .into_iter()
-                .filter(|s| s.cwd == cwd.to_string_lossy())
+                .filter(|s| paths_match(Path::new(&s.cwd), cwd))
                 .collect(),
             None => all,
         };
@@ -989,7 +1029,16 @@ impl AcpAgent {
             .skip(offset)
             .take(LIST_PAGE_SIZE)
             .map(|s| {
+                let additional_directories = if s.additional_directories.is_empty() {
+                    self.store
+                        .get(&s.session_id)
+                        .map(|stored| stored.additional_directories)
+                        .unwrap_or_default()
+                } else {
+                    s.additional_directories.clone()
+                };
                 SessionInfo::new(s.session_id.clone(), PathBuf::from(&s.cwd))
+                    .additional_directories(additional_directories)
                     .title(s.title.clone())
                     .updated_at(s.updated_at.clone())
             })
@@ -1049,7 +1098,9 @@ impl AcpAgent {
         req: &SetSessionModeRequest,
         cx: &ConnectionTo<Client>,
     ) -> std::result::Result<SetSessionModeResponse, AcpError> {
-        let session = self.restore_session(&req.session_id, None, cx).await?;
+        let session = self
+            .restore_session(&req.session_id, None, None, cx)
+            .await?;
         let mode = req.mode_id.0.as_ref();
         let level = ThinkingLevel::parse(mode)
             .ok_or_else(|| invalid_params(&format!("Unknown modeId: {mode}")))?;
@@ -1070,7 +1121,9 @@ impl AcpAgent {
         req: &SetSessionConfigOptionRequest,
         cx: &ConnectionTo<Client>,
     ) -> std::result::Result<SetSessionConfigOptionResponse, AcpError> {
-        let session = self.restore_session(&req.session_id, None, cx).await?;
+        let session = self
+            .restore_session(&req.session_id, None, None, cx)
+            .await?;
         let config_id = req.config_id.0.as_ref();
 
         let value = req
@@ -1126,7 +1179,7 @@ impl AcpAgent {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_params("session/set_model missing modelId"))?;
 
-        let session = self.restore_session(&session_id, None, cx).await?;
+        let session = self.restore_session(&session_id, None, None, cx).await?;
         set_session_model(&session, model_id)
             .await
             .map_err(acp_error_from_pi)?;
@@ -1139,16 +1192,20 @@ impl AcpAgent {
     // session restoration & spawning
     // -----------------------------------------------------------------------
 
-    /// Locate a session's `{cwd, sessionFile}`: the session map first, then a
-    /// fresh scan of pi's session files (updating the map).
-    fn find_stored_session(&self, session_id: &str) -> Option<(String, String)> {
+    /// Locate a session's persisted location and roots: the session map first,
+    /// then a fresh scan of pi's session files (updating the map).
+    fn find_stored_session(&self, session_id: &str) -> Option<SessionLocation> {
         if let Some(stored) = self.store.get(session_id) {
-            return Some((stored.cwd, stored.session_file));
+            return Some(stored);
         }
         let pi_session = find_pi_session(session_id)?;
-        self.store
-            .upsert(session_id, &pi_session.cwd, &pi_session.session_file);
-        Some((pi_session.cwd, pi_session.session_file))
+        self.store.upsert_with_additional_directories(
+            session_id,
+            &pi_session.cwd,
+            &pi_session.session_file,
+            &pi_session.additional_directories,
+        );
+        self.store.get(session_id)
     }
 
     /// Get the live session for `session_id`, restoring it (spawning a pi
@@ -1157,20 +1214,27 @@ impl AcpAgent {
         &self,
         session_id: &SessionId,
         cwd: Option<&Path>,
+        additional_directories: Option<&[PathBuf]>,
         cx: &ConnectionTo<Client>,
     ) -> std::result::Result<Arc<PiAcpSession>, AcpError> {
         if let Some(existing) = self.sessions.maybe_get(session_id).await {
             return Ok(existing);
         }
 
-        let (stored_cwd, session_file) = self
+        let stored = self
             .find_stored_session(&session_id.0)
             .ok_or_else(|| invalid_params(&format!("Unknown sessionId: {}", session_id.0)))?;
 
         let effective_cwd = cwd
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(&stored_cwd));
-        let file_commands = commands::load_slash_commands(&effective_cwd);
+            .unwrap_or_else(|| PathBuf::from(&stored.cwd));
+        let effective_additional_directories = additional_directories
+            .map(|directories| directories.to_vec())
+            .unwrap_or_else(|| stored.additional_directories.clone());
+        let file_commands = commands::load_slash_commands_with_roots(
+            &effective_cwd,
+            &effective_additional_directories,
+        );
         // W-483: a respawned pi starts without the caller's menu — re-apply
         // the stored specs instead of silently dropping them.
         let mcp_specs = self
@@ -1184,11 +1248,14 @@ impl AcpAgent {
         let session = self
             .spawn_session(
                 Some(&effective_cwd),
-                Some(PathBuf::from(&session_file)),
+                Some(PathBuf::from(&stored.session_file)),
                 Some(session_id.clone()),
                 cx,
-                file_commands,
-                &mcp_specs,
+                SpawnSessionOptions {
+                    file_commands,
+                    mcp_specs: &mcp_specs,
+                    additional_directories: &effective_additional_directories,
+                },
             )
             .await?;
 
@@ -1203,10 +1270,11 @@ impl AcpAgent {
         }
 
         *self.last_session_cwd.lock().await = Some(effective_cwd.clone());
-        self.store.upsert(
+        self.store.upsert_with_additional_directories(
             &session_id.0,
             &effective_cwd.to_string_lossy(),
-            &session_file,
+            &stored.session_file,
+            &effective_additional_directories,
         );
         Ok(session)
     }
@@ -1222,8 +1290,7 @@ impl AcpAgent {
         session_path: Option<PathBuf>,
         session_id_override: Option<SessionId>,
         cx: &ConnectionTo<Client>,
-        file_commands: Vec<FileSlashCommand>,
-        mcp_specs: &[McpServerSpec],
+        options: SpawnSessionOptions<'_>,
     ) -> std::result::Result<Arc<PiAcpSession>, AcpError> {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(512);
         let conn = cx.clone();
@@ -1231,14 +1298,14 @@ impl AcpAgent {
 
         let mut extra_args: Vec<String> = Vec::new();
         let mut extra_env: Vec<(String, String)> = Vec::new();
-        if !mcp_specs.is_empty() {
+        if !options.mcp_specs.is_empty() {
             let registrar = mcp::materialize_registrar().map_err(|e| {
                 AcpError::new(
                     ACP_INTERNAL_ERROR,
                     format!("failed to stage the MCP registrar extension: {e}"),
                 )
             })?;
-            let payload = mcp::McpSessionManager::new(mcp_specs.to_vec())
+            let payload = mcp::McpSessionManager::new(options.mcp_specs.to_vec())
                 .payload_json()
                 .map_err(|e| {
                     AcpError::new(
@@ -1257,10 +1324,11 @@ impl AcpAgent {
             timeout: std::time::Duration::from_secs(self.cfg.rpc_timeout_secs),
             settle_timeout: std::time::Duration::from_secs(self.cfg.settle_timeout_secs),
             cwd: cwd.unwrap_or_else(|| Path::new(".")).to_path_buf(),
+            additional_directories: options.additional_directories.to_vec(),
             outbound: outbound_tx,
             session_path,
             session_id_override,
-            file_commands,
+            file_commands: options.file_commands,
             extra_env,
         })
         .await?;
@@ -1662,6 +1730,37 @@ fn invalid_params(msg: &str) -> AcpError {
     AcpError::new(ACP_INVALID_PARAMS, msg.to_string())
 }
 
+/// Compare paths while tolerating symlink aliases such as macOS `/var` and
+/// `/private/var`. Fall back to lexical comparison when either path does not
+/// exist yet.
+fn paths_match(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// ACP requires every additional workspace root to be absolute. Keep the
+/// primary `cwd` separate because it remains the base for relative paths.
+fn validate_additional_directories(
+    method: &str,
+    additional_directories: &[PathBuf],
+) -> std::result::Result<(), AcpError> {
+    if let Some(path) = additional_directories
+        .iter()
+        .find(|path| !path.is_absolute())
+    {
+        return Err(invalid_params(&format!(
+            "{method}: additionalDirectories entries must be absolute paths: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Validate an ACP `mcp_servers` menu (W-483). Pure validation runs before
 /// any side effect; every rejection names the offending server so the caller
 /// can fix exactly that entry. An empty menu is the common case and returns
@@ -1771,6 +1870,7 @@ fn acp_error_from_pi(e: AcpxError) -> AcpError {
 /// critical path).
 fn build_startup_prelude(
     cwd: &Path,
+    additional_directories: &[PathBuf],
     pi_version: Option<&str>,
     quiet_startup: bool,
     update_notice: Option<&str>,
@@ -1778,7 +1878,7 @@ fn build_startup_prelude(
     if quiet_startup {
         return update_notice.map(|n| format!("{n}\n")).unwrap_or_default();
     }
-    let out = build_startup_info(cwd, pi_version, update_notice);
+    let out = build_startup_info_with_roots(cwd, additional_directories, pi_version, update_notice);
     tracing::debug!(chars = out.len(), "startup prelude built");
     out
 }
@@ -2390,6 +2490,19 @@ mod tests {
         assert!(!is_bare_pi_command("/opt/pi/bin/pi"));
         assert!(!is_bare_pi_command("C:\\tools\\pi.cmd"));
         assert!(is_bare_pi_command("pi"));
+    }
+
+    #[test]
+    fn additional_directory_validation_requires_absolute_paths() {
+        assert!(validate_additional_directories("session/new", &[]).is_ok());
+        let absolute = std::env::temp_dir().join("workspace").join("extra");
+        assert!(
+            validate_additional_directories("session/new", std::slice::from_ref(&absolute)).is_ok()
+        );
+        let error = validate_additional_directories("session/load", &[PathBuf::from("relative")])
+            .expect_err("relative additional roots must be rejected");
+        assert_eq!(error.code, ACP_INVALID_PARAMS.into());
+        assert!(error.message.contains("additionalDirectories"));
     }
 
     #[test]

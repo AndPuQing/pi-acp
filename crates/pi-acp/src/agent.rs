@@ -927,7 +927,7 @@ impl AcpAgent {
         let stored = self
             .find_stored_session(&req.session_id.0)
             .ok_or_else(|| invalid_params(&format!("Unknown sessionId: {}", req.session_id.0)))?;
-        if Path::new(&stored.cwd) != req.cwd.as_path() {
+        if !paths_match(Path::new(&stored.cwd), &req.cwd) {
             return Err(invalid_params(&format!(
                 "session/load cwd must match the stored session cwd: {}",
                 stored.cwd
@@ -1007,16 +1007,14 @@ impl AcpAgent {
 
         // ACP: filter by cwd if provided. Zed sends `{}`, so default to the
         // last session cwd to emulate pi's project-scoped `/resume` picker.
-        let effective_cwd = req.cwd.clone().or_else(|| {
-            self.last_session_cwd
-                .try_lock()
-                .ok()
-                .and_then(|l| l.clone())
-        });
+        let effective_cwd = match req.cwd.clone() {
+            Some(cwd) => Some(cwd),
+            None => self.last_session_cwd.lock().await.clone(),
+        };
         let filtered: Vec<_> = match &effective_cwd {
             Some(cwd) => all
                 .into_iter()
-                .filter(|s| s.cwd == cwd.to_string_lossy())
+                .filter(|s| paths_match(Path::new(&s.cwd), cwd))
                 .collect(),
             None => all,
         };
@@ -1730,6 +1728,19 @@ fn resolve_session_file_path(cwd: &Path, session_file: &str) -> PathBuf {
 
 fn invalid_params(msg: &str) -> AcpError {
     AcpError::new(ACP_INVALID_PARAMS, msg.to_string())
+}
+
+/// Compare paths while tolerating symlink aliases such as macOS `/var` and
+/// `/private/var`. Fall back to lexical comparison when either path does not
+/// exist yet.
+fn paths_match(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// ACP requires every additional workspace root to be absolute. Keep the
@@ -2484,11 +2495,10 @@ mod tests {
     #[test]
     fn additional_directory_validation_requires_absolute_paths() {
         assert!(validate_additional_directories("session/new", &[]).is_ok());
-        assert!(validate_additional_directories(
-            "session/new",
-            &[PathBuf::from("/workspace/extra")]
-        )
-        .is_ok());
+        let absolute = std::env::temp_dir().join("workspace").join("extra");
+        assert!(
+            validate_additional_directories("session/new", std::slice::from_ref(&absolute)).is_ok()
+        );
         let error = validate_additional_directories("session/load", &[PathBuf::from("relative")])
             .expect_err("relative additional roots must be rejected");
         assert_eq!(error.code, ACP_INVALID_PARAMS.into());

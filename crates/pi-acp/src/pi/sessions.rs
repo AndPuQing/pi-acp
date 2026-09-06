@@ -570,14 +570,21 @@ mod tests {
 
     #[test]
     fn parses_absolute_additional_directories_and_ignores_relative_entries() {
-        let parsed = parse_session_header_with_roots(
-            r#"{"type":"session","id":"s1","cwd":"/work","additionalDirectories":["/repo-a","relative","/repo-b"]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.additional_directories,
-            vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")]
-        );
+        let repo_a = std::env::temp_dir().join("repo-a");
+        let repo_b = std::env::temp_dir().join("repo-b");
+        let raw = serde_json::json!({
+            "type": "session",
+            "id": "s1",
+            "cwd": "/work",
+            "additionalDirectories": [
+                repo_a.to_string_lossy(),
+                "relative",
+                repo_b.to_string_lossy()
+            ]
+        })
+        .to_string();
+        let parsed = parse_session_header_with_roots(&raw).unwrap();
+        assert_eq!(parsed.additional_directories, vec![repo_a, repo_b]);
     }
 
     #[test]

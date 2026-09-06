@@ -6,8 +6,11 @@
 //!
 //! - **TurnQueue**: client-side `one-at-a-time` queueing. A `prompt` while a
 //!   turn is running is queued; the queue is drained one turn at a time, each
-//!   completing only on pi's `agent_settled` event (**not** `agent_end`, which
-//!   pi may emit repeatedly for retries/compaction/continuations). `cancel()`
+//!   ordinary turn completing only on pi's `agent_settled` event (**not**
+//!   `agent_end`, which pi may emit repeatedly for retries/compaction/
+//!   continuations). Extension slash commands are the explicit exception:
+//!   pi acknowledges them without entering the agent loop, so their prompt
+//!   response is the completion signal. `cancel()`
 //!   clears the queue (each queued turn resolves `Cancelled`) and aborts the
 //!   in-flight turn. A settle timeout (pi accepted the prompt but never
 //!   settled) does **not** immediately retire the session: the stuck turn fails
@@ -76,7 +79,8 @@ use crate::translate::tools::{
 /// rewrite surfaces failures as explicit `Err(AcpxError)`, design D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// The turn completed normally (`agent_settled`).
+    /// The turn completed normally (`agent_settled` or an accepted extension
+    /// slash command).
     EndTurn,
     /// The turn was cancelled by the client (`session/cancel`).
     Cancelled,
@@ -348,6 +352,10 @@ pub struct PiAcpSession {
     /// same post-set state, so the pump skips its own re-read and emits only
     /// the authoritative mode update (W-479 P1).
     thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Names of pi extension slash commands discovered through `get_commands`.
+    /// Extension commands are not advertised to ACP, but they must take
+    /// precedence over local prompt files and complete on the prompt response.
+    extension_commands: Arc<Mutex<Option<HashSet<String>>>>,
 }
 
 /// Commands the pump task accepts from the outside world.
@@ -356,6 +364,7 @@ enum SessionCommand {
     Prompt {
         message: String,
         images: Vec<ImageContent>,
+        extension_command: bool,
         respond: oneshot::Sender<Result<StopReason>>,
     },
     /// Clear the queue and abort the in-flight turn.
@@ -391,6 +400,7 @@ enum SessionCommand {
 struct QueuedTurn {
     message: String,
     images: Vec<ImageContent>,
+    extension_command: bool,
     resolve: oneshot::Sender<Result<StopReason>>,
 }
 
@@ -402,6 +412,9 @@ struct PendingTurn {
     /// channel, so this prevents a late response from an earlier turn from
     /// mutating the current turn's deadline or result.
     turn_id: u64,
+    /// True for a pi extension command that completes on the prompt response
+    /// instead of waiting for `agent_settled`.
+    extension_command: bool,
     /// Whether pi has acknowledged the prompt RPC. Normally this precedes all
     /// events, but separate response/event channels can be observed in either
     /// order by the pump.
@@ -596,6 +609,7 @@ impl PiAcpSession {
         let (recovery_abort_tx, recovery_abort_rx) = mpsc::channel(1);
         let (extension_tx, extension_rx) = mpsc::channel(8);
         let death = Arc::new(std::sync::Mutex::new(None));
+        let extension_commands = Arc::new(Mutex::new(None));
         let pump = Pump {
             proc: Arc::new(Mutex::new(proc)),
             rpc,
@@ -644,6 +658,7 @@ impl PiAcpSession {
             death,
             initial_state: state,
             thinking_set_at,
+            extension_commands,
         }))
     }
 
@@ -686,8 +701,10 @@ impl PiAcpSession {
     }
 
     /// Start a turn (or queue it behind the running one) and await its
-    /// completion — which happens at pi's `agent_settled`, **not** at the
-    /// early `prompt` response (S2 constraint 2).
+    /// completion. Ordinary prompts complete at pi's `agent_settled`, **not**
+    /// at the early `prompt` response (S2 constraint 2); extension slash
+    /// commands complete at that response because they do not enter pi's
+    /// agent loop.
     ///
     /// File-based slash commands are expanded first (pi RPC mode disables its
     /// own expansion; TS `session.prompt` does the same).
@@ -696,17 +713,53 @@ impl PiAcpSession {
     /// when `cancel()` was requested, or `Err` when the turn failed (pi error /
     /// process death) — surfaced explicitly per design D5.
     pub async fn prompt(&self, message: String, images: Vec<ImageContent>) -> Result<StopReason> {
-        let expanded = crate::commands::expand_slash_command(&message, &self.file_commands);
+        // Query pi lazily for slash prompts so command discovery remains off
+        // the session/new critical path. A pi extension command wins over a
+        // same-named local prompt file, matching pi's command precedence.
+        let extension_command = self.is_extension_command(&message).await;
+        let expanded = if extension_command {
+            message
+        } else {
+            crate::commands::expand_slash_command(&message, &self.file_commands)
+        };
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::Prompt {
                 message: expanded,
                 images,
+                extension_command,
                 respond: tx,
             })
             .await
             .map_err(|_| self.death_error())?;
         rx.await.map_err(|_| self.death_error())?
+    }
+
+    /// Return whether a prompt names a pi extension command. The cache is
+    /// populated by the post-response advertisement path when that wins the
+    /// race; otherwise the first slash prompt performs the same discovery on
+    /// demand. Discovery failures leave the existing local-command behavior
+    /// intact.
+    async fn is_extension_command(&self, message: &str) -> bool {
+        let Some(name) = crate::commands::slash_command_name(message) else {
+            return false;
+        };
+
+        {
+            let cached = self.extension_commands.lock().await;
+            if let Some(names) = cached.as_ref() {
+                return names.contains(name);
+            }
+        }
+
+        if self.get_commands().await.is_err() {
+            return false;
+        }
+        self.extension_commands
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|names| names.contains(name))
     }
 
     /// Cancel the running turn and clear all queued turns (each resolves
@@ -936,7 +989,10 @@ impl PiAcpSession {
 
     /// `get_commands` (slash / skill / extension command list).
     pub async fn get_commands(&self) -> Result<Value> {
-        self.rpc(RpcCommand::GetCommands).await
+        let data = self.rpc(RpcCommand::GetCommands).await?;
+        *self.extension_commands.lock().await =
+            Some(crate::commands::extension_command_names(&data));
+        Ok(data)
     }
 }
 
@@ -951,8 +1007,15 @@ async fn pump_loop(mut pump: Pump) {
         tokio::select! {
             cmd = pump.cmd_rx.recv() => {
                 match cmd {
-                    Some(SessionCommand::Prompt { message, images, respond }) => {
-                        pump.on_prompt(message, images, respond).await;
+                    Some(SessionCommand::Prompt {
+                        message,
+                        images,
+                        extension_command,
+                        respond,
+                    }) => {
+                        pump
+                            .on_prompt(message, images, extension_command, respond)
+                            .await;
                     }
                     Some(SessionCommand::Cancel { respond }) => {
                         pump.on_cancel(respond).await;
@@ -1095,6 +1158,7 @@ impl Pump {
         &mut self,
         message: String,
         images: Vec<ImageContent>,
+        extension_command: bool,
         respond: oneshot::Sender<Result<StopReason>>,
     ) {
         if self.poisoned {
@@ -1104,6 +1168,7 @@ impl Pump {
         let queued = QueuedTurn {
             message,
             images,
+            extension_command,
             resolve: respond,
         };
         if self.pending_turn.is_some() || self.recovering {
@@ -1240,7 +1305,16 @@ impl Pump {
                     pending.prompt_accepted = true;
                     pending.settled_before_accept
                 };
-                if settled_before_accept {
+                let extension_command = self
+                    .pending_turn
+                    .as_ref()
+                    .is_some_and(|pending| pending.extension_command);
+                if extension_command {
+                    // Extension commands are handled outside pi's agent loop;
+                    // their successful prompt response is the turn's settle
+                    // signal and no `agent_settled` follows.
+                    self.settle_pending_turn().await;
+                } else if settled_before_accept {
                     self.settle_pending_turn().await;
                 } else if self.settle_timeout > Duration::ZERO {
                     // Accepted: arm the settle fallback (design §11 risk #84).
@@ -1275,6 +1349,7 @@ impl Pump {
         self.pending_turn = Some(PendingTurn {
             resolve: queued.resolve,
             turn_id,
+            extension_command: queued.extension_command,
             prompt_accepted: false,
             settled_before_accept: false,
             prompt_started: Some(prompt_started_rx),

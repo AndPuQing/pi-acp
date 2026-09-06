@@ -12,8 +12,8 @@
 //!   and collected as the *prelude* (context/skills/extension banner).
 //! - A **watcher task** awaits `Child::wait()`; on exit it rejects every
 //!   pending request with [`AcpxError::PiExited`] and marks the process dead —
-//!   so a dead pi is detected loudly instead of a silent empty `end_turn`
-//!   (fixes #82).
+//!   including the bounded stderr tail so a dead pi is detected loudly instead
+//!   of a silent empty `end_turn` (fixes #82 / upstream #108).
 //! - Teardown is SIGTERM → grace → SIGKILL against the whole process group
 //!   (pi is spawned in its own group on unix), with a reaper task; `Drop` is
 //!   the sync emergency path. Never relies on stdin-EOF alone (S2 constraint 4).
@@ -23,7 +23,7 @@
 //! here rather than rewritten: the single-in-flight model becomes the
 //! pending-map + event-channel client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +36,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
-use crate::error::{AcpxError, Result};
+use crate::error::{append_stderr_tail, AcpxError, Result};
 use crate::pi::resolve::resolve_current_env;
 use crate::pi::rpc::{
     ExtensionUiResponse, Model, QueueMode, RpcCommand, RpcEvent, RpcResponse, RpcSessionState,
@@ -63,6 +63,11 @@ const PRELUDE_CAP: usize = 200;
 /// Upper bound on collected MCP registrar markers (one per requested server;
 /// defensive — a menu with hundreds of servers is already unreasonable).
 const MCP_MARKER_CAP: usize = 128;
+/// Keep the most recent stderr lines for actionable startup/exit diagnostics.
+const STDERR_TAIL_CAP: usize = 20;
+/// Give the stderr reader a bounded window to consume bytes after the child
+/// exits. A descendant that inherited the pipe must not hold up reaping.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Shared state between the client handle and the two background tasks
 /// (reader + watcher).
@@ -77,9 +82,12 @@ struct Shared {
     /// `PI_ACP_MCP:*` marker lines scraped from the child's stderr (W-483).
     /// pi routes everything its extensions print (including raw
     /// `process.stdout.write`) to the child's stderr, so the in-pi
-    /// registrar reports there; pi-acp pipes stderr and keeps only marker
-    /// lines (pi diagnostics stay invisible, as when stderr was nulled).
+    /// registrar reports there; pi-acp keeps these separately for the MCP
+    /// handshake.
     mcp_markers: Mutex<Vec<String>>,
+    /// The most recent non-empty stderr lines, used when reporting a failed
+    /// child. This is deliberately raw text: diagnostics are not parsed.
+    stderr_tail: Mutex<VecDeque<String>>,
 }
 
 /// The request transport shared with session operations. Its stdin lock only
@@ -208,8 +216,8 @@ impl PiProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // pi writes diagnostics to stderr: piped (never the JSONL
-            // stream) and drained by a reader task that keeps only the
-            // `PI_ACP_MCP:*` registrar markers (W-483).
+            // stream) and drained by a reader task that keeps MCP markers
+            // (W-483) plus a bounded diagnostic tail.
             .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -241,9 +249,12 @@ impl PiProcess {
                     tokio::time::sleep(SPAWN_RETRY_DELAY).await;
                 }
                 Err(error) => {
+                    // Command::spawn failures happen before a child and its
+                    // stderr pipe exist, so there is no child-side tail to
+                    // attach on this path.
                     return Err(AcpxError::PiSpawn(spawn_error(
-                        pi_command, &resolved, error,
-                    )))
+                        pi_command, &resolved, error, None,
+                    )));
                 }
             }
         };
@@ -269,6 +280,7 @@ impl PiProcess {
             exit: Mutex::new(None),
             prelude: Mutex::new(Vec::new()),
             mcp_markers: Mutex::new(Vec::new()),
+            stderr_tail: Mutex::new(VecDeque::new()),
         });
 
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -281,11 +293,11 @@ impl PiProcess {
             .take()
             .ok_or_else(|| AcpxError::PiSpawn("pi stderr not piped".to_string()))?;
         let stderr_shared = shared.clone();
-        tokio::spawn(stderr_loop(stderr, stderr_shared));
+        let stderr_task = tokio::spawn(stderr_loop(stderr, stderr_shared));
 
         let pid = child.id();
         let watcher_shared = shared.clone();
-        let watcher = tokio::spawn(wait_loop(child, watcher_shared));
+        let watcher = tokio::spawn(wait_loop(child, watcher_shared, stderr_task));
 
         Ok(Self {
             stdin: Arc::new(AsyncMutex::new(stdin)),
@@ -363,6 +375,13 @@ impl PiProcess {
         self.shared.mcp_markers.lock().unwrap().clone()
     }
 
+    /// Non-draining snapshot of the most recent non-empty lines emitted by pi
+    /// on stderr. The returned string is suitable for appending to an error;
+    /// its contents are never parsed or interpreted.
+    pub fn stderr_tail_snapshot(&self) -> Option<String> {
+        stderr_tail_message(&self.shared)
+    }
+
     /// Whether the watcher has observed the child exit.
     pub fn is_dead(&self) -> bool {
         self.exit_status().is_some()
@@ -372,6 +391,14 @@ impl PiProcess {
     /// `signal` is populated on unix only (windows reports `None`).
     pub fn exit_status(&self) -> Option<(Option<i32>, Option<i32>)> {
         *self.shared.exit.lock().unwrap()
+    }
+
+    fn pi_exited_error(&self, code: Option<i32>, signal: Option<i32>) -> AcpxError {
+        AcpxError::PiExited {
+            code,
+            signal,
+            stderr: self.stderr_tail_snapshot(),
+        }
     }
 
     /// Wait (bounded) for the watcher to publish the child's exit status, then
@@ -422,8 +449,11 @@ impl PiProcess {
                     }
                     // Stream ended without settling (pi died mid-turn).
                     None => {
-                        let (code, signal) = self.exit_status().unwrap_or((None, None));
-                        return Err(AcpxError::PiExited { code, signal });
+                        let (code, signal) = self
+                            .wait_exited(Duration::from_millis(200))
+                            .await
+                            .unwrap_or((None, None));
+                        return Err(self.pi_exited_error(code, signal));
                     }
                 }
             }
@@ -650,7 +680,11 @@ impl RpcClient {
         // Fail fast on a dead child instead of writing into a broken pipe and
         // hoping for a timeout (design D3; fixes #82's silent empty end_turn).
         if let Some((code, signal)) = *self.shared.exit.lock().unwrap() {
-            return Err(AcpxError::PiExited { code, signal });
+            return Err(AcpxError::PiExited {
+                code,
+                signal,
+                stderr: stderr_tail_message(&self.shared),
+            });
         }
 
         let id = self.next_id();
@@ -696,6 +730,7 @@ impl RpcClient {
                 Err(AcpxError::PiExited {
                     code: None,
                     signal: None,
+                    stderr: stderr_tail_message(&self.shared),
                 })
             }
             Err(_) => {
@@ -764,14 +799,16 @@ fn spawn_error(
     pi_command: &str,
     resolved: &crate::pi::resolve::ResolvedPi,
     e: std::io::Error,
+    stderr: Option<&str>,
 ) -> String {
-    match e.kind() {
+    let message = match e.kind() {
         std::io::ErrorKind::NotFound => format!(
             "`{pi_command}` not found on PATH (resolved to {})",
             resolved.program
         ),
         _ => format!("{pi_command}: {e}"),
-    }
+    };
+    append_stderr_tail(message, stderr)
 }
 
 /// Background task: read pi's stdout line by line until EOF, routing responses
@@ -855,10 +892,9 @@ async fn read_loop(stdout: ChildStdout, shared: Arc<Shared>, events_tx: mpsc::Se
     tracing::debug!("pi stdout stream ended");
 }
 
-/// Background task: drain pi's stderr, keeping only the MCP registrar
-/// markers (W-483). Everything else is pi diagnostics — dropped, exactly as
-/// invisible as when stderr was nulled, but without ever blocking the child
-/// on a full pipe.
+/// Background task: drain pi's stderr, keeping the MCP registrar markers
+/// (W-483) and a bounded tail of all non-empty diagnostic lines. The tail is
+/// raw text and is only surfaced when a spawn/exit error is reported.
 async fn stderr_loop(stderr: ChildStderr, shared: Arc<Shared>) {
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
@@ -876,6 +912,10 @@ async fn stderr_loop(stderr: ChildStderr, shared: Arc<Shared>) {
         if trimmed.is_empty() {
             continue;
         }
+        {
+            let mut tail = shared.stderr_tail.lock().unwrap();
+            push_stderr_tail(&mut tail, trimmed);
+        }
         if !trimmed.starts_with(crate::mcp::MCP_MARKER_PREFIX) {
             continue;
         }
@@ -887,11 +927,29 @@ async fn stderr_loop(stderr: ChildStderr, shared: Arc<Shared>) {
     tracing::debug!("pi stderr stream ended");
 }
 
+fn stderr_tail_message(shared: &Shared) -> Option<String> {
+    let tail = shared.stderr_tail.lock().unwrap();
+    (!tail.is_empty()).then(|| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
+}
+
+fn push_stderr_tail(tail: &mut VecDeque<String>, line: &str) {
+    if tail.len() >= STDERR_TAIL_CAP {
+        tail.pop_front();
+    }
+    tail.push_back(line.to_string());
+}
+
 /// Background task: reap the child and propagate its exit.
 /// On exit: record `(code, signal)`, reject every pending request with
 /// [`AcpxError::PiExited`], and clear the pending map.
-async fn wait_loop(mut child: Child, shared: Arc<Shared>) {
+async fn wait_loop(mut child: Child, shared: Arc<Shared>, mut stderr_task: JoinHandle<()>) {
     let status = child.wait().await.ok();
+    if tokio::time::timeout(STDERR_DRAIN_TIMEOUT, &mut stderr_task)
+        .await
+        .is_err()
+    {
+        stderr_task.abort();
+    }
     let (code, signal) = match &status {
         Some(s) => (s.code(), exit_signal(s)),
         None => (None, None),
@@ -908,8 +966,13 @@ async fn wait_loop(mut child: Child, shared: Arc<Shared>) {
         std::mem::take(&mut *map)
     };
     let count = pending.len();
+    let stderr = stderr_tail_message(&shared);
     for (_, tx) in pending {
-        let _ = tx.send(Err(AcpxError::PiExited { code, signal }));
+        let _ = tx.send(Err(AcpxError::PiExited {
+            code,
+            signal,
+            stderr: stderr.clone(),
+        }));
     }
     if count > 0 {
         tracing::warn!(count, "rejected pending pi RPC requests after child exit");
@@ -995,6 +1058,18 @@ pub fn text_delta_of(event: &RpcEvent) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::pi::rpc::AssistantMessageEvent;
+
+    #[test]
+    fn stderr_tail_keeps_only_the_latest_lines() {
+        let mut tail = VecDeque::new();
+        for index in 0..(STDERR_TAIL_CAP + 2) {
+            push_stderr_tail(&mut tail, &format!("diagnostic-{index}"));
+        }
+
+        assert_eq!(tail.len(), STDERR_TAIL_CAP);
+        assert_eq!(tail.front().map(String::as_str), Some("diagnostic-2"));
+        assert_eq!(tail.back().map(String::as_str), Some("diagnostic-21"));
+    }
 
     #[test]
     fn strips_csi_color_codes() {

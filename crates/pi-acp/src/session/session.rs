@@ -82,10 +82,17 @@ pub enum StopReason {
     Cancelled,
 }
 
-/// The pi subprocess's exit `(code, signal)` once it has exited (`None` while
-/// alive); shared between the session handle and the pump task so a dead pi is
+/// The pi subprocess's exit details once it has exited (`None` while alive);
+/// shared between the session handle and the pump task so a dead pi is
 /// reported loudly on every later command (S8 / #82).
-type PiExitStatus = Option<(Option<i32>, Option<i32>)>;
+#[derive(Debug, Clone)]
+struct PiExitInfo {
+    code: Option<i32>,
+    signal: Option<i32>,
+    stderr: Option<String>,
+}
+
+type PiExitStatus = Option<PiExitInfo>;
 
 /// How long after our own thinking/model set a `thinking_level_changed` event
 /// counts as that set's echo (W-479 P1). The echoing event follows the set
@@ -191,8 +198,9 @@ pub struct PiAcpSession {
     file_commands: Vec<crate::commands::FileSlashCommand>,
     /// The pi subprocess's exit `(code, signal)` when it died **unexpectedly**
     /// (stream end, not graceful dispose). Commands issued after death fail
-    /// with [`AcpxError::PiExited`] (code/signal + hint) instead of a generic
-    /// "session closed" (S8 / fixes #82 — a dead pi is always loud).
+    /// with [`AcpxError::PiExited`] (code/signal + stderr tail + hint) instead
+    /// of a generic "session closed" (S8 / fixes #82 — a dead pi is always
+    /// loud).
     death: Arc<std::sync::Mutex<PiExitStatus>>,
     /// The `get_state` snapshot taken during [`PiAcpSession::spawn`]. No pi
     /// mutation happens between spawn and the `session/new` handshake, so the
@@ -513,11 +521,16 @@ impl PiAcpSession {
     }
 
     /// The error to surface when the session's pump is gone: [`AcpxError::PiExited`]
-    /// when pi died unexpectedly (carrying code/signal so the client gets the
-    /// "pi is dead" diagnosis + hint), else [`AcpxError::SessionClosed`].
+    /// when pi died unexpectedly (carrying code/signal/stderr so the client
+    /// gets the "pi is dead" diagnosis + hint), else
+    /// [`AcpxError::SessionClosed`].
     fn death_error(&self) -> AcpxError {
-        if let Some((code, signal)) = *self.death.lock().unwrap() {
-            AcpxError::PiExited { code, signal }
+        if let Some(exit) = self.death.lock().unwrap().clone() {
+            AcpxError::PiExited {
+                code: exit.code,
+                signal: exit.signal,
+                stderr: exit.stderr,
+            }
         } else {
             AcpxError::SessionClosed(self.session_id.0.to_string())
         }
@@ -893,12 +906,14 @@ async fn pump_loop(mut pump: Pump) {
         let _ = pending.resolve.send(Err(AcpxError::PiExited {
             code: None,
             signal: None,
+            stderr: None,
         }));
     }
     while let Some(t) = pump.queue.pop_front() {
         let _ = t.resolve.send(Err(AcpxError::PiExited {
             code: None,
             signal: None,
+            stderr: None,
         }));
     }
     // pi died unexpectedly: record the (settled) exit status so later commands
@@ -910,8 +925,13 @@ async fn pump_loop(mut pump: Pump) {
             proc.wait_exited(std::time::Duration::from_millis(200))
                 .await
         };
-        if let Some(status) = status {
-            *pump.death.lock().unwrap() = Some(status);
+        if let Some((code, signal)) = status {
+            let stderr = pump.proc.lock().await.stderr_tail_snapshot();
+            *pump.death.lock().unwrap() = Some(PiExitInfo {
+                code,
+                signal,
+                stderr,
+            });
         }
     }
     pump.proc.lock().await.dispose().await;
@@ -1520,18 +1540,28 @@ impl Pump {
         // the exit status. Give the watcher a short polling window before
         // rejecting turns so a real exit code is not lost in that race. The
         // helper polls shared state, leaving the JoinHandle for teardown.
-        let status = {
+        let (status, stderr) = {
             let mut proc = self.proc.lock().await;
-            proc.wait_exited(Duration::from_millis(200)).await
+            let status = proc.wait_exited(Duration::from_millis(200)).await;
+            let stderr = proc.stderr_tail_snapshot();
+            (status, stderr)
         };
         let (code, signal) = status.unwrap_or((None, None));
-        let pending_err = AcpxError::PiExited { code, signal };
+        let pending_err = AcpxError::PiExited {
+            code,
+            signal,
+            stderr: stderr.clone(),
+        };
         self.flush_outbound().await;
         if let Some(p) = self.pending_turn.take() {
             let _ = p.resolve.send(Err(pending_err));
         }
         while let Some(t) = self.queue.pop_front() {
-            let _ = t.resolve.send(Err(AcpxError::PiExited { code, signal }));
+            let _ = t.resolve.send(Err(AcpxError::PiExited {
+                code,
+                signal,
+                stderr: stderr.clone(),
+            }));
         }
         self.in_agent_loop = false;
     }

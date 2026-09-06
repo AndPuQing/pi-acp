@@ -1173,7 +1173,13 @@ async fn pi_exit_fails_the_running_turn() {
 /// generic "session closed" that hides what happened (S8 / fixes #82).
 #[tokio::test]
 async fn dead_session_reports_pi_exit_on_subsequent_prompts() {
-    let fx = fixture(&["--mock-exit-after", "2"]).await;
+    let fx = fixture(&[
+        "--mock-exit-after",
+        "2",
+        "--mock-stderr",
+        "provider startup failed",
+    ])
+    .await;
     write_scenario(&fx.scenarios, 1, &[json!({"type":"turn_start"})]);
 
     // First prompt dies mid-flight (command 2 = the prompt).
@@ -1184,9 +1190,14 @@ async fn dead_session_reports_pi_exit_on_subsequent_prompts() {
 
     // The pump has torn down; the session remembers the exit and surfaces it.
     match prompt_turn(&fx, "again").await {
-        Err(AcpxError::PiExited { code, signal }) => {
+        Err(AcpxError::PiExited {
+            code,
+            signal,
+            stderr,
+        }) => {
             assert_eq!(code, Some(42), "exit code must survive the teardown");
             assert_eq!(signal, None);
+            assert_eq!(stderr.as_deref(), Some("provider startup failed"));
         }
         other => panic!("expected PiExited on subsequent prompt, got {other:?}"),
     }

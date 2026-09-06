@@ -112,6 +112,139 @@ fn thinking_event_is_echo(last_set: Option<std::time::Instant>, now: std::time::
     last_set.is_some_and(|t| now.saturating_duration_since(t) <= THINKING_SET_ECHO_WINDOW)
 }
 
+const GENERIC_PI_ERROR: &str = "Pi reported an assistant error.";
+
+fn non_empty_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Extract useful text from the error/message shapes emitted by pi. The depth
+/// bound keeps malformed future payloads harmless while allowing nested error
+/// objects such as `{error: {message: "..."}}`.
+fn value_error_text(value: &Value, depth: u8) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+    match value {
+        Value::String(text) => non_empty_text(text),
+        Value::Array(blocks) => {
+            let text: String = blocks
+                .iter()
+                .filter_map(|block| {
+                    (block.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| block.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect();
+            non_empty_text(&text)
+        }
+        Value::Object(_) => {
+            for key in [
+                "errorMessage",
+                "error_message",
+                "message",
+                "error",
+                "detail",
+                "details",
+            ] {
+                if let Some(text) = value
+                    .get(key)
+                    .and_then(|nested| value_error_text(nested, depth + 1))
+                {
+                    return Some(text);
+                }
+            }
+            value
+                .get("content")
+                .and_then(|content| value_error_text(content, depth + 1))
+        }
+        _ => None,
+    }
+}
+
+fn meaningful_error_reason(reason: &str) -> Option<String> {
+    let reason = non_empty_text(reason)?;
+    (!matches!(reason.to_ascii_lowercase().as_str(), "error" | "aborted")).then_some(reason)
+}
+
+fn error_detail(value: &Value) -> Option<String> {
+    ["errorMessage", "error_message", "error"]
+        .iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(|detail| value_error_text(detail, 0))
+}
+
+fn assistant_error_text(reason: &str, error: &Value) -> String {
+    value_error_text(error, 0)
+        .or_else(|| meaningful_error_reason(reason))
+        .unwrap_or_else(|| GENERIC_PI_ERROR.to_string())
+}
+
+/// Extract a terminal assistant failure from `message_end`. Current pi uses
+/// `stopReason`/`errorMessage`; older or compatible producers may use
+/// `isError`/`is_error` or snake_case spellings.
+fn assistant_message_error_text(message: &Value) -> Option<String> {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+
+    let stop_reason = ["stopReason", "stop_reason", "status"]
+        .iter()
+        .find_map(|key| message.get(*key).and_then(Value::as_str));
+    let is_error = ["isError", "is_error"]
+        .iter()
+        .any(|key| message.get(*key).and_then(Value::as_bool) == Some(true));
+    let stop_is_error = stop_reason.is_some_and(|reason| reason.eq_ignore_ascii_case("error"));
+    let has_error_detail = error_detail(message).is_some();
+
+    if !(is_error || stop_is_error || has_error_detail) {
+        return None;
+    }
+
+    Some(
+        error_detail(message)
+            .or_else(|| {
+                message
+                    .get("content")
+                    .and_then(|content| value_error_text(content, 0))
+            })
+            .unwrap_or_else(|| GENERIC_PI_ERROR.to_string()),
+    )
+}
+
+/// Recover an error event that was too new for the typed enum to deserialize.
+/// Only error-tagged message events are surfaced; unrelated future events stay
+/// ignored as before.
+fn unknown_message_error_text(raw: &Value) -> Option<String> {
+    let event = match raw.get("type").and_then(Value::as_str) {
+        Some("message_update") => raw.get("assistantMessageEvent")?,
+        Some("error") | Some("agent_error") => raw,
+        _ => return None,
+    };
+    let event_type = event.get("type").and_then(Value::as_str);
+    if !matches!(event_type, Some("error") | Some("agent_error")) {
+        return None;
+    }
+
+    let reason = event.get("reason").and_then(Value::as_str).unwrap_or("");
+    Some(
+        error_detail(event)
+            .or_else(|| {
+                event
+                    .get("content")
+                    .and_then(|content| value_error_text(content, 0))
+            })
+            .or_else(|| {
+                event
+                    .get("message")
+                    .and_then(|message| value_error_text(message, 0))
+            })
+            .or_else(|| meaningful_error_reason(reason))
+            .unwrap_or_else(|| GENERIC_PI_ERROR.to_string()),
+    )
+}
+
 /// Clear a thinking-set stamp recorded before a failed set — but only when it
 /// is still ours, so a concurrent newer set's stamp is never wiped.
 fn clear_thinking_stamp(
@@ -347,6 +480,10 @@ struct Pump {
     thinking_set_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// True when the pump loop exited because pi's stdout ended (process died).
     pi_died: bool,
+    /// Error text already emitted for the active assistant turn. Pi can report
+    /// the same failure in both `message_update` and `message_end`; keep the
+    /// client from seeing duplicate diagnostics.
+    last_message_error: Option<String>,
 
     /// Client-side one-at-a-time turn queue.
     queue: VecDeque<QueuedTurn>,
@@ -476,6 +613,7 @@ impl PiAcpSession {
             death: death.clone(),
             thinking_set_at: thinking_set_at.clone(),
             pi_died: false,
+            last_message_error: None,
             queue: VecDeque::new(),
             pending_turn: None,
             next_turn_id: 0,
@@ -1130,6 +1268,7 @@ impl Pump {
     async fn start_turn(&mut self, queued: QueuedTurn) {
         self.cancel_requested = false;
         self.in_agent_loop = false;
+        self.last_message_error = None;
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
         let (prompt_started_tx, prompt_started_rx) = oneshot::channel();
@@ -1200,6 +1339,18 @@ impl Pump {
     async fn emit_text(&mut self, text: &str) {
         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
         self.emit(SessionUpdate::AgentMessageChunk(chunk)).await;
+    }
+
+    /// Surface a pi assistant failure as a visible ACP text chunk. A single
+    /// failure is commonly present in both the streaming error event and the
+    /// final message, so identical text is emitted only once per turn.
+    async fn emit_message_error(&mut self, text: String) {
+        let text = non_empty_text(&text).unwrap_or_else(|| GENERIC_PI_ERROR.to_string());
+        if self.last_message_error.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        self.last_message_error = Some(text.clone());
+        self.emit_text(&format!("Error: {text}")).await;
     }
 
     /// Publish the client-side queue depth via `session_info_update._meta`
@@ -1370,6 +1521,9 @@ impl Pump {
                 if let Some(usage) = Self::usage_from_assistant_message(&message) {
                     self.emit_usage_update(&usage).await;
                 }
+                if let Some(error) = assistant_message_error_text(&message) {
+                    self.emit_message_error(error).await;
+                }
             }
             RpcEvent::ToolExecutionStart {
                 tool_call_id,
@@ -1459,9 +1613,16 @@ impl Pump {
             RpcEvent::ThinkingLevelChanged { level } => {
                 self.on_thinking_level_changed(level).await;
             }
+            RpcEvent::Unknown { raw } => {
+                if let Some(error) = unknown_message_error_text(&raw) {
+                    self.emit_message_error(error).await;
+                } else {
+                    tracing::trace!(?raw, "unhandled unknown pi event");
+                }
+            }
             // Not wired (logged): QueueUpdate / EntryAppended /
             // UnmatchedResponse / ExtensionError / summarization retries /
-            // unknown future events.
+            // other unknown future events.
             other => {
                 tracing::trace!(?other, "unhandled pi event");
             }
@@ -1740,6 +1901,10 @@ impl Pump {
             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(delta.clone())));
                 self.emit(SessionUpdate::AgentThoughtChunk(chunk)).await;
+            }
+            AssistantMessageEvent::Error { reason, error } => {
+                self.emit_message_error(assistant_error_text(reason, error))
+                    .await;
             }
             AssistantMessageEvent::ToolcallStart { id, tool_name, .. } => {
                 // Modern pi strips the partial message and injects id/toolName;

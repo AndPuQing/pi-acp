@@ -347,6 +347,92 @@ async fn final_assistant_message_usage_updates_context() {
     assert_eq!(usage_updates(&recorded), vec![(33, 1000)]);
 }
 
+/// Pi has emitted both a structured assistant message and a plain string in
+/// the `error` field across releases. Both must become visible ACP text.
+#[tokio::test]
+async fn forwards_message_error_event_payload_variants() {
+    let fx = fixture(&[]).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "error",
+                    "reason": "error",
+                    "error": {
+                        "role": "assistant",
+                        "stopReason": "error",
+                        "errorMessage": "quota exceeded",
+                        "newField": {"piVersion": "0.84"}
+                    }
+                }
+            }),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "error",
+                    "reason": "error",
+                    "error": "legacy provider failure"
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "hello").await.unwrap(),
+        StopReason::EndTurn
+    );
+    let recorded = fx.recorded.lock().await.clone();
+    let chunks = text_chunks(&recorded);
+    assert!(chunks.iter().any(|text| text == "Error: quota exceeded"));
+    assert!(chunks
+        .iter()
+        .any(|text| text == "Error: legacy provider failure"));
+}
+
+/// A future error event with an unknown tag still degrades to generic text,
+/// while the final assistant message exposes its provider failure detail.
+#[tokio::test]
+async fn forwards_message_end_error_and_unknown_error_shape() {
+    let fx = fixture(&[]).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "agent_error",
+                    "diagnostic": {"provider": "new-pi", "code": 502}
+                }
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": "provider request failed"
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "hello").await.unwrap(),
+        StopReason::EndTurn
+    );
+    let recorded = fx.recorded.lock().await.clone();
+    let chunks = text_chunks(&recorded);
+    assert!(chunks
+        .iter()
+        .any(|text| text == "Error: Pi reported an assistant error."));
+    assert!(chunks
+        .iter()
+        .any(|text| text == "Error: provider request failed"));
+}
+
 /// Two prompts: the second is queued while the first streams; the queue drains
 /// one-at-a-time, each turn completing on `agent_settled` (never `agent_end`).
 #[tokio::test]

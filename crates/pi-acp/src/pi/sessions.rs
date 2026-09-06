@@ -26,9 +26,17 @@ const HEAD_BYTES: usize = 64 * 1024;
 pub struct PiSessionListItem {
     pub session_id: String,
     pub cwd: String,
+    pub additional_directories: Vec<PathBuf>,
     pub title: Option<String>,
     pub updated_at: Option<String>,
     pub session_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionHeader {
+    session_id: String,
+    cwd: String,
+    additional_directories: Vec<PathBuf>,
 }
 
 /// The pi sessions directory: settings `sessionDir` override (resolved against
@@ -107,7 +115,9 @@ fn read_tail(path: &Path) -> Option<String> {
 }
 
 /// Parse the session header line: `{ "type": "session", "id", "cwd" }`.
-fn parse_session_header(first_line: &str) -> Option<(String, String)> {
+/// Older pi session files omit `additionalDirectories`, which is equivalent to
+/// an empty list.
+fn parse_session_header_with_roots(first_line: &str) -> Option<SessionHeader> {
     let obj: Value = serde_json::from_str(first_line).ok()?;
     if obj.get("type").and_then(Value::as_str) != Some("session") {
         return None;
@@ -117,7 +127,24 @@ fn parse_session_header(first_line: &str) -> Option<(String, String)> {
     if session_id.is_empty() || cwd.is_empty() {
         return None;
     }
-    Some((session_id.to_string(), cwd.to_string()))
+    let additional_directories = obj
+        .get("additionalDirectories")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect();
+    Some(SessionHeader {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        additional_directories,
+    })
+}
+
+fn parse_session_header(first_line: &str) -> Option<(String, String)> {
+    parse_session_header_with_roots(first_line).map(|header| (header.session_id, header.cwd))
 }
 
 /// Return whether `path` is a persisted pi session whose header has
@@ -430,9 +457,14 @@ pub fn list_pi_sessions_from(sessions_dir: &Path) -> Vec<PiSessionListItem> {
         let Some(first) = read_first_line(&file) else {
             continue;
         };
-        let Some((session_id, cwd)) = parse_session_header(&first) else {
+        let Some(header) = parse_session_header_with_roots(&first) else {
             continue;
         };
+        let SessionHeader {
+            session_id,
+            cwd,
+            additional_directories,
+        } = header;
 
         let mut title: Option<String> = None;
         let mut updated_at: Option<String> = None;
@@ -457,6 +489,7 @@ pub fn list_pi_sessions_from(sessions_dir: &Path) -> Vec<PiSessionListItem> {
         items.push(PiSessionListItem {
             session_id,
             cwd,
+            additional_directories,
             title,
             updated_at,
             session_file: file.to_string_lossy().to_string(),
@@ -532,6 +565,18 @@ mod tests {
         assert_eq!(
             parse_session_header(r#"{"type":"session","id":"","cwd":"/x"}"#),
             None
+        );
+    }
+
+    #[test]
+    fn parses_absolute_additional_directories_and_ignores_relative_entries() {
+        let parsed = parse_session_header_with_roots(
+            r#"{"type":"session","id":"s1","cwd":"/work","additionalDirectories":["/repo-a","relative","/repo-b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.additional_directories,
+            vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")]
         );
     }
 

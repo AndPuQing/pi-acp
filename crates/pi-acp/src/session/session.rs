@@ -301,6 +301,9 @@ pub struct SessionParams {
     pub settle_timeout: Duration,
     /// Working directory of the session (resolves relative tool paths).
     pub cwd: PathBuf,
+    /// ACP additional workspace roots. These expand the session's discovery
+    /// and filesystem scope without changing the relative-path base in `cwd`.
+    pub additional_directories: Vec<PathBuf>,
     /// Outbound ACP message sink (see [`OutboundMessage`]).
     pub outbound: mpsc::Sender<OutboundMessage>,
     /// Optional pi session file to resume (`--session <path>`; used by
@@ -326,6 +329,7 @@ pub struct SessionParams {
 pub struct PiAcpSession {
     session_id: SessionId,
     cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
     cmd_tx: mpsc::Sender<SessionCommand>,
     /// Whether a real (non-slash) prompt has already been sent; the first one
     /// derives the thread's provisional title (fixes #102/#24).
@@ -652,6 +656,7 @@ impl PiAcpSession {
         Ok(Arc::new(Self {
             session_id,
             cwd: params.cwd,
+            additional_directories: params.additional_directories,
             cmd_tx,
             first_prompt: AtomicBool::new(false),
             file_commands: params.file_commands,
@@ -691,6 +696,10 @@ impl PiAcpSession {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub fn additional_directories(&self) -> &[PathBuf] {
+        &self.additional_directories
     }
 
     /// Atomically claim the first-prompt slot. Returns `true` on the first

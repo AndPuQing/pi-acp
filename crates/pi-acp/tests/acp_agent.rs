@@ -662,6 +662,154 @@ async fn new_session_map_waits_for_persisted_session_file() {
     result.expect("connection should complete");
 }
 
+/// ACP additional roots survive new-session persistence and listing, while an
+/// explicit empty list on session/load replaces the previous list.
+#[tokio::test]
+async fn additional_workspace_roots_roundtrip_and_load_empty_clears_them() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("primary");
+    let extra = tmp.path().join("secondary");
+    let agent_dir = tmp.path().join("agent");
+    let session_file = agent_dir.join("sessions/mock-session.jsonl");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&extra).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(extra.join("AGENTS.md"), "secondary context").unwrap();
+
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+            .env("PI_ACP_MOCK_SESSION_FILE", session_file.to_str().unwrap()),
+    );
+
+    let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+    let log_in_handler = log.clone();
+    let result = Client
+        .builder()
+        .name("additional-roots-client")
+        .on_receive_notification(
+            async move |notif: SessionNotification, _cx| {
+                log_in_handler
+                    .lock()
+                    .await
+                    .push((notif.session_id.0.to_string(), notif.update.clone()));
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(agent, async |cx| {
+            let init = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            assert!(
+                init.agent_capabilities
+                    .session_capabilities
+                    .additional_directories
+                    .is_some(),
+                "additionalDirectories capability must be advertised"
+            );
+
+            let new_session = cx
+                .send_request(
+                    NewSessionRequest::new(cwd.clone()).additional_directories(vec![extra.clone()]),
+                )
+                .block_task()
+                .await?;
+            wait_for(&log, |update| {
+                matches!(update, SessionUpdate::AgentMessageChunk(chunk)
+                    if matches!(&chunk.content, ContentBlock::Text(text)
+                        if text
+                            .text
+                            .contains(extra.join("AGENTS.md").to_string_lossy().as_ref())))
+            })
+            .await;
+
+            cx.send_request(prompt_for(&new_session.session_id, "persist roots"))
+                .block_task()
+                .await?;
+
+            let map_path = agent_dir.join("pi-acp/session-map.json");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let map = loop {
+                if let Ok(raw) = fs::read_to_string(&map_path) {
+                    let parsed: Value = serde_json::from_str(&raw).unwrap();
+                    if parsed["sessions"][new_session.session_id.0.as_ref()]
+                        ["additionalDirectories"]
+                        .as_array()
+                        .is_some()
+                    {
+                        break parsed;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "additional roots must be persisted"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            let stored = &map["sessions"][new_session.session_id.0.as_ref()];
+            assert_eq!(
+                stored["additionalDirectories"][0],
+                extra.to_string_lossy().as_ref()
+            );
+
+            let listed = cx
+                .send_request(ListSessionsRequest::new())
+                .block_task()
+                .await?;
+            let listed_session = listed
+                .sessions
+                .iter()
+                .find(|session| session.session_id == new_session.session_id)
+                .expect("new session should be listed");
+            assert_eq!(listed_session.additional_directories, vec![extra.clone()]);
+
+            cx.send_request(LoadSessionRequest::new(
+                new_session.session_id.clone(),
+                cwd.clone(),
+            ))
+            .block_task()
+            .await?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let raw = fs::read_to_string(&map_path).unwrap();
+                let parsed: Value = serde_json::from_str(&raw).unwrap();
+                let stored = &parsed["sessions"][new_session.session_id.0.as_ref()];
+                if stored.get("additionalDirectories").is_none()
+                    || stored["additionalDirectories"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "session/load with an empty list must clear additional roots"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let listed = cx
+                .send_request(ListSessionsRequest::new())
+                .block_task()
+                .await?;
+            let listed_session = listed
+                .sessions
+                .iter()
+                .find(|session| session.session_id == new_session.session_id)
+                .expect("loaded session should remain listed");
+            assert!(listed_session.additional_directories.is_empty());
+            Ok(())
+        })
+        .await;
+    result.expect("additional roots flow should complete");
+}
+
 /// A session/new that never reaches a persisted turn must not become
 /// loadable after the ACP process is restarted.
 #[tokio::test]

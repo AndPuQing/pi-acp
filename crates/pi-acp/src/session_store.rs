@@ -1,4 +1,5 @@
-//! `session-map.json` persistence: `sessionId -> {cwd, sessionFile, updatedAt}`.
+//! `session-map.json` persistence: `sessionId -> {cwd, sessionFile,
+//! additionalDirectories, updatedAt}`.
 //!
 //! Ports `acp/session-store.ts` (which rewrites the whole file on every access)
 //! with the design's hardening: **in-memory cache + atomic write** (tempfile +
@@ -36,6 +37,10 @@ pub struct StoredSession {
     pub session_id: String,
     pub cwd: String,
     pub session_file: String,
+    /// The complete ACP additional-root list. Missing in older map files is
+    /// treated as an empty list by serde.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
     pub updated_at: String,
 }
 
@@ -124,6 +129,17 @@ impl SessionStore {
 
     /// Insert or refresh an entry (updates `updatedAt` to now).
     pub fn upsert(&self, session_id: &str, cwd: &str, session_file: &str) {
+        self.upsert_with_additional_directories(session_id, cwd, session_file, &[]);
+    }
+
+    /// Insert or refresh an entry with its complete ACP additional-root list.
+    pub fn upsert_with_additional_directories(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        session_file: &str,
+        additional_directories: &[PathBuf],
+    ) {
         self.update(|db| {
             db.sessions.insert(
                 session_id.to_string(),
@@ -131,6 +147,7 @@ impl SessionStore {
                     session_id: session_id.to_string(),
                     cwd: cwd.to_string(),
                     session_file: session_file.to_string(),
+                    additional_directories: additional_directories.to_vec(),
                     updated_at: utc_now_iso8601(),
                 },
             );
@@ -240,6 +257,7 @@ mod tests {
         assert_eq!(entry.session_id, "s1");
         assert_eq!(entry.cwd, "/work");
         assert_eq!(entry.session_file, "/tmp/s1.jsonl");
+        assert!(entry.additional_directories.is_empty());
         assert!(entry.updated_at.ends_with('Z'));
 
         // upsert refreshes
@@ -282,6 +300,28 @@ mod tests {
         // And a subsequent write repairs the file.
         store.upsert("x", "/w", "/f");
         assert_eq!(SessionStore::at(path).get("x").unwrap().cwd, "/w");
+    }
+
+    #[test]
+    fn additional_directories_roundtrip_and_old_maps_default_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("map.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"sessions":{"old":{"sessionId":"old","cwd":"/work","sessionFile":"/tmp/old.jsonl","updatedAt":"2026-08-01T00:00:00.000Z"}}}"#,
+        )
+        .unwrap();
+
+        let old = SessionStore::at(path.clone());
+        assert!(old.get("old").unwrap().additional_directories.is_empty());
+
+        let roots = vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")];
+        old.upsert_with_additional_directories("new", "/work", "/tmp/new.jsonl", &roots);
+        let entry = SessionStore::at(path.clone()).get("new").unwrap();
+        assert_eq!(entry.additional_directories, roots);
+
+        let raw = fs::read_to_string(path).unwrap();
+        assert!(raw.contains("additionalDirectories"));
     }
 
     #[test]

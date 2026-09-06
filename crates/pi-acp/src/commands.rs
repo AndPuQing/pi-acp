@@ -163,20 +163,47 @@ pub fn load_commands_from_dir(
 /// - user:    `~/.pi/agent/prompts/**/*.md` (honoring `PI_CODING_AGENT_DIR`);
 /// - project: `<cwd>/.pi/prompts/**/*.md`.
 pub fn load_slash_commands(cwd: &Path) -> Vec<FileSlashCommand> {
-    load_slash_commands_at(&agent_dir(), cwd)
+    load_slash_commands_with_roots(cwd, &[])
+}
+
+/// Load prompt files from the primary cwd and ACP additional workspace roots.
+/// The user prompt directory is loaded once, followed by project prompt
+/// directories in request order. `cwd` remains the relative-path base; the
+/// extra roots only add discoverable project commands.
+pub fn load_slash_commands_with_roots(
+    cwd: &Path,
+    additional_directories: &[std::path::PathBuf],
+) -> Vec<FileSlashCommand> {
+    load_slash_commands_at_roots(&agent_dir(), cwd, additional_directories)
 }
 
 /// [`load_slash_commands`] with an explicit agent dir (testable / injectable).
 pub fn load_slash_commands_at(agent_dir: &Path, cwd: &Path) -> Vec<FileSlashCommand> {
+    load_slash_commands_at_roots(agent_dir, cwd, &[])
+}
+
+/// [`load_slash_commands_with_roots`] with explicit paths (testable / injectable).
+pub fn load_slash_commands_at_roots(
+    agent_dir: &Path,
+    cwd: &Path,
+    additional_directories: &[std::path::PathBuf],
+) -> Vec<FileSlashCommand> {
     let mut commands = Vec::new();
     let user_dir = agent_dir.join("prompts");
-    let project_dir = cwd.join(".pi").join("prompts");
     commands.extend(load_commands_from_dir(&user_dir, CommandSource::User, ""));
-    commands.extend(load_commands_from_dir(
-        &project_dir,
-        CommandSource::Project,
-        "",
-    ));
+    let mut project_roots: Vec<&Path> = vec![cwd];
+    for root in additional_directories {
+        if !project_roots.iter().any(|existing| *existing == root) {
+            project_roots.push(root);
+        }
+    }
+    for root in project_roots {
+        commands.extend(load_commands_from_dir(
+            &root.join(".pi").join("prompts"),
+            CommandSource::Project,
+            "",
+        ));
+    }
     commands
 }
 
@@ -663,6 +690,30 @@ mod tests {
         project_cmds.sort();
         assert_eq!(user, vec![("a", "(user)"), ("b", "(user)")]);
         assert_eq!(project_cmds, vec![("b", "(project)"), ("c", "(project)")]);
+    }
+
+    #[test]
+    fn load_slash_commands_at_roots_includes_additional_projects() {
+        let agent = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        fs::create_dir_all(cwd.path().join(".pi/prompts")).unwrap();
+        fs::create_dir_all(extra.path().join(".pi/prompts")).unwrap();
+        fs::write(cwd.path().join(".pi/prompts/main.md"), "main").unwrap();
+        fs::write(extra.path().join(".pi/prompts/extra.md"), "extra").unwrap();
+
+        let commands = load_slash_commands_at_roots(
+            agent.path(),
+            cwd.path(),
+            &[extra.path().to_path_buf(), cwd.path().to_path_buf()],
+        );
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"main"));
+        assert!(names.contains(&"extra"));
     }
 
     #[test]

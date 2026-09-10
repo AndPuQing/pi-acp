@@ -287,7 +287,9 @@ fn pick_fallback_title_from_head(path: &Path) -> Option<String> {
 ///
 /// Accepts `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM|±HHMM]` (the shapes pi emits);
 /// converts any offset to UTC `Z` and pads milliseconds (JS `toISOString`
-/// style). Anything else → `None` (TS `Date.parse` NaN).
+/// style). A *naive* timestamp (no `Z`/offset) is rejected too: labeling it
+/// UTC would silently shift it by the local offset, so callers fall back to
+/// the file mtime (the real clock) instead.
 fn normalize_timestamp(ts: &str) -> Option<String> {
     let s = ts.trim();
     let bytes = s.as_bytes();
@@ -347,7 +349,8 @@ fn normalize_timestamp(ts: &str) -> Option<String> {
     };
 
     let offset_minutes = match bytes.get(index).copied() {
-        None => 0i64,
+        // Naive (no zone designator): not safely interpretable — reject.
+        None => return None,
         Some(b'Z' | b'z') if index + 1 == bytes.len() => 0,
         Some(b'+' | b'-') => {
             let sign = if bytes[index] == b'+' { 1i64 } else { -1i64 };
@@ -639,6 +642,14 @@ mod tests {
             normalize_timestamp("2026-08-01T23:30:00-0200"),
             Some("2026-08-02T01:30:00.000Z".to_string())
         );
+    }
+
+    #[test]
+    fn naive_timestamp_is_rejected() {
+        // No `Z`/offset: labeling it UTC would silently shift it by the local
+        // zone, so it is rejected and the caller falls back to file mtime.
+        assert_eq!(normalize_timestamp("2026-08-02T00:30:00.100"), None);
+        assert_eq!(normalize_timestamp("2026-08-02T00:30:00"), None);
     }
 
     #[test]

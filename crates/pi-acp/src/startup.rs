@@ -115,11 +115,10 @@ pub fn build_startup_info_at_with_roots(
     // Skills
     let mut skills_items = Vec::new();
     push_skills_from_root(&agent.join("skills"), &mut skills_items);
-    if let Some(home) = std::env::var_os("HOME") {
-        push_skills_from_root(
-            &PathBuf::from(home).join(".agents").join("skills"),
-            &mut skills_items,
-        );
+    // `dirs::home_dir()` (not `$HOME`) so this root is found on Windows,
+    // where `HOME` is typically unset.
+    if let Some(home) = dirs::home_dir() {
+        push_skills_from_root(&home.join(".agents").join("skills"), &mut skills_items);
     }
     for root in &roots {
         push_skills_from_root(&root.join(".pi").join("skills"), &mut skills_items);

@@ -195,10 +195,17 @@ fn split_path(p: &str, is_windows: bool) -> Vec<String> {
         .collect()
 }
 
-/// Existence check for the unix branch (plain `is_file`; `exists` on Windows).
+/// Existence check for the unix branch. A regular file that is not
+/// executable (e.g. a non-executable `pi` script earlier in PATH) must NOT
+/// satisfy the lookup — selecting it would fail at spawn with `EACCES`
+/// instead of falling through to a real executable further down the PATH.
 #[cfg(unix)]
 fn candidate_exists(p: &Path) -> bool {
-    p.is_file()
+    use std::os::unix::fs::PermissionsExt;
+    match p.metadata() {
+        Ok(md) => md.is_file() && md.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
 }
 #[cfg(windows)]
 fn candidate_exists(p: &Path) -> bool {
@@ -249,15 +256,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bare_name_unix_picks_existing_path_entry() {
-        // Use a real, existing file path as a stand-in directory entry so the
+    fn bare_name_unix_picks_existing_executable_path_entry() {
+        // Use a real, existing executable file as a stand-in so the
         // resolution can actually find something: point PATH at a dir that
-        // contains a file named "pi".
+        // contains an executable file named "pi".
         let tmp = tempfile::tempdir().unwrap();
         let pi = tmp.path().join("pi");
         std::fs::write(&pi, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &pi,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
         let r = resolve_pi_command("pi", unix(), Some(tmp.path().to_str().unwrap()), None);
         assert_eq!(r.program, pi.to_string_lossy());
+        assert!(r.cmd_args.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_name_unix_skips_non_executable_and_falls_through() {
+        // A non-executable `pi` earlier in PATH must be skipped (selecting it
+        // would fail at spawn with EACCES); resolution falls through to the
+        // bare name so the OS can find a real executable.
+        let tmp = tempfile::tempdir().unwrap();
+        let pi = tmp.path().join("pi");
+        std::fs::write(&pi, b"#!/bin/sh\n").unwrap();
+        // Leave it non-executable (0644, the default).
+        let r = resolve_pi_command("pi", unix(), Some(tmp.path().to_str().unwrap()), None);
+        assert_eq!(r.program, "pi");
         assert!(r.cmd_args.is_empty());
     }
 

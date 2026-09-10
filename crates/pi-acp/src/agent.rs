@@ -1351,14 +1351,16 @@ impl AcpAgent {
         message: &str,
     ) -> std::result::Result<Option<PromptResponse>, AcpError> {
         let trimmed = message.trim();
-        let space = trimmed.find(' ');
-        let cmd = match space {
-            Some(i) => &trimmed[1..i],
-            None => &trimmed[1..],
-        };
-        let args_string = match space {
-            Some(i) => &trimmed[i + 1..],
-            None => "",
+        // Split the command token on ANY whitespace (matching
+        // `expand_slash_command` / `slash_command_name`): `/compact\tinstructions`
+        // is the `compact` builtin, not an unknown command.
+        let rest = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        let (cmd, args_string) = match rest
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+        {
+            Some((index, _)) => (&rest[..index], rest[index..].trim_start()),
+            None => (rest, ""),
         };
         let args = commands::parse_command_args(args_string);
 

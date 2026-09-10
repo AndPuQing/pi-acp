@@ -1825,6 +1825,14 @@ impl Pump {
     /// (it clears the drain queue). A healthy pi retries on the same ACP
     /// session id; an abort failure or an unconfirmed drain poisons the
     /// session, which is the safe fallback for an unhealthy pi.
+    ///
+    /// A *cancelled* turn that never settles (W-480 cancel race): `on_cancel`
+    /// already confirmed the abort with pi, so the turn is reported as
+    /// `StopReason::Cancelled` — the client explicitly cancelled and should
+    /// not see a scary `SettleTimeout` for a turn it ended. The W-480
+    /// handshake still runs: a late `agent_settled` from the aborted turn can
+    /// still arrive, and queued retries must wait for it (the abort is
+    /// already confirmed, so only the settle side is outstanding).
     async fn on_settle_timeout(&mut self) {
         self.settle_deadline = None;
         let Some(pending) = self.pending_turn.take() else {
@@ -1832,6 +1840,21 @@ impl Pump {
             return;
         };
         self.flush_outbound().await;
+        if self.cancel_requested {
+            let _ = pending.resolve.send(Ok(StopReason::Cancelled));
+            self.cancel_requested = false;
+            self.in_agent_loop = false;
+            // The abort was confirmed by `on_cancel` (it awaits the RPC and
+            // poisons the session on failure), so only the late settle is
+            // outstanding. Queued turns wait behind the drain, as in the
+            // non-cancel path.
+            self.recovering = true;
+            self.recover_deadline = Some(tokio::time::Instant::now() + STALE_DRAIN_TIMEOUT);
+            self.recovery_abort_confirmed = true;
+            self.recovery_settled = false;
+            self.emit_queue_depth(false).await;
+            return;
+        }
         let secs = self.settle_timeout.as_secs();
         let _ = pending.resolve.send(Err(AcpxError::SettleTimeout { secs }));
         // Queued turns never reached pi: fail them with the same timeout so
@@ -2402,6 +2425,11 @@ impl Pump {
 /// `session/update` notifications in order and answers
 /// `session/request_permission` requests. Runs on a spawned task — outside the
 /// SDK dispatch loop, so `block_task()` is safe there.
+///
+/// Permission requests are handled in their own spawned task: the forward
+/// loop must never block on a client answer, or a client that never responds
+/// to an (extension-UI) permission request could back up the 512-slot
+/// outbound channel and wedge the pump (blocking `Cancel`/`Shutdown`).
 pub fn spawn_outbound_connector(
     conn: ConnectionTo<Client>,
     mut rx: mpsc::Receiver<OutboundMessage>,
@@ -2414,13 +2442,16 @@ pub fn spawn_outbound_connector(
                         conn.send_notification(notif)?;
                     }
                     OutboundMessage::RequestPermission(request, respond) => {
-                        let response = conn.send_request(request).block_task().await.map_err(|e| {
-                            AcpxError::RpcFailed {
-                                command: "request_permission".into(),
-                                message: e.to_string(),
-                            }
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            let response = conn.send_request(request).block_task().await.map_err(
+                                |e| AcpxError::RpcFailed {
+                                    command: "request_permission".into(),
+                                    message: e.to_string(),
+                                },
+                            );
+                            let _ = respond.send(response);
                         });
-                        let _ = respond.send(response);
                     }
                     OutboundMessage::Flush(ack) => {
                         // Everything before this marker is now enqueued on the

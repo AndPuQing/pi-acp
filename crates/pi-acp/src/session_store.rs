@@ -116,7 +116,14 @@ impl SessionStore {
             .lock()
             .expect("session store file lock poisoned");
         let mut cache = self.cache.lock().expect("session store cache poisoned");
+        // A map file that exists on disk but cannot be parsed (corruption, or
+        // a future version) is loaded as an empty map; the write below would
+        // destroy its entries. Preserve the raw bytes first so they are
+        // recoverable instead of silently lost.
         let mut db = load_file(&self.path);
+        if map_file_unreadable(&self.path) {
+            let _ = backup_unreadable_map(&self.path);
+        }
         if update(&mut db) && atomic_write_json(&self.path, &db) {
             *cache = Some(db);
         }
@@ -171,6 +178,47 @@ fn load_file(path: &Path) -> SessionMapFile {
         Ok(db) if db.version == 1 => db,
         _ => SessionMapFile::default(),
     }
+}
+
+/// True when the map file exists on disk but cannot be parsed as a v1 map
+/// (corruption, malformed JSON, or a future version).
+fn map_file_unreadable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<SessionMapFile>(&raw)
+            .map(|db| db.version != 1)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Preserve the raw bytes of an unreadable map file as `<path>.corrupt`
+/// (only if no backup exists yet) and log where they went. Called BEFORE the
+/// overwriting write; the corrupted entries are then recoverable manually.
+fn backup_unreadable_map(path: &Path) -> std::io::Result<()> {
+    let backup = path.with_file_name(format!(
+        "{}.corrupt",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    if backup.exists() {
+        return Ok(());
+    }
+    let result = fs::rename(path, &backup);
+    match &result {
+        Ok(()) => tracing::error!(
+            ?path,
+            ?backup,
+            "session-map file was unreadable (corrupt or unknown version); preserved it and continued with an empty map — restore entries from the backup if needed"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            ?path,
+            "session-map file was unreadable and could not be backed up; its entries will be lost on the next write"
+        ),
+    }
+    result
 }
 
 /// Write the map file through a same-directory temp file and replacement.
@@ -366,6 +414,26 @@ mod tests {
         let fresh = SessionStore::at(path);
         assert!(fresh.get("first").is_some());
         assert!(fresh.get("second").is_some());
+    }
+
+    #[test]
+    fn corrupt_map_is_preserved_as_backup_before_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("map.json");
+        // Malformed bytes that still contain a recognizable entry, so the
+        // backup's recoverability is observable.
+        fs::write(&path, "{ not json but mentions \"old\"").unwrap();
+
+        let store = SessionStore::at(path.clone());
+        store.upsert("new", "/w", "/f");
+
+        let backup = path.with_file_name("map.json.corrupt");
+        assert!(backup.exists(), "corrupt map should be preserved as a backup");
+        let backup_raw = fs::read_to_string(&backup).unwrap();
+        assert!(backup_raw.contains("old"));
+        // The live file is the repaired v1 map with only the new entry.
+        assert!(store.get("new").is_some());
+        assert!(store.get("old").is_none());
     }
 
     #[test]

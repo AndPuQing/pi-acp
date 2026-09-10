@@ -207,8 +207,11 @@ fn normalize_one(server: &McpServer) -> Result<McpServerSpec, String> {
     }
 }
 
-/// Names must be non-empty (adapter fails closed on those) and single-line
-/// (they travel in line-based stdout markers).
+/// Names must be non-empty (adapter fails closed on those), single-line, and
+/// free of `:` and whitespace: they travel in the line-based
+/// `PI_ACP_MCP:<kind>:<name>:...` stdout markers, and the parser splits the
+/// first `:` after the kind — a name containing `:` would be mis-parsed and
+/// its gate would time out with a misleading error.
 fn checked_name(name: &str) -> Result<String, String> {
     if name.trim().is_empty() {
         return Err("MCP server name must be a non-empty string".to_string());
@@ -216,6 +219,12 @@ fn checked_name(name: &str) -> Result<String, String> {
     if name.contains('\n') || name.contains('\r') {
         return Err(format!(
             "MCP server \"{name}\": name must not contain line breaks"
+        ));
+    }
+    if name.contains(':') || name.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "MCP server \"{name}\": name must not contain ':' or whitespace \
+             (names travel in line-based stdout markers)"
         ));
     }
     Ok(name.to_string())
@@ -445,19 +454,37 @@ impl McpSessionManager {
 /// This is extension *code*, not MCP configuration: it carries no server
 /// definitions and no secrets (those travel per-child in the environment),
 /// so sharing one copy across sessions is safe. Unix files get `0600`.
+static REGISTRAR_TEMP_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub fn materialize_registrar() -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("pi-acp-{REGISTRAR_VERSION}"));
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("mcp-registrar.js");
     let current = std::fs::read_to_string(&path).ok();
     if current.as_deref() != Some(REGISTRAR_JS) {
-        let tmp = dir.join("mcp-registrar.js.tmp");
-        std::fs::write(&tmp, REGISTRAR_JS)?;
+        let sequence = REGISTRAR_TEMP_COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            "mcp-registrar.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        // `create_new` refuses to follow a pre-planted symlink (the old
+        // `fs::write` did); 0600 is set before any bytes land, so there is no
+        // world-readable window.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        f.write_all(REGISTRAR_JS.as_bytes())?;
+        f.sync_all()?;
         std::fs::rename(&tmp, &path)?;
     }
     Ok(path)

@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// The pi agent directory: `PI_CODING_AGENT_DIR` when set, else
 /// `~/.pi/agent`. Mirrors TS `getAgentDir` (pi-settings.ts).
@@ -49,15 +49,18 @@ pub fn deep_merge(base: &Value, overlay: &Value) -> Value {
 }
 
 /// Read a JSON settings file; missing files, malformed JSON, and non-object
-/// payloads all yield `Value::Null` (mirrors TS `readJsonFile` returning `{}`).
+/// payloads all yield an empty object `{}` (mirrors TS `readJsonFile`, which
+/// returns `{}` rather than `null`). Returning `{}` — not `Value::Null` — is
+/// what keeps a project without `.pi/settings.json` from wiping the global
+/// settings during [`deep_merge`]: a `null` overlay would win wholesale.
 pub fn read_json_file(path: &Path) -> Value {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(_) => return Value::Null,
+        Err(_) => return json!({}),
     };
     match serde_json::from_str::<Value>(&raw) {
         Ok(value) if value.is_object() => value,
-        _ => Value::Null,
+        _ => json!({}),
     }
 }
 
@@ -319,7 +322,22 @@ mod tests {
     fn deep_merge_null_base_behaves_like_empty() {
         let merged = deep_merge(&Value::Null, &json!({ "a": 1 }));
         assert_eq!(merged, json!({ "a": 1 }));
-        assert_eq!(deep_merge(&json!({ "a": 1 }), &Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn global_settings_survive_missing_project_file() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        fs::write(
+            agent.path().join("settings.json"),
+            json!({ "quietStartup": true, "enabledModels": ["anthropic/*"] })
+                .to_string(),
+        )
+        .unwrap();
+
+        let merged = load_merged_settings(agent.path(), project.path());
+        assert_eq!(merged["quietStartup"], true);
+        assert_eq!(merged["enabledModels"], json!(["anthropic/*"]));
     }
 
     // --- read_json_file ---
@@ -327,15 +345,18 @@ mod tests {
     #[test]
     fn read_json_file_tolerates_missing_and_bad_json() {
         let dir = TempDir::new().unwrap();
-        assert_eq!(read_json_file(&dir.path().join("nope.json")), Value::Null);
+        // Missing/malformed/non-object files read as `{}`, not `null`: a
+        // `null` overlay would wipe the base during `deep_merge` (a project
+        // without `.pi/settings.json` would lose all global settings).
+        assert_eq!(read_json_file(&dir.path().join("nope.json")), json!({}));
 
         let bad = dir.path().join("bad.json");
         fs::write(&bad, "{ not json").unwrap();
-        assert_eq!(read_json_file(&bad), Value::Null);
+        assert_eq!(read_json_file(&bad), json!({}));
 
         let scalar = dir.path().join("scalar.json");
         fs::write(&scalar, "42").unwrap();
-        assert_eq!(read_json_file(&scalar), Value::Null);
+        assert_eq!(read_json_file(&scalar), json!({}));
     }
 
     // --- merged settings ---

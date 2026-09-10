@@ -66,7 +66,13 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
     };
     let end_index = 3 + relative_end;
 
-    let frontmatter_block = &content[4..end_index];
+    // `"---\n---"` (empty frontmatter) puts end_index at 3, before the body
+    // starts at 4; treat that as an empty block instead of panicking.
+    let frontmatter_block = if end_index >= 4 {
+        &content[4..end_index]
+    } else {
+        ""
+    };
     let remaining = content[end_index + 4..].trim();
 
     for line in frontmatter_block.lines() {
@@ -456,13 +462,21 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
 /// Mirrors TS `expandSlashCommand`: returns the original text when the text is
 /// not a slash command or names an unknown command.
 pub fn expand_slash_command(text: &str, file_commands: &[FileSlashCommand]) -> String {
-    if !text.starts_with('/') {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('/') {
         return text.to_string();
     }
 
-    let (command_name, args_string) = match text[1..].find(' ') {
-        Some(space) => (&text[1..1 + space], &text[1 + space + 1..]),
-        None => (&text[1..], ""),
+    // Split the command token on ANY whitespace (matching
+    // `slash_command_name`), not just ASCII space: `/foo\tbar` must expand
+    // as command `foo` with arg `bar`, not fall through as unknown text.
+    let rest = &trimmed[1..];
+    let (command_name, args_string) = match rest
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+    {
+        Some((index, _)) => (&rest[..index], rest[index..].trim_start()),
+        None => (rest, ""),
     };
 
     let Some(cmd) = file_commands.iter().find(|c| c.name == command_name) else {
@@ -490,6 +504,20 @@ mod tests {
             Some("Do a thing")
         );
         assert_eq!(body, "body line");
+    }
+
+    #[test]
+    fn frontmatter_empty_block_does_not_panic() {
+        // `"---\n---"` terminates immediately after the opening line; the
+        // old slice `content[4..3]` panicked here (fixes the empty-template
+        // wedge).
+        let (fm, body) = parse_frontmatter("---\n---");
+        assert!(fm.is_empty());
+        assert_eq!(body, "");
+
+        let (fm, body) = parse_frontmatter("---\n---\nbody");
+        assert!(fm.is_empty());
+        assert_eq!(body, "body");
     }
 
     #[test]
@@ -604,6 +632,15 @@ mod tests {
         assert_eq!(expand_slash_command("plain text", &cmds()), "plain text");
         assert_eq!(expand_slash_command("", &cmds()), "");
         assert_eq!(expand_slash_command("/", &cmds()), "/");
+    }
+
+    #[test]
+    fn expand_command_token_splits_on_any_whitespace() {
+        // Tab-separated args must expand as command `plain` (matching
+        // `slash_command_name`), not fall through as unknown text.
+        assert_eq!(expand_slash_command("/plain\tx", &cmds()), "static body");
+        // Leading whitespace before the slash is tolerated too.
+        assert_eq!(expand_slash_command("  /plain\t arg", &cmds()), "static body");
     }
 
     // --- fs loading ---

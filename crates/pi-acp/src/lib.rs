@@ -19,6 +19,33 @@
 //! - [`auth`] — Terminal Auth + error → ACP `AuthRequired` detection.
 //! - [`startup`] — startup info assembly + (disabled-by-default) version check.
 //!
+//! ## Library use (in-process driving)
+//!
+//! The crate is also usable as a library: [`agent::AcpAgent`] owns the whole
+//! ACP translation stack and can be driven **in-process** over any transport,
+//! not just as a stdio child. Call [`agent::AcpAgent::run_with`] with any
+//! [`ConnectTo<Agent>`](agent_client_protocol::ConnectTo) component — e.g. one
+//! end of a [`Channel::duplex`](agent_client_protocol::Channel::duplex) pair;
+//! [`agent::AcpAgent::run`] is exactly `run_with(Stdio::new())`, so the binary
+//! and any external client keep the same behavior.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use agent_client_protocol::{Channel, ConnectTo};
+//! use pi_acp::agent::AcpAgent;
+//! use pi_acp::config::Config;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let agent = Arc::new(AcpAgent::new(Config::default()));
+//! // The agent end of an in-process duplex pair; drive the other end with an
+//! // ACP client (e.g. `Client.builder()...connect_to(other_end)`).
+//! let (agent_end, _peer) = Channel::duplex();
+//! agent.run_with(agent_end).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! See the workspace README and design doc (issue W-446 / W-447) for the full plan.
 
 pub mod agent;

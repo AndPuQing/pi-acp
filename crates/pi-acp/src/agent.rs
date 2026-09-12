@@ -56,8 +56,8 @@ use agent_client_protocol::schema::v1::{
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{
-    on_receive_dispatch, on_receive_notification, on_receive_request, Agent, ConnectionTo,
-    Dispatch, Error as AcpError, Handled, Stdio, UntypedMessage,
+    on_receive_dispatch, on_receive_notification, on_receive_request, Agent, ConnectTo,
+    ConnectionTo, Dispatch, Error as AcpError, Handled, Stdio, UntypedMessage,
 };
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -265,7 +265,55 @@ impl AcpAgent {
 
     /// Run the ACP agent over stdio until the client disconnects; dispose all
     /// sessions on the way out.
+    ///
+    /// Thin wrapper over [`AcpAgent::run_with`]: identical signature, behavior,
+    /// and error mapping as before transport injection existed, so existing
+    /// callers (the `pi-acp` binary, Zed) need no change.
     pub async fn run(self: &Arc<Self>) -> Result<()> {
+        self.run_with(Stdio::new()).await
+    }
+
+    /// Run the ACP agent over a caller-supplied transport until it disconnects;
+    /// dispose all sessions on the way out.
+    ///
+    /// This is the process-internal entry point: instead of hardcoding stdio, the
+    /// caller passes the client side as an [`ConnectTo<Agent>`] component. The
+    /// SDK's own agent-side entry point uses the same bound
+    /// (`AgentProtocolRouter::connect_to(client: impl ConnectTo<Agent>)`), and a
+    /// bare [`Channel`](agent_client_protocol::Channel) endpoint — the common
+    /// in-process case — satisfies it directly:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use agent_client_protocol::{Channel, Client, ConnectTo};
+    /// # use pi_acp::agent::AcpAgent;
+    /// # use pi_acp::config::Config;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let agent = Arc::new(AcpAgent::new(Config::default()));
+    /// let (agent_end, client_end) = Channel::duplex();
+    /// // Drive the agent on one end ...
+    /// let agent_task = tokio::spawn({ let agent = agent.clone(); async move {
+    ///     agent.run_with(agent_end).await
+    /// }});
+    /// // ... and an ACP client on the other.
+    /// Client.builder()
+    ///     .name("in-process-client")
+    ///     .connect_with(client_end, async |cx| {
+    ///         // send_request(InitializeRequest...) / NewSessionRequest / PromptRequest
+    ///         Ok(())
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The transport parameter may equally be a fully built client component
+    /// (`Client.builder()...` implements `ConnectTo<Agent>`), in which case this
+    /// method drives both sides.
+    ///
+    /// Only the transport changes: handler registration order, response timing,
+    /// session lifecycle, and error mapping are identical to [`AcpAgent::run`].
+    pub async fn run_with(self: &Arc<Self>, client: impl ConnectTo<Agent> + 'static) -> Result<()> {
         let agent = self.clone();
         let a_init = agent.clone();
         let a_new = agent.clone();
@@ -445,10 +493,10 @@ impl AcpAgent {
                 },
                 on_receive_dispatch!(),
             )
-            .connect_to(Stdio::new())
+            .connect_to(client)
             .await
             .map_err(|e| AcpxError::RpcFailed {
-                command: "acp-stdio".into(),
+                command: "acp-transport".into(),
                 message: e.to_string(),
             });
 

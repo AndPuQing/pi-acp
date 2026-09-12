@@ -330,8 +330,7 @@ mod tests {
         let project = TempDir::new().unwrap();
         fs::write(
             agent.path().join("settings.json"),
-            json!({ "quietStartup": true, "enabledModels": ["anthropic/*"] })
-                .to_string(),
+            json!({ "quietStartup": true, "enabledModels": ["anthropic/*"] }).to_string(),
         )
         .unwrap();
 

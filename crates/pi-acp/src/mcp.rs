@@ -454,8 +454,7 @@ impl McpSessionManager {
 /// This is extension *code*, not MCP configuration: it carries no server
 /// definitions and no secrets (those travel per-child in the environment),
 /// so sharing one copy across sessions is safe. Unix files get `0600`.
-static REGISTRAR_TEMP_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static REGISTRAR_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn materialize_registrar() -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("pi-acp-{REGISTRAR_VERSION}"));
@@ -463,8 +462,7 @@ pub fn materialize_registrar() -> std::io::Result<PathBuf> {
     let path = dir.join("mcp-registrar.js");
     let current = std::fs::read_to_string(&path).ok();
     if current.as_deref() != Some(REGISTRAR_JS) {
-        let sequence = REGISTRAR_TEMP_COUNTER
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sequence = REGISTRAR_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = dir.join(format!(
             "mcp-registrar.{}.{}.tmp",
             std::process::id(),

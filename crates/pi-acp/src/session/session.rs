@@ -2444,12 +2444,13 @@ pub fn spawn_outbound_connector(
                     OutboundMessage::RequestPermission(request, respond) => {
                         let conn = conn.clone();
                         tokio::spawn(async move {
-                            let response = conn.send_request(request).block_task().await.map_err(
-                                |e| AcpxError::RpcFailed {
-                                    command: "request_permission".into(),
-                                    message: e.to_string(),
-                                },
-                            );
+                            let response =
+                                conn.send_request(request).block_task().await.map_err(|e| {
+                                    AcpxError::RpcFailed {
+                                        command: "request_permission".into(),
+                                        message: e.to_string(),
+                                    }
+                                });
                             let _ = respond.send(response);
                         });
                     }

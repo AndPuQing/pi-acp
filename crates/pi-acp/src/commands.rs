@@ -471,10 +471,7 @@ pub fn expand_slash_command(text: &str, file_commands: &[FileSlashCommand]) -> S
     // `slash_command_name`), not just ASCII space: `/foo\tbar` must expand
     // as command `foo` with arg `bar`, not fall through as unknown text.
     let rest = &trimmed[1..];
-    let (command_name, args_string) = match rest
-        .char_indices()
-        .find(|(_, ch)| ch.is_whitespace())
-    {
+    let (command_name, args_string) = match rest.char_indices().find(|(_, ch)| ch.is_whitespace()) {
         Some((index, _)) => (&rest[..index], rest[index..].trim_start()),
         None => (rest, ""),
     };
@@ -640,7 +637,10 @@ mod tests {
         // `slash_command_name`), not fall through as unknown text.
         assert_eq!(expand_slash_command("/plain\tx", &cmds()), "static body");
         // Leading whitespace before the slash is tolerated too.
-        assert_eq!(expand_slash_command("  /plain\t arg", &cmds()), "static body");
+        assert_eq!(
+            expand_slash_command("  /plain\t arg", &cmds()),
+            "static body"
+        );
     }
 
     // --- fs loading ---

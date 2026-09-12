@@ -266,11 +266,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &pi,
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
+            std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let r = resolve_pi_command("pi", unix(), Some(tmp.path().to_str().unwrap()), None);
         assert_eq!(r.program, pi.to_string_lossy());

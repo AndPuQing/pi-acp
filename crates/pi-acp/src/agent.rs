@@ -1403,10 +1403,7 @@ impl AcpAgent {
         // `expand_slash_command` / `slash_command_name`): `/compact\tinstructions`
         // is the `compact` builtin, not an unknown command.
         let rest = trimmed.strip_prefix('/').unwrap_or(trimmed);
-        let (cmd, args_string) = match rest
-            .char_indices()
-            .find(|(_, ch)| ch.is_whitespace())
-        {
+        let (cmd, args_string) = match rest.char_indices().find(|(_, ch)| ch.is_whitespace()) {
             Some((index, _)) => (&rest[..index], rest[index..].trim_start()),
             None => (rest, ""),
         };

@@ -428,7 +428,10 @@ mod tests {
         store.upsert("new", "/w", "/f");
 
         let backup = path.with_file_name("map.json.corrupt");
-        assert!(backup.exists(), "corrupt map should be preserved as a backup");
+        assert!(
+            backup.exists(),
+            "corrupt map should be preserved as a backup"
+        );
         let backup_raw = fs::read_to_string(&backup).unwrap();
         assert!(backup_raw.contains("old"));
         // The live file is the repaired v1 map with only the new entry.

@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_client_protocol::schema::v1::MessageId;
 use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, CurrentModeUpdate, Diff,
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
@@ -185,6 +186,32 @@ fn assistant_error_text(reason: &str, error: &Value) -> String {
         .unwrap_or_else(|| GENERIC_PI_ERROR.to_string())
 }
 
+/// Extract an assistant message's text blocks as ACP content blocks, for the
+/// v2 `agent_message` patch (W-562).
+///
+/// pi's assistant `content` is an array of `{type: "text", text}` /
+/// thinking / tool-call blocks; v2's `agent_message.content` carries content
+/// blocks, so the text blocks map one-to-one. A non-assistant or shapeless
+/// message yields no blocks and no patch is sent.
+fn assistant_text_blocks(message: &Value) -> Vec<ContentBlock> {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+                .map(|text| ContentBlock::Text(TextContent::new(text.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract a terminal assistant failure from `message_end`. Current pi uses
 /// `stopReason`/`errorMessage`; older or compatible producers may use
 /// `isError`/`is_error` or snake_case spellings.
@@ -271,6 +298,28 @@ fn clear_thinking_stamp(
 pub enum OutboundMessage {
     /// A `session/update` notification (full frame, including the session id).
     Notify(SessionNotification),
+    /// A v2-only `agent_message` patch: the authoritative complete content of
+    /// `message_id` (W-562). The connector drops this on a v1 connection, where
+    /// no such update exists, so the pump stays protocol-agnostic and the
+    /// decision lives at the boundary.
+    AgentMessage {
+        /// The session this update belongs to.
+        session_id: SessionId,
+        /// The message being patched (the id minted at `message_start`).
+        message_id: agent_client_protocol::schema::v1::MessageId,
+        /// The complete replacement content.
+        content: Vec<ContentBlock>,
+    },
+    /// A v2-only `state_update` notification (W-562). v2 reports turn
+    /// completion through session updates instead of the `session/prompt`
+    /// response's `stopReason`, so the pump publishes the transition here.
+    /// v1 reports completion in the prompt response and drops this.
+    Foreground {
+        /// The session this update belongs to.
+        session_id: SessionId,
+        /// The transition itself.
+        state: ForegroundState,
+    },
     /// A `session/request_permission` request; the answer is delivered back on
     /// the oneshot. If the responder is dropped without sending, the request
     /// is treated as cancelled by the caller.
@@ -283,6 +332,18 @@ pub enum OutboundMessage {
     /// resolving a turn so streamed notifications are never overtaken by the
     /// `session/prompt` response (TS `flushEmits` parity).
     Flush(oneshot::Sender<()>),
+}
+
+/// Foreground work state transitions the pump publishes as v2 `state_update`s
+/// (W-562). v2 has no `stopReason` on the prompt response; it reports completion
+/// through these updates instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundState {
+    /// A turn started: foreground work is in progress.
+    Running,
+    /// A turn ended; carries the reason so v2 clients see the same stop reason
+    /// a v1 client reads from the prompt response.
+    Idle(StopReason),
 }
 
 /// Parameters for spawning a session (S6 agent wiring / tests).
@@ -306,6 +367,11 @@ pub struct SessionParams {
     pub additional_directories: Vec<PathBuf>,
     /// Outbound ACP message sink (see [`OutboundMessage`]).
     pub outbound: mpsc::Sender<OutboundMessage>,
+    /// The negotiated ACP version (W-562). The v2-only emissions (the
+    /// `agent_message` patch and `state_update`) are gated on it here, at the
+    /// source, so a v1 connection never puts them on the wire at all — the
+    /// boundary then only has to *convert*, not discard.
+    pub protocol: crate::protocol::Protocol,
     /// Optional pi session file to resume (`--session <path>`; used by
     /// `session/load`).
     pub session_path: Option<PathBuf>,
@@ -550,6 +616,18 @@ struct Pump {
     /// The active model's context window (tokens), from `get_state` at spawn
     /// and refreshed on `set_model`. Feeds ACP `usage_update.size` (S6).
     context_window: Option<u64>,
+
+    /// The `message_id` of the assistant message currently streaming (W-562).
+    /// pi's RPC messages carry no id, so pi-acp mints one at `message_start`
+    /// and every chunk of that message reuses it — a `message_id` is never
+    /// minted per chunk. `None` before the first `message_start` of a turn.
+    current_message_id: Option<MessageId>,
+    /// Monotonic per-session counter feeding `pi-msg-<n>` (W-562). Session-
+    /// local uniqueness is all the protocol requires; sessions are told apart
+    /// by `session_id`.
+    next_message_seq: u64,
+    /// The negotiated ACP version; gates the v2-only emissions (W-562).
+    protocol: crate::protocol::Protocol,
 }
 
 impl PiAcpSession {
@@ -650,6 +728,9 @@ impl PiAcpSession {
             bash_tool_call_ids: HashSet::new(),
             bash_output_snapshots: HashMap::new(),
             context_window: state.model.as_ref().and_then(|m| m.context_window),
+            current_message_id: None,
+            next_message_seq: 0,
+            protocol: params.protocol,
         };
         tokio::spawn(pump_loop(pump));
 
@@ -1364,6 +1445,7 @@ impl Pump {
             prompt_started: Some(prompt_started_rx),
         });
         self.emit_queue_depth(true).await;
+        self.emit_foreground(ForegroundState::Running).await;
 
         // Send the prompt in a spawned task so the pump keeps servicing
         // commands (cancel) and events while the early response is in flight.
@@ -1403,6 +1485,98 @@ impl Pump {
         }
     }
 
+    /// Mint the `message_id` for an assistant/user message that just started
+    /// (W-562). pi's RPC messages carry no id, so the adapter assigns one here,
+    /// at `message_start`, and every chunk of that message reuses it via
+    /// [`Pump::tag_message`]. Format is a monotonic per-session sequence
+    /// (`pi-msg-<n>`), matching the `pi-replay-<n>` precedent in
+    /// `replay_history`.
+    ///
+    /// v1 clients benefit too: `ContentChunk.message_id` is an `Option` in v1,
+    /// so filling it lets clients group chunks into messages — a capability
+    /// the v1 path did not have before.
+    fn mint_message_id(&mut self) -> MessageId {
+        self.next_message_seq += 1;
+        let id = MessageId::new(format!("pi-msg-{}", self.next_message_seq));
+        self.current_message_id = Some(id.clone());
+        id
+    }
+
+    /// The `message_id` a streamed chunk belongs to. Falls back to minting one
+    /// when pi streams a delta without a preceding `message_start` (older pi
+    /// producers), so a chunk is never anonymous once the feature is in place.
+    fn current_message_id(&mut self) -> MessageId {
+        match self.current_message_id.clone() {
+            Some(id) => id,
+            None => self.mint_message_id(),
+        }
+    }
+
+    /// Tag an outgoing chunk with the current message's id.
+    async fn emit_chunk(&mut self, wrap: fn(ContentChunk) -> SessionUpdate, content: ContentBlock) {
+        let message_id = self.current_message_id();
+        let chunk = ContentChunk::new(content).message_id(message_id);
+        self.emit(wrap(chunk)).await;
+    }
+
+    /// Publish a foreground-work transition for v2 clients (W-562). v2 dropped
+    /// the prompt response's `stopReason` in favor of `state_update`; v1 reads
+    /// completion from the response, so the connector drops this there.
+    async fn emit_foreground(&mut self, state: ForegroundState) {
+        // v2 reports completion through state updates; v1 reads it from the
+        // prompt response (and v1 has no state_update type at all).
+        if !self.protocol.is_v2() {
+            return;
+        }
+        if self
+            .outbound
+            .send(OutboundMessage::Foreground {
+                session_id: self.session_id.clone(),
+                state,
+            })
+            .await
+            .is_err()
+        {
+            tracing::debug!("outbound sink closed; dropping foreground state update");
+        }
+    }
+
+    /// Publish pi's authoritative `message_end.message` as a v2 `agent_message`
+    /// patch (W-562).
+    ///
+    /// v2 `agent_message.content` has patch semantics: a concrete array
+    /// replaces everything previously accumulated for that `messageId`, which
+    /// is how the streamed chunks and the final object converge. The update is
+    /// handed to the outbound sink, which drops it on a v1 connection — v1 has
+    /// no full-object update and fabricating one would be wrong (v1 clients
+    /// consume chunks).
+    async fn emit_message_patch(&mut self, message: &Value) {
+        // v1 has no full-object update type; fabricating one is explicitly
+        // forbidden by the W-562 constraints, so the v1 path stops here.
+        if !self.protocol.is_v2() {
+            return;
+        }
+        let Some(message_id) = self.current_message_id.clone() else {
+            return;
+        };
+        let content = assistant_text_blocks(message);
+        if content.is_empty() {
+            return;
+        }
+        if self
+            .outbound
+            .send(OutboundMessage::AgentMessage {
+                session_id: self.session_id.clone(),
+                message_id,
+                content,
+            })
+            .await
+            .is_err()
+        {
+            tracing::debug!("outbound sink closed; dropping agent_message patch");
+        }
+    }
+
     /// Ordering barrier: block until everything already sent on the outbound
     /// channel has been forwarded to the connection (S8 / D4; TS `flushEmits`).
     /// Resolving a turn only after this guarantees streamed notifications are
@@ -1421,8 +1595,11 @@ impl Pump {
     }
 
     async fn emit_text(&mut self, text: &str) {
-        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-        self.emit(SessionUpdate::AgentMessageChunk(chunk)).await;
+        self.emit_chunk(
+            SessionUpdate::AgentMessageChunk,
+            ContentBlock::Text(TextContent::new(text.to_string())),
+        )
+        .await;
     }
 
     /// Surface a pi assistant failure as a visible ACP text chunk. A single
@@ -1601,6 +1778,13 @@ impl Pump {
                 self.emit_usage_update(&usage).await;
                 self.on_message_update(&assistant_message_event).await;
             }
+            RpcEvent::MessageStart { .. } => {
+                // W-562: pi's RPC messages carry no id, so the adapter mints one
+                // here and every chunk of this message reuses it. This is the
+                // only place a message id is assigned.
+                let id = self.mint_message_id();
+                tracing::trace!(message_id = %id.0, "minted assistant message id");
+            }
             RpcEvent::MessageEnd { message } => {
                 if let Some(usage) = Self::usage_from_assistant_message(&message) {
                     self.emit_usage_update(&usage).await;
@@ -1608,6 +1792,12 @@ impl Pump {
                 if let Some(error) = assistant_message_error_text(&message) {
                     self.emit_message_error(error).await;
                 }
+                // W-562: pi's `message_end.message` is the authoritative, complete
+                // assistant message. pi-acp currently used it only for usage; the
+                // v2 path additionally publishes it as an `agent_message` patch so
+                // the client's streamed chunks converge on the final content. v1
+                // has no full-object update type, so this is a no-op there.
+                self.emit_message_patch(&message).await;
             }
             RpcEvent::ToolExecutionStart {
                 tool_call_id,
@@ -1762,6 +1952,7 @@ impl Pump {
         };
         let _ = pending.resolve.send(Ok(reason));
         self.in_agent_loop = false;
+        self.emit_foreground(ForegroundState::Idle(reason)).await;
 
         if let Some(next) = self.queue.pop_front() {
             self.emit_text(&format!(
@@ -2006,8 +2197,11 @@ impl Pump {
                 self.emit_text(delta).await;
             }
             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(delta.clone())));
-                self.emit(SessionUpdate::AgentThoughtChunk(chunk)).await;
+                self.emit_chunk(
+                    SessionUpdate::AgentThoughtChunk,
+                    ContentBlock::Text(TextContent::new(delta.clone())),
+                )
+                .await;
             }
             AssistantMessageEvent::Error { reason, error } => {
                 self.emit_message_error(assistant_error_text(reason, error))
@@ -2432,25 +2626,44 @@ impl Pump {
 /// outbound channel and wedge the pump (blocking `Cancel`/`Shutdown`).
 pub fn spawn_outbound_connector(
     conn: ConnectionTo<Client>,
+    protocol: crate::protocol::Protocol,
     mut rx: mpsc::Receiver<OutboundMessage>,
 ) -> std::result::Result<(), AcpxError> {
     let _: tokio::task::JoinHandle<std::result::Result<(), AcpxError>> = tokio::spawn(async move {
-        let run: std::result::Result<(), agent_client_protocol::Error> = async {
+        let run: std::result::Result<(), AcpxError> = async {
             while let Some(msg) = rx.recv().await {
                 match msg {
                     OutboundMessage::Notify(notif) => {
-                        conn.send_notification(notif)?;
+                        // Every session update crosses the protocol boundary
+                        // here, so no unconverted frame reaches the wire.
+                        crate::protocol::send_session_update(&conn, protocol, notif)?;
+                    }
+                    OutboundMessage::AgentMessage {
+                        session_id,
+                        message_id,
+                        content,
+                    } => {
+                        crate::protocol::send_agent_message(
+                            &conn,
+                            protocol,
+                            &session_id,
+                            &message_id,
+                            content,
+                        )?;
+                    }
+                    OutboundMessage::Foreground { session_id, state } => {
+                        if let Some(notif) =
+                            foreground_state_notification(protocol, &session_id, state)
+                        {
+                            // Already in the negotiated version; send as-is.
+                            let _ = conn.send_notification(notif);
+                        }
                     }
                     OutboundMessage::RequestPermission(request, respond) => {
                         let conn = conn.clone();
                         tokio::spawn(async move {
                             let response =
-                                conn.send_request(request).block_task().await.map_err(|e| {
-                                    AcpxError::RpcFailed {
-                                        command: "request_permission".into(),
-                                        message: e.to_string(),
-                                    }
-                                });
+                                crate::protocol::request_permission(&conn, protocol, request).await;
                             let _ = respond.send(response);
                         });
                     }
@@ -2470,6 +2683,48 @@ pub fn spawn_outbound_connector(
         Ok(())
     });
     Ok(())
+}
+
+/// Build the v2 `state_update` frame for a foreground transition, or `None` on
+/// a v1 connection (v1 reports turn completion in the prompt response).
+#[cfg(feature = "protocol-v2")]
+fn foreground_state_notification(
+    protocol: crate::protocol::Protocol,
+    session_id: &SessionId,
+    state: ForegroundState,
+) -> Option<agent_client_protocol_schema::v2::UpdateSessionNotification> {
+    use agent_client_protocol::schema::v1::StopReason as AcpStopReason;
+    use agent_client_protocol_schema::v2;
+    use agent_client_protocol_schema::v2::conversion::try_v1_to_v2;
+
+    if !protocol.is_v2() {
+        return None;
+    }
+    let state = match state {
+        ForegroundState::Running => v2::StateUpdate::Running(v2::RunningStateUpdate::new()),
+        ForegroundState::Idle(reason) => {
+            let reason = match reason {
+                StopReason::EndTurn => AcpStopReason::EndTurn,
+                StopReason::Cancelled => AcpStopReason::Cancelled,
+            };
+            let stop_reason: v2::StopReason = try_v1_to_v2(reason).ok()?;
+            v2::StateUpdate::Idle(v2::IdleStateUpdate::new().stop_reason(stop_reason))
+        }
+    };
+    let session_id: v2::SessionId = try_v1_to_v2(session_id.clone()).ok()?;
+    Some(v2::UpdateSessionNotification::new(
+        session_id,
+        v2::SessionUpdate::StateUpdate(state),
+    ))
+}
+
+#[cfg(not(feature = "protocol-v2"))]
+fn foreground_state_notification(
+    _protocol: crate::protocol::Protocol,
+    _session_id: &SessionId,
+    _state: ForegroundState,
+) -> Option<agent_client_protocol::schema::v1::SessionNotification> {
+    None
 }
 
 // ---------------------------------------------------------------------------

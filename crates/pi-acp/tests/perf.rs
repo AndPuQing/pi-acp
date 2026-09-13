@@ -83,6 +83,7 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
                     let _ =
                         respond.send(Err(pi_acp::error::AcpxError::SessionClosed("perf".into())));
                 }
+                OutboundMessage::AgentMessage { .. } | OutboundMessage::Foreground { .. } => {}
                 OutboundMessage::Flush(ack) => {
                     let _ = ack.send(());
                 }
@@ -98,6 +99,7 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
+        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],

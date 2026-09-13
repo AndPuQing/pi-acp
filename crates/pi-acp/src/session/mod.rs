@@ -20,7 +20,8 @@
 mod session;
 
 pub use session::{
-    spawn_outbound_connector, OutboundMessage, PiAcpSession, SessionParams, StopReason,
+    spawn_outbound_connector, ForegroundState, OutboundMessage, PiAcpSession, SessionParams,
+    StopReason,
 };
 
 use std::collections::HashMap;

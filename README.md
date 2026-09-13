@@ -259,6 +259,37 @@ cargo build --release
 
 The binary is written to `target/release/pi-acp`.
 
+### ACP protocol v2 (experimental)
+
+ACP protocol v2 is an unstable draft. It is behind the off-by-default
+`protocol-v2` feature, so a normal build is unaffected in behavior, dependency
+set, and ACP semantics:
+
+```bash
+cargo build --release --features protocol-v2
+```
+
+With it enabled, the adapter negotiates the version from the client's
+`initialize` and serves either; each connection gets the version it asked for.
+The translation core still speaks v1 only — v1 <-> v2 conversion happens once,
+at the connection boundary, using the schema crate's conversion layer.
+
+Two v2-specific behaviors are worth knowing:
+
+- **v2 clients receive `message_id`s and a complete-message patch.** pi's RPC
+  messages carry no id, so the adapter mints one per assistant message
+  (`pi-msg-<n>`) and tags every chunk with it; v1 clients get the same ids (v1's
+  `messageId` is optional, so this is a strict improvement). At `message_end` a
+  v2 client additionally gets an `agent_message` update carrying the
+  authoritative complete content under that same id, which patches what it
+  streamed.
+- **v2 has no session modes.** `session/set_mode` and `current_mode_update` were
+  removed in favor of config options, so those updates are skipped on the v2
+  path (the thinking/model selectors still arrive as `config_option_update`).
+  v1 is unchanged. `session/resume` replaces `session/load` for v2 clients, and
+  only `replayFrom: {"type":"start"}` and an omitted `replayFrom` are supported
+  — an unknown cursor is rejected rather than guessed at.
+
 ## License
 
 MIT

@@ -41,6 +41,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(feature = "protocol-v2")]
+use agent_client_protocol::schema::v1::CloseSessionResponse;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, AvailableCommandsUpdate,
     CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate,
@@ -71,6 +73,7 @@ use crate::pi::rpc::{ImageContent, Model, QueueMode, RpcSessionState, ThinkingLe
 use crate::pi::sessions::{
     find_pi_session, list_pi_sessions, session_file_matches_id, title_from_session_file,
 };
+use crate::protocol::{NegotiatedProtocol, Protocol};
 use crate::session::{
     spawn_outbound_connector, PiAcpSession, SessionManager, SessionParams,
     StopReason as SessionStopReason,
@@ -148,21 +151,22 @@ type SessionLocation = StoredSession;
 /// Notifications that must be sent only after the `session/new` response is
 /// queued. ACP clients such as Zed ignore session updates for an id they have
 /// not registered yet.
-struct NewSessionPostResponse {
-    session: Arc<PiAcpSession>,
+pub(crate) struct NewSessionPostResponse {
+    pub(crate) session: Arc<PiAcpSession>,
     prelude_text: String,
     enable_skill_commands: bool,
     file_commands: Vec<FileSlashCommand>,
 }
 
 impl NewSessionPostResponse {
-    async fn send(self, cx: &ConnectionTo<Client>) {
+    pub(crate) async fn send(self, cx: &ConnectionTo<Client>, protocol: Protocol) {
         let session_id = self.session.session_id().clone();
         if !self.prelude_text.is_empty() {
-            send_text_chunk(cx, &session_id, &self.prelude_text).await;
+            send_text_chunk(cx, protocol, &session_id, &self.prelude_text).await;
         }
         advertise_commands(
             cx,
+            protocol,
             &self.session,
             self.enable_skill_commands,
             &self.file_commands,
@@ -173,29 +177,40 @@ impl NewSessionPostResponse {
 
 /// Notifications that must be sent only after the `session/load` response is
 /// queued. This keeps replay and command discovery attached to a known session.
-struct LoadSessionPostResponse {
-    session: Arc<PiAcpSession>,
+pub(crate) struct LoadSessionPostResponse {
+    pub(crate) session: Arc<PiAcpSession>,
     history: Value,
     title: Option<String>,
     enable_skill_commands: bool,
     file_commands: Vec<FileSlashCommand>,
+    /// Whether to replay the stored conversation. v1 `session/load` always
+    /// replays; on the v2 path a `session/resume` without `replayFrom` maps to
+    /// the same restore but publishes no history (W-562).
+    pub(crate) replay: bool,
 }
 
 impl LoadSessionPostResponse {
-    async fn send(self, cx: &ConnectionTo<Client>) {
+    pub(crate) async fn send(self, cx: &ConnectionTo<Client>, protocol: Protocol) {
         let session_id = self.session.session_id().clone();
         if let Some(title) = self.title {
             let update = SessionInfoUpdate::new()
                 .title(title)
                 .updated_at(utc_now_iso8601());
-            let _ = cx.send_notification(SessionNotification::new(
-                session_id.clone(),
-                SessionUpdate::SessionInfoUpdate(update),
-            ));
+            let _ = crate::protocol::send_session_update(
+                cx,
+                protocol,
+                SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::SessionInfoUpdate(update),
+                ),
+            );
         }
-        replay_history(cx, &self.session, &self.history).await;
+        if self.replay {
+            replay_history(cx, protocol, &self.session, &self.history).await;
+        }
         advertise_commands(
             cx,
+            protocol,
             &self.session,
             self.enable_skill_commands,
             &self.file_commands,
@@ -248,6 +263,10 @@ pub struct AcpAgent {
     /// `mcp_servers`; consulted on restore so a respawned pi re-registers
     /// instead of silently dropping the caller's menu.
     mcp_configs: Mutex<HashMap<String, Vec<McpServerSpec>>>,
+    /// The ACP version this connection negotiated in `initialize` (W-562).
+    /// Fixed for the connection's lifetime; the boundary conversions and the
+    /// v2-only emissions all read it.
+    protocol: NegotiatedProtocol,
 }
 
 impl AcpAgent {
@@ -260,7 +279,13 @@ impl AcpAgent {
             last_session_cwd: Mutex::new(None),
             version_check: Mutex::new(VersionCheck::Pending),
             mcp_configs: Mutex::new(HashMap::new()),
+            protocol: NegotiatedProtocol::new(),
         }
+    }
+
+    /// The ACP version negotiated on this connection (v1 until `initialize`).
+    pub fn protocol(&self) -> Protocol {
+        self.protocol.get()
     }
 
     /// Run the ACP agent over stdio until the client disconnects; dispose all
@@ -326,7 +351,7 @@ impl AcpAgent {
         let a_set_config = agent.clone();
         let a_set_model = agent.clone();
 
-        let result = Agent
+        let builder = Agent
             .builder()
             .name("pi-acp")
             .on_receive_request(
@@ -348,8 +373,9 @@ impl AcpAgent {
                             // post-response task with its first prompt.
                             let _ = post_response.session.publish_initial_usage().await;
                             let cx_for_task = cx.clone();
+                            let protocol = agent.protocol();
                             cx.spawn(async move {
-                                post_response.send(&cx_for_task).await;
+                                post_response.send(&cx_for_task, protocol).await;
                                 Ok(())
                             })
                         }
@@ -402,8 +428,9 @@ impl AcpAgent {
                         Ok((resp, post_response)) => {
                             responder.respond(resp)?;
                             let cx_for_task = cx.clone();
+                            let protocol = agent.protocol();
                             cx.spawn(async move {
-                                post_response.send(&cx_for_task).await;
+                                post_response.send(&cx_for_task, protocol).await;
                                 Ok(())
                             })
                         }
@@ -492,7 +519,34 @@ impl AcpAgent {
                     Ok(Handled::Yes)
                 },
                 on_receive_dispatch!(),
-            )
+            );
+        let v1 = builder;
+
+        // `protocol-v2` (W-562): register a v2 implementation next to the v1
+        // one and let the SDK's router pick per client. The implementation is
+        // the *same* v1 core — only `initialize` is re-typed, because on a v2
+        // connection the SDK speaks v2 method names and v2 types, so the
+        // boundary conversion happens right here, before the v1 handlers run.
+        //
+        // With the feature disabled this is exactly the old code path: the v1
+        // builder connects directly, and no v2 behavior, dependency, or wire
+        // frame is reachable.
+        #[cfg(feature = "protocol-v2")]
+        let result = {
+            let router = Agent
+                .protocol_router()
+                .with_v1(v1)
+                .with_v2(self.v2_implementation());
+            router
+                .connect_to(client)
+                .await
+                .map_err(|e| AcpxError::RpcFailed {
+                    command: "acp-transport".into(),
+                    message: e.to_string(),
+                })
+        };
+        #[cfg(not(feature = "protocol-v2"))]
+        let result = v1
             .connect_to(client)
             .await
             .map_err(|e| AcpxError::RpcFailed {
@@ -503,6 +557,72 @@ impl AcpAgent {
         self.sessions.dispose_all().await;
         self.mcp_configs.lock().await.clear();
         result
+    }
+
+    /// The ACP v2 implementation registered on the protocol router (W-562).
+    ///
+    /// It is the v1 core with a v2-typed `initialize`: the SDK normalizes the
+    /// client's request to the negotiated version before handing it over, so
+    /// this handler converts it to the v1 shape the rest of the agent speaks.
+    /// Every other request reaches the same v1 handlers through the shared
+    /// builder — the router does not convert traffic after `initialize`, it
+    /// only selects the implementation, so nothing else needs re-typing.
+    #[cfg(feature = "protocol-v2")]
+    fn v2_implementation(self: &Arc<Self>) -> impl ConnectTo<Client> {
+        use agent_client_protocol_schema::v2;
+        use agent_client_protocol_schema::v2::conversion::try_v2_to_v1;
+
+        let agent = self.clone();
+        let agent_dispatch = self.clone();
+        let agent_cancel = self.clone();
+        Agent
+            .v2()
+            .on_receive_request(
+                async move |req: v2::InitializeRequest, responder, _cx| {
+                    // v2 request -> v1 request -> the existing v1 handler, so the
+                    // negotiated version and capabilities are computed once.
+                    let v1_req: InitializeRequest = match try_v2_to_v1(req) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            responder.respond_with_error(AcpError::new(
+                                ACP_INVALID_PARAMS,
+                                format!("invalid ACP v2 initialize request: {e}"),
+                            ))?;
+                            return Ok(());
+                        }
+                    };
+                    let resp = agent.handle_initialize(&v1_req);
+                    match crate::protocol::initialize_response_to_v2(resp) {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(AcpError::new(
+                            ACP_INTERNAL_ERROR,
+                            format!("failed to convert the initialize response to ACP v2: {e}"),
+                        )),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |notif: v2::CancelSessionNotification, _cx| {
+                    // v2's `session/cancel` is the same notification as v1's,
+                    // renamed; map it back so the v1 cancel path handles it.
+                    let notif: CancelNotification = try_v2_to_v1(notif).map_err(|e| {
+                        AcpError::new(
+                            ACP_INVALID_PARAMS,
+                            format!("invalid ACP v2 session/cancel: {e}"),
+                        )
+                    })?;
+                    agent_cancel.handle_cancel(&notif).await;
+                    Ok(())
+                },
+                on_receive_notification!(),
+            )
+            .on_receive_dispatch(
+                async move |dispatch, cx| {
+                    crate::v2::handle_dispatch(&agent_dispatch, dispatch, &cx).await
+                },
+                on_receive_dispatch!(),
+            )
     }
 
     /// Gracefully shut down (design §8.3): dispose every live pi session.
@@ -521,10 +641,27 @@ impl AcpAgent {
     // initialize
     // -----------------------------------------------------------------------
 
-    fn handle_initialize(&self, req: &InitializeRequest) -> InitializeResponse {
+    pub(crate) fn handle_initialize(&self, req: &InitializeRequest) -> InitializeResponse {
         tracing::info!(protocol_version = ?req.protocol_version, "ACP initialize");
-        // We currently only support ACP protocol version 1.
-        let protocol_version = agent_client_protocol::schema::ProtocolVersion::V1;
+        // Answer with the version the client requested, not a hardcoded V1
+        // (W-562). The SDK's protocol router has already selected the matching
+        // implementation and normalized the request to that version, so the
+        // requested version is the negotiated one. Without the `protocol-v2`
+        // feature the only selectable version is V1.
+        #[cfg(feature = "protocol-v2")]
+        let protocol_version =
+            if req.protocol_version == agent_client_protocol::schema::ProtocolVersion::V2 {
+                self.protocol.set(Protocol::V2);
+                agent_client_protocol::schema::ProtocolVersion::V2
+            } else {
+                self.protocol.set(Protocol::V1);
+                agent_client_protocol::schema::ProtocolVersion::V1
+            };
+        #[cfg(not(feature = "protocol-v2"))]
+        let protocol_version = {
+            self.protocol.set(Protocol::V1);
+            agent_client_protocol::schema::ProtocolVersion::V1
+        };
 
         let supports_terminal_auth_meta = req
             .client_capabilities
@@ -553,6 +690,11 @@ impl AcpAgent {
                     .embedded_context(self.cfg.enable_embedded_context),
             )
             .session_capabilities(
+                // v1 capabilities are unchanged (W-562 constraint: the
+                // default build's ACP semantics must not move). The two
+                // capabilities v2's capability model requires — `resume` and
+                // `close` — are added by `initialize_response_to_v2` on the v2
+                // path only.
                 SessionCapabilities::new()
                     .list(agent_client_protocol::schema::v1::SessionListCapabilities::new())
                     .delete(agent_client_protocol::schema::v1::SessionDeleteCapabilities::new())
@@ -571,7 +713,7 @@ impl AcpAgent {
     // session/new
     // -----------------------------------------------------------------------
 
-    async fn handle_new_session(
+    pub(crate) async fn handle_new_session(
         &self,
         req: &NewSessionRequest,
         cx: &ConnectionTo<Client>,
@@ -809,7 +951,7 @@ impl AcpAgent {
     /// its first assistant response. pi intentionally keeps an empty new
     /// session in memory, so `get_state.sessionFile` alone is not proof that
     /// the path can be restored after this process exits.
-    async fn persist_session_if_ready(&self, session: &Arc<PiAcpSession>) {
+    pub(crate) async fn persist_session_if_ready(&self, session: &Arc<PiAcpSession>) {
         let state = match session.get_state().await {
             Ok(state) => state,
             Err(err) => {
@@ -864,7 +1006,7 @@ impl AcpAgent {
     /// (`None` for headless built-in commands, which never persist — same as
     /// before); the caller persists *after* queueing the response so the
     /// map write stays off prompt latency (W-479 P1).
-    async fn handle_prompt(
+    pub(crate) async fn handle_prompt(
         &self,
         req: &PromptRequest,
         cx: &ConnectionTo<Client>,
@@ -896,10 +1038,14 @@ impl AcpAgent {
                 let update = SessionInfoUpdate::new()
                     .title(title)
                     .updated_at(utc_now_iso8601());
-                let _ = cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::SessionInfoUpdate(update),
-                ));
+                let _ = crate::protocol::send_session_update(
+                    cx,
+                    self.protocol(),
+                    SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::SessionInfoUpdate(update),
+                    ),
+                );
             }
         }
 
@@ -928,7 +1074,7 @@ impl AcpAgent {
     // session/load
     // -----------------------------------------------------------------------
 
-    async fn handle_load_session(
+    pub(crate) async fn handle_load_session(
         &self,
         req: &LoadSessionRequest,
         cx: &ConnectionTo<Client>,
@@ -1039,15 +1185,35 @@ impl AcpAgent {
                 title,
                 enable_skill_commands,
                 file_commands,
+                replay: true,
             },
         ))
+    }
+
+    /// `session/close`: dispose the session's pi process and forget it.
+    ///
+    /// v2 advertises (and its capability model requires) this capability, so it
+    /// must be real rather than a bare marker. Closing is idempotent: an unknown
+    /// session id still succeeds, because the client's goal — "this session is
+    /// no longer in use" — is already true.
+    ///
+    /// Gated on the feature because only the v2 path registers it: the v1 build
+    /// must keep its exact previous method surface (W-562 constraint).
+    #[cfg(feature = "protocol-v2")]
+    pub(crate) async fn handle_close_session(
+        &self,
+        session_id: &SessionId,
+    ) -> CloseSessionResponse {
+        self.sessions.close(session_id).await;
+        self.mcp_configs.lock().await.remove(session_id.0.as_ref());
+        CloseSessionResponse::new()
     }
 
     // -----------------------------------------------------------------------
     // session/list / session/delete
     // -----------------------------------------------------------------------
 
-    async fn handle_list_sessions(
+    pub(crate) async fn handle_list_sessions(
         &self,
         req: &ListSessionsRequest,
     ) -> std::result::Result<ListSessionsResponse, AcpError> {
@@ -1101,7 +1267,7 @@ impl AcpAgent {
         Ok(ListSessionsResponse::new(page).next_cursor(next_cursor))
     }
 
-    async fn handle_delete_session(
+    pub(crate) async fn handle_delete_session(
         &self,
         req: &DeleteSessionRequest,
     ) -> std::result::Result<DeleteSessionResponse, AcpError> {
@@ -1141,7 +1307,7 @@ impl AcpAgent {
     // session/set_mode / session/set_config_option / session/set_model
     // -----------------------------------------------------------------------
 
-    async fn handle_set_mode(
+    pub(crate) async fn handle_set_mode(
         &self,
         req: &SetSessionModeRequest,
         cx: &ConnectionTo<Client>,
@@ -1160,11 +1326,11 @@ impl AcpAgent {
 
         // Refreshes both selectors; the mode update carries pi's effective
         // (possibly clamped) level.
-        let _ = emit_config_options_update(cx, &req.session_id, &session).await;
+        let _ = emit_config_options_update(cx, self.protocol(), &req.session_id, &session).await;
         Ok(SetSessionModeResponse::new())
     }
 
-    async fn handle_set_config_option(
+    pub(crate) async fn handle_set_config_option(
         &self,
         req: &SetSessionConfigOptionRequest,
         cx: &ConnectionTo<Client>,
@@ -1203,9 +1369,10 @@ impl AcpAgent {
             }
         }
 
-        let config_options = emit_config_options_update(cx, &req.session_id, &session)
-            .await
-            .map_err(acp_error_from_pi)?;
+        let config_options =
+            emit_config_options_update(cx, self.protocol(), &req.session_id, &session)
+                .await
+                .map_err(acp_error_from_pi)?;
         Ok(SetSessionConfigOptionResponse::new(config_options))
     }
 
@@ -1231,7 +1398,7 @@ impl AcpAgent {
         set_session_model(&session, model_id)
             .await
             .map_err(acp_error_from_pi)?;
-        let _ = emit_config_options_update(cx, &session_id, &session).await;
+        let _ = emit_config_options_update(cx, self.protocol(), &session_id, &session).await;
         tracing::info!(session = %session_id.0, model = model_id, "session/set_model applied");
         Ok(())
     }
@@ -1342,7 +1509,12 @@ impl AcpAgent {
     ) -> std::result::Result<Arc<PiAcpSession>, AcpError> {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(512);
         let conn = cx.clone();
-        spawn_outbound_connector(conn, outbound_rx)?;
+        // The connector is where every session update crosses the v1/v2
+        // boundary (W-562). It only needs the negotiated protocol: the session
+        // id travels with each message, because a fresh `session/new` learns
+        // pi's real id from the child after this connector is already running.
+        let protocol = self.protocol();
+        spawn_outbound_connector(conn, protocol, outbound_rx)?;
 
         let mut extra_args: Vec<String> = Vec::new();
         let mut extra_env: Vec<(String, String)> = Vec::new();
@@ -1374,6 +1546,7 @@ impl AcpAgent {
             cwd: cwd.unwrap_or_else(|| Path::new(".")).to_path_buf(),
             additional_directories: options.additional_directories.to_vec(),
             outbound: outbound_tx,
+            protocol,
             session_path,
             session_id_override,
             file_commands: options.file_commands,
@@ -1441,7 +1614,7 @@ impl AcpAgent {
                 if let Some(s) = summary {
                     text.push_str(&format!("\n\n{s}"));
                 }
-                let _ = send_text_chunk(cx, session_id, &text).await;
+                let _ = send_text_chunk(cx, self.protocol(), session_id, &text).await;
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
             }
             "session" => {
@@ -1487,13 +1660,14 @@ impl AcpAgent {
                 } else {
                     lines.join("\n")
                 };
-                let _ = send_text_chunk(cx, session_id, &text).await;
+                let _ = send_text_chunk(cx, self.protocol(), session_id, &text).await;
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
             }
             "name" => {
                 let name = args.join(" ").trim().to_string();
                 if name.is_empty() {
-                    let _ = send_text_chunk(cx, session_id, "Usage: /name <name>").await;
+                    let _ = send_text_chunk(cx, self.protocol(), session_id, "Usage: /name <name>")
+                        .await;
                     return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
                 }
                 match session.set_session_name(&name).await {
@@ -1501,13 +1675,21 @@ impl AcpAgent {
                         let update = SessionInfoUpdate::new()
                             .title(name.clone())
                             .updated_at(utc_now_iso8601());
-                        let _ = cx.send_notification(SessionNotification::new(
-                            session_id.clone(),
-                            SessionUpdate::SessionInfoUpdate(update),
-                        ));
-                        let _ =
-                            send_text_chunk(cx, session_id, &format!("Session name set: {name}"))
-                                .await;
+                        let _ = crate::protocol::send_session_update(
+                            cx,
+                            self.protocol(),
+                            SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::SessionInfoUpdate(update),
+                            ),
+                        );
+                        let _ = send_text_chunk(
+                            cx,
+                            self.protocol(),
+                            session_id,
+                            &format!("Session name set: {name}"),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -1518,6 +1700,7 @@ impl AcpAgent {
                         };
                         let _ = send_text_chunk(
                             cx,
+                            self.protocol(),
                             session_id,
                             &format!("Failed to set session name: {msg}{hint}"),
                         )
@@ -1545,6 +1728,7 @@ impl AcpAgent {
                 if mode_raw.is_empty() {
                     let _ = send_text_chunk(
                         cx,
+                        self.protocol(),
                         session_id,
                         &format!(
                             "{mode_name} mode: {}",
@@ -1561,6 +1745,7 @@ impl AcpAgent {
                 if mode_raw != "all" && mode_raw != "one-at-a-time" {
                     let _ = send_text_chunk(
                         cx,
+                        self.protocol(),
                         session_id,
                         &format!("Usage: /{action} all | /{action} one-at-a-time"),
                     )
@@ -1585,6 +1770,7 @@ impl AcpAgent {
                 }
                 let _ = send_text_chunk(
                     cx,
+                    self.protocol(),
                     session_id,
                     &format!("{mode_name} mode set to: {mode_raw}"),
                 )
@@ -1606,7 +1792,7 @@ impl AcpAgent {
                     },
                     None => "Changelog not found (couldn't locate pi installation).".to_string(),
                 };
-                let _ = send_text_chunk(cx, session_id, &text).await;
+                let _ = send_text_chunk(cx, self.protocol(), session_id, &text).await;
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
             }
             "export" => {
@@ -1628,6 +1814,7 @@ impl AcpAgent {
                 if !file_ok {
                     let _ = send_text_chunk(
                         cx,
+                        self.protocol(),
                         session_id,
                         "Nothing to export yet (no session messages). Send a prompt first.",
                     )
@@ -1655,12 +1842,19 @@ impl AcpAgent {
                         if result_path.is_empty() {
                             let _ = send_text_chunk(
                                 cx,
+                                self.protocol(),
                                 session_id,
                                 "Export failed: no output path returned by pi.",
                             )
                             .await;
                         } else {
-                            let _ = send_text_chunk(cx, session_id, "Session exported: ").await;
+                            let _ = send_text_chunk(
+                                cx,
+                                self.protocol(),
+                                session_id,
+                                "Session exported: ",
+                            )
+                            .await;
                             let link = ContentBlock::ResourceLink(
                                 ResourceLink::new(
                                     format!("pi-session-{safe_session_id}.html"),
@@ -1670,15 +1864,24 @@ impl AcpAgent {
                                 .title("Session exported"),
                             );
                             let chunk = ContentChunk::new(link);
-                            let _ = cx.send_notification(SessionNotification::new(
-                                session_id.clone(),
-                                SessionUpdate::AgentMessageChunk(chunk),
-                            ));
+                            let _ = crate::protocol::send_session_update(
+                                cx,
+                                self.protocol(),
+                                SessionNotification::new(
+                                    session_id.clone(),
+                                    SessionUpdate::AgentMessageChunk(chunk),
+                                ),
+                            );
                         }
                     }
                     Err(e) => {
-                        let _ =
-                            send_text_chunk(cx, session_id, &format!("Export failed: {e}")).await;
+                        let _ = send_text_chunk(
+                            cx,
+                            self.protocol(),
+                            session_id,
+                            &format!("Export failed: {e}"),
+                        )
+                        .await;
                     }
                 }
                 Ok(Some(PromptResponse::new(StopReason::EndTurn)))
@@ -1707,6 +1910,7 @@ impl AcpAgent {
                     .map_err(acp_error_from_pi)?;
                 let _ = send_text_chunk(
                     cx,
+                    self.protocol(),
                     session_id,
                     &format!(
                         "Auto-compaction {}.",
@@ -1934,6 +2138,7 @@ fn build_startup_prelude(
 /// the legacy fallback (TS `newSession`/`loadSession`).
 async fn advertise_commands(
     cx: &ConnectionTo<Client>,
+    protocol: Protocol,
     session: &Arc<PiAcpSession>,
     enable_skill_commands: bool,
     file_commands: &[FileSlashCommand],
@@ -1955,10 +2160,14 @@ async fn advertise_commands(
     } else {
         commands::merge_commands(&from_pi, &commands::builtin_available_commands())
     };
-    let _ = cx.send_notification(SessionNotification::new(
-        session_id,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available)),
-    ));
+    let _ = crate::protocol::send_session_update(
+        cx,
+        protocol,
+        SessionNotification::new(
+            session_id,
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available)),
+        ),
+    );
 }
 
 /// Rebuild and emit the `config_option_update` notification; returns the new
@@ -1969,36 +2178,54 @@ async fn advertise_commands(
 /// read-back level, not the requested one).
 async fn emit_config_options_update(
     cx: &ConnectionTo<Client>,
+    protocol: Protocol,
     session_id: &SessionId,
     session: &Arc<PiAcpSession>,
 ) -> std::result::Result<Vec<SessionConfigOption>, AcpxError> {
     let (config_options, _models, modes) = get_session_configuration(session, None, None).await;
-    send_current_mode_update(cx, session_id, &modes.current_mode_id).await;
+    send_current_mode_update(cx, protocol, session_id, &modes.current_mode_id).await;
     let update = ConfigOptionUpdate::new(config_options.clone());
-    cx.send_notification(SessionNotification::new(
-        session_id.clone(),
-        SessionUpdate::ConfigOptionUpdate(update),
-    ))
-    .map_err(|e| AcpxError::RpcFailed {
-        command: "config_option_update".into(),
-        message: e.to_string(),
-    })?;
+    crate::protocol::send_session_update(
+        cx,
+        protocol,
+        SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ConfigOptionUpdate(update),
+        ),
+    )?;
     Ok(config_options)
 }
 
-async fn send_current_mode_update(cx: &ConnectionTo<Client>, session_id: &SessionId, mode: &str) {
-    let _ = cx.send_notification(SessionNotification::new(
-        session_id.clone(),
-        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.to_string())),
-    ));
+async fn send_current_mode_update(
+    cx: &ConnectionTo<Client>,
+    protocol: Protocol,
+    session_id: &SessionId,
+    mode: &str,
+) {
+    // v2 has no `current_mode_update`; `send_session_update` skips it there
+    // (v2 expresses modes as config options). v1 is unchanged.
+    let _ = crate::protocol::send_session_update(
+        cx,
+        protocol,
+        SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.to_string())),
+        ),
+    );
 }
 
-async fn send_text_chunk(cx: &ConnectionTo<Client>, session_id: &SessionId, text: &str) {
+async fn send_text_chunk(
+    cx: &ConnectionTo<Client>,
+    protocol: Protocol,
+    session_id: &SessionId,
+    text: &str,
+) {
     let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-    let _ = cx.send_notification(SessionNotification::new(
-        session_id.clone(),
-        SessionUpdate::AgentMessageChunk(chunk),
-    ));
+    let _ = crate::protocol::send_session_update(
+        cx,
+        protocol,
+        SessionNotification::new(session_id.clone(), SessionUpdate::AgentMessageChunk(chunk)),
+    );
 }
 
 /// Fetch `session_configuration`: configOptions + model/mode states.
@@ -2226,7 +2453,12 @@ async fn set_session_model(
 }
 
 /// Replay a session's message history as ACP notifications (TS `loadSession`).
-async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, data: &Value) {
+async fn replay_history(
+    cx: &ConnectionTo<Client>,
+    protocol: Protocol,
+    session: &Arc<PiAcpSession>,
+    data: &Value,
+) {
     let session_id = session.session_id().clone();
     let cwd = session.cwd().to_string_lossy().to_string();
     let messages = data
@@ -2243,17 +2475,25 @@ async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, 
         match replay {
             ReplayMessage::UserText(text) => {
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
-                let _ = cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::UserMessageChunk(chunk),
-                ));
+                let _ = crate::protocol::send_session_update(
+                    cx,
+                    protocol,
+                    SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::UserMessageChunk(chunk),
+                    ),
+                );
             }
             ReplayMessage::AssistantText(text) => {
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
-                let _ = cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(chunk),
-                ));
+                let _ = crate::protocol::send_session_update(
+                    cx,
+                    protocol,
+                    SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(chunk),
+                    ),
+                );
             }
             ReplayMessage::ToolResult(t) => {
                 let tool_call_id = t.tool_call_id.unwrap_or_else(|| {
@@ -2266,10 +2506,11 @@ async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, 
                         .status(ToolCallStatus::Completed)
                         .content(bash_terminal_content(&tool_call_id))
                         .meta(bash_terminal_info_meta(&tool_call_id, &cwd));
-                    let _ = cx.send_notification(SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::ToolCall(call),
-                    ));
+                    let _ = crate::protocol::send_session_update(
+                        cx,
+                        protocol,
+                        SessionNotification::new(session_id.clone(), SessionUpdate::ToolCall(call)),
+                    );
                     let mut meta = serde_json::Map::new();
                     if !t.text.is_empty() {
                         meta.extend(bash_terminal_output_meta(&tool_call_id, &t.text));
@@ -2284,20 +2525,25 @@ async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, 
                         ToolCallStatus::Completed
                     }));
                     let update = ToolCallUpdate::new(tool_call_id.clone(), fields).meta(meta);
-                    let _ = cx.send_notification(SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::ToolCallUpdate(update),
-                    ));
+                    let _ = crate::protocol::send_session_update(
+                        cx,
+                        protocol,
+                        SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ToolCallUpdate(update),
+                        ),
+                    );
                 } else {
                     let call = ToolCall::new(tool_call_id.clone(), t.title.clone())
                         .kind(to_tool_kind(&t.tool_name))
                         .status(ToolCallStatus::Completed)
                         .raw_input(Value::Null)
                         .raw_output(t.raw.clone());
-                    let _ = cx.send_notification(SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::ToolCall(call),
-                    ));
+                    let _ = crate::protocol::send_session_update(
+                        cx,
+                        protocol,
+                        SessionNotification::new(session_id.clone(), SessionUpdate::ToolCall(call)),
+                    );
                     let text = tool_result_to_text(&t.raw);
                     let content = if text.is_empty() {
                         None
@@ -2316,10 +2562,17 @@ async fn replay_history(cx: &ConnectionTo<Client>, session: &Arc<PiAcpSession>, 
                         }))
                         .content(content)
                         .raw_output(t.raw.clone());
-                    let _ = cx.send_notification(SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields)),
-                    ));
+                    let _ = crate::protocol::send_session_update(
+                        cx,
+                        protocol,
+                        SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                tool_call_id,
+                                fields,
+                            )),
+                        ),
+                    );
                 }
             }
         }

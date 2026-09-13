@@ -77,7 +77,17 @@ where
             },
             on_receive_notification!(),
         )
-        .connect_with(agent, |cx| async move { f(cx).await })
+        .connect_with(
+            agent,
+            |cx: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>| async move {
+                // The ACP handshake is mandatory: the SDK's protocol router reads
+                // `initialize` to select the v1/v2 implementation (W-562).
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                f(cx).await
+            },
+        )
         .await
         .expect("connection should complete");
 }

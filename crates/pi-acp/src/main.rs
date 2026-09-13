@@ -755,6 +755,13 @@ fn persist_mock_session_file(path: &Path, session_id: &str) -> Result<()> {
 /// an empty usage snapshot, the final assistant `message_end` with token
 /// usage, and `agent_settled`.
 async fn emit_default_prompt_response(stdout: &mut tokio::io::Stdout) -> Result<()> {
+    // Real pi opens an assistant message before streaming its deltas; the
+    // adapter mints the ACP `messageId` from this event (W-562).
+    let start = serde_json::json!({
+        "type": "message_start",
+        "message": {"role": "assistant", "content": []}
+    });
+    mock_write_line(stdout, start.to_string().as_bytes()).await?;
     let update = serde_json::json!({
         "type": "message_update",
         "usage": {},

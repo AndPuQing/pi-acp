@@ -604,6 +604,11 @@ async fn new_session_map_waits_for_persisted_session_file() {
         .builder()
         .name("s6-session-persistence-client")
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd.clone()))
                 .block_task()
@@ -836,6 +841,11 @@ async fn unpersisted_new_session_is_unknown_after_restart() {
         .builder()
         .name("s6-session-restart-create-client")
         .connect_with(make_agent(), async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd.clone()))
                 .block_task()
@@ -852,6 +862,11 @@ async fn unpersisted_new_session_is_unknown_after_restart() {
         .builder()
         .name("s6-session-restart-load-client")
         .connect_with(make_agent(), async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let err = cx
                 .send_request(LoadSessionRequest::new(
                     "mock-session-id".to_string(),
@@ -894,6 +909,11 @@ async fn set_session_model_unknown_session_errors() {
             on_receive_notification!(),
         )
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let err = cx
                 .send_request(
                     UntypedMessage::new(
@@ -932,6 +952,11 @@ async fn unknown_config_option_errors() {
         .builder()
         .name("s6-e2e-client-3")
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd))
                 .block_task()
@@ -978,6 +1003,11 @@ async fn thinking_max_level_round_trips() {
         .builder()
         .name("thinking-max-client")
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd))
                 .block_task()
@@ -1069,6 +1099,11 @@ async fn model_switch_reshapes_thinking_levels() {
             on_receive_notification!(),
         )
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd))
                 .block_task()
@@ -1148,6 +1183,11 @@ async fn prompt_after_pi_death_returns_explicit_error() {
         .builder()
         .name("s8-dead-pi-client")
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd))
                 .block_task()
@@ -1233,6 +1273,11 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
         .builder()
         .name("s8-auth-prompt-client")
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new(cwd))
                 .block_task()
@@ -1289,6 +1334,11 @@ async fn auth_looking_models_error_on_new_surfaces_auth_required() {
         .builder()
         .name("s8-auth-new-client")
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let err = cx
                 .send_request(NewSessionRequest::new(cwd))
                 .block_task()
@@ -1335,6 +1385,11 @@ async fn load_session_surfaces_get_messages_failure() {
         .builder()
         .name("s8-load-error-client")
         .connect_with(agent, async |cx| {
+            // initialize (the ACP handshake is mandatory: the protocol
+            // router reads it to select the implementation).
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let err = cx
                 .send_request(LoadSessionRequest::new("stored-session", cwd))
                 .block_task()

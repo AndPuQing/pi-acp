@@ -37,6 +37,13 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 enum Recorded {
     Notify(SessionUpdate),
     Permission(RequestPermissionRequest),
+    /// A v2-only complete-message patch (W-562); never produced on v1.
+    AgentMessage {
+        message_id: agent_client_protocol::schema::v1::MessageId,
+        content: Vec<agent_client_protocol::schema::v1::ContentBlock>,
+    },
+    /// A v2-only foreground-state transition (W-562); never produced on v1.
+    Foreground(pi_acp::session::ForegroundState),
 }
 
 struct Fixture {
@@ -54,7 +61,22 @@ async fn fixture(extra_args: &[&str]) -> Fixture {
     fixture_with_settle_timeout(extra_args, Duration::ZERO).await
 }
 
+/// A fixture whose session believes it is serving an ACP **v2** client, so the
+/// v2-only emissions (the `agent_message` patch, `state_update`) are produced
+/// (W-562). v1 sessions never emit them.
+async fn fixture_v2() -> Fixture {
+    fixture_with_options(&[], Duration::ZERO, pi_acp::protocol::Protocol::V2).await
+}
+
 async fn fixture_with_settle_timeout(extra_args: &[&str], settle_timeout: Duration) -> Fixture {
+    fixture_with_options(extra_args, settle_timeout, pi_acp::protocol::Protocol::V1).await
+}
+
+async fn fixture_with_options(
+    extra_args: &[&str],
+    settle_timeout: Duration,
+    protocol: pi_acp::protocol::Protocol,
+) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let scenarios = tmp.path().join("scenarios");
     let command_log = tmp.path().join("commands.log");
@@ -86,6 +108,7 @@ async fn fixture_with_settle_timeout(extra_args: &[&str], settle_timeout: Durati
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
+        protocol,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
@@ -126,6 +149,24 @@ async fn run_recorder(
                     RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                 });
                 let _ = respond.send(Ok(answer));
+            }
+            // v2-only frames (W-562): recorded so v2 tests can assert on
+            // them; the v1 path never produces them.
+            OutboundMessage::AgentMessage {
+                session_id: _,
+                message_id,
+                content,
+            } => {
+                recorded.lock().await.push(Recorded::AgentMessage {
+                    message_id,
+                    content,
+                });
+            }
+            OutboundMessage::Foreground {
+                session_id: _,
+                state,
+            } => {
+                recorded.lock().await.push(Recorded::Foreground(state));
             }
             OutboundMessage::Flush(ack) => {
                 // Ordering barrier: everything before it is already recorded.
@@ -295,6 +336,156 @@ async fn forwards_thinking_delta_without_optional_wire_fields() {
     );
     let recorded = fx.recorded.lock().await.clone();
     assert_eq!(thought_chunks(&recorded), vec!["thinking...".to_string()]);
+}
+
+/// W-562: every chunk of one assistant message carries the same minted
+/// `message_id`, and a second message gets a *different* one. pi's RPC messages
+/// have no id, so the adapter mints `pi-msg-<n>` at `message_start`; minting per
+/// chunk would defeat the grouping the id exists for.
+#[tokio::test]
+async fn message_ids_group_chunks_per_assistant_message() {
+    let fx = fixture(&[]).await;
+    // Two assistant messages in one turn: `message_start` opens each, and each
+    // streams two deltas.
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({"type": "message_start", "message": {"role": "assistant"}}),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "first a"}
+            }),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "first b"}
+            }),
+            json!({"type": "message_start", "message": {"role": "assistant"}}),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "second"}
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "hello").await.unwrap(),
+        StopReason::EndTurn
+    );
+
+    let recorded = fx.recorded.lock().await.clone();
+    let ids: Vec<Option<String>> = recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::Notify(SessionUpdate::AgentMessageChunk(c)) => {
+                Some(c.message_id.as_ref().map(|id| id.0.to_string()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(ids.len(), 3, "three streamed chunks: {recorded:#?}");
+    // Same message -> same id (never re-minted per chunk).
+    assert_eq!(ids[0], ids[1], "chunks of one message share its id");
+    assert!(ids[0].is_some(), "v1 chunks now carry a message_id");
+    assert_eq!(ids[0].as_deref(), Some("pi-msg-1"));
+    // A new message -> a new id.
+    assert_ne!(ids[1], ids[2], "a new message starts a new id");
+    assert_eq!(ids[2].as_deref(), Some("pi-msg-2"));
+
+    // v1 has no full-object update and no foreground state: the patch and the
+    // v2 state transitions must never appear on a v1 connection.
+    assert!(
+        !recorded
+            .iter()
+            .any(|r| matches!(r, Recorded::AgentMessage { .. })),
+        "v1 must not emit the v2 agent_message patch"
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|r| matches!(r, Recorded::Foreground(_))),
+        "v1 must not emit the v2 state_update"
+    );
+}
+
+/// W-562: the v2-only patch object is built from pi's authoritative
+/// `message_end.message` (the full content array), and reuses the id minted at
+/// `message_start` so the client can patch what it accumulated.
+#[tokio::test]
+async fn message_end_yields_the_v2_patch_with_the_same_message_id() {
+    let fx = fixture_v2().await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({"type": "message_start", "message": {"role": "assistant"}}),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "hello"}
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello world"}]
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "hello").await.unwrap(),
+        StopReason::EndTurn
+    );
+
+    let recorded = fx.recorded.lock().await.clone();
+    let patch = recorded
+        .iter()
+        .find_map(|r| match r {
+            Recorded::AgentMessage {
+                message_id,
+                content,
+            } => Some((message_id.clone(), content.clone())),
+            _ => None,
+        })
+        .expect("message_end carries the authoritative message and must yield a patch");
+
+    assert_eq!(
+        patch.0 .0.as_ref(),
+        "pi-msg-1",
+        "the patch reuses the streamed id"
+    );
+    assert_eq!(patch.1.len(), 1);
+    match &patch.1[0] {
+        agent_client_protocol::schema::v1::ContentBlock::Text(t) => {
+            assert_eq!(
+                t.text, "hello world",
+                "the patch carries the complete content"
+            );
+        }
+        other => panic!("expected a text block, got {other:?}"),
+    }
+
+    // The same v2 session also publishes the turn's foreground transitions,
+    // which is how v2 reports completion (v1 uses the prompt response).
+    let states: Vec<pi_acp::session::ForegroundState> = recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::Foreground(state) => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            pi_acp::session::ForegroundState::Running,
+            pi_acp::session::ForegroundState::Idle(StopReason::EndTurn),
+        ],
+        "the v2 turn publishes running -> idle(end_turn)"
+    );
 }
 
 /// pi's streaming usage can be empty; the final assistant message carries the
@@ -1360,6 +1551,7 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
+        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
@@ -1555,6 +1747,7 @@ async fn session_id_override_mismatch_is_rejected() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
+        protocol: pi_acp::protocol::Protocol::V1,
         session_path: Some(session_file),
         session_id_override: Some("requested-session-id".into()),
         file_commands: vec![],
@@ -1592,6 +1785,7 @@ async fn session_manager_registers_and_disposes_sessions() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
+        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
@@ -1631,6 +1825,7 @@ async fn session_manager_replacement_disposes_previous_instance() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound,
+        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],

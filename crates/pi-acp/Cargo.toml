@@ -8,6 +8,17 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+# ACP protocol v2 (unstable draft) support, W-562. **Off by default**: with the
+# feature disabled the build, the dependency set, the CLI behavior and the ACP
+# semantics are exactly as before. Enabling it registers a v2 implementation
+# next to the v1 one on the SDK's `AgentProtocolRouter`; the v1 session core is
+# untouched and every v1 <-> v2 conversion happens once, at the boundary.
+protocol-v2 = [
+    "agent-client-protocol/unstable_protocol_v2",
+    "agent-client-protocol-schema/unstable_protocol_v2",
+]
+
 [[bin]]
 name = "pi-acp"
 path = "src/main.rs"

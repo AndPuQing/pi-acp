@@ -235,20 +235,56 @@ async fn v2_end_to_end_handshake_prompt_and_patch_object() {
 
     let entries = log.lock().await.clone();
 
-    // Every streamed chunk of the message carries the same messageId (grouping).
-    let chunk_ids: Vec<String> = entries
+    // Every streamed chunk of the answer carries the same messageId (grouping).
+    //
+    // Scoped to the answer's own message: the session also publishes a startup
+    // prelude as its own `agent_message_chunk`, which is a genuinely different
+    // message and so carries its own id. Lumping the two together would assert
+    // that every chunk in the session belongs to one message, which was only
+    // true while the prelude's chunk was being dropped on the way out.
+    let all_chunk_ids: Vec<String> = entries
         .iter()
         .filter(|v| kind(v) == Some("agent_message_chunk"))
         .filter_map(|v| update(v)["messageId"].as_str().map(str::to_string))
         .collect();
     assert!(
-        !chunk_ids.is_empty(),
+        !all_chunk_ids.is_empty(),
         "v2 must tag streamed chunks with a messageId: {entries:#?}"
     );
+
+    // The message the completion patch names is the answer, and its chunks are
+    // contiguous and identically tagged.
+    let answer_id = entries
+        .iter()
+        .find(|v| kind(v) == Some("agent_message"))
+        .map(|v| {
+            update(v)["messageId"]
+                .as_str()
+                .expect("patch messageId")
+                .to_string()
+        })
+        .unwrap_or_else(|| panic!("expected an agent_message patch: {entries:#?}"));
+    let answer_chunks: Vec<&String> = all_chunk_ids
+        .iter()
+        .filter(|id| **id == answer_id)
+        .collect();
     assert!(
-        chunk_ids.windows(2).all(|w| w[0] == w[1]),
-        "all chunks of one message must share one messageId: {chunk_ids:?}"
+        !answer_chunks.is_empty(),
+        "the answer's chunks must carry the patch's id {answer_id}: {all_chunk_ids:?}"
     );
+    // Every chunk tag in the session is either the answer's or a distinct
+    // message's, never an ungrouped stream: a run of one message's chunks is
+    // contiguous, so no id may reappear after a different one.
+    let mut seen: Vec<&String> = Vec::new();
+    for id in &all_chunk_ids {
+        if seen.last() != Some(&id) {
+            assert!(
+                !seen.contains(&id),
+                "a message's chunks must be contiguous: {all_chunk_ids:?}"
+            );
+            seen.push(id);
+        }
+    }
 
     // The v2-only complete-message patch, carrying the authoritative content
     // under the same id so the client can replace what it accumulated.
@@ -260,7 +296,7 @@ async fn v2_end_to_end_handshake_prompt_and_patch_object() {
         .as_str()
         .expect("patch messageId");
     assert_eq!(
-        patch_id, chunk_ids[0],
+        patch_id, answer_id,
         "the patch must reuse the streamed message's id"
     );
     let content = update(patch)["content"]

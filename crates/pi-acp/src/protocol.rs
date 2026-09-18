@@ -118,20 +118,11 @@ pub fn send_session_update(
         Protocol::V2 => {
             #[cfg(feature = "protocol-v2")]
             {
-                use agent_client_protocol_schema::v2;
-                use agent_client_protocol_schema::v2::conversion::try_v1_to_v2;
-
-                // v2 removed session modes: `CurrentModeUpdate` has no v2
-                // counterpart (the conversion layer returns
-                // `removed_v1_enum_variant`). Skipping is the decision, not a
-                // fallback — v2 expresses modes as config options, which pi-acp
-                // still publishes via `ConfigOptionUpdate`.
-                if matches!(notification.update, v1::SessionUpdate::CurrentModeUpdate(_)) {
-                    tracing::trace!("skipping current_mode_update on the ACP v2 path");
-                    return Ok(());
-                }
-                let converted: v2::UpdateSessionNotification = try_v1_to_v2(notification)
-                    .map_err(|e| conversion_error("session/update->v2", e))?;
+                let converted = match convert_session_update_to_v2(notification) {
+                    Some(converted) => converted,
+                    // The update has no v2 form and is deliberately skipped.
+                    None => return Ok(()),
+                };
                 cx.send_notification(converted)
                     .map_err(|e| conversion_error("session/update", e))
             }
@@ -146,6 +137,87 @@ pub fn send_session_update(
             }
         }
     }
+}
+
+/// The v2 form of a v1 session update, or `None` when the update is one v2 has
+/// no representation for and the boundary deliberately drops.
+///
+/// Split out of [`send_session_update`] so the conversion — the part that can
+/// fail, and the part a regression silently breaks — is testable without a live
+/// connection. The connection call is all that is left in the function above.
+#[cfg(feature = "protocol-v2")]
+fn convert_session_update_to_v2(
+    notification: v1::SessionNotification,
+) -> Option<agent_client_protocol_schema::v2::UpdateSessionNotification> {
+    // v2 removed session modes: `CurrentModeUpdate` has no v2 counterpart (the
+    // conversion layer returns `removed_v1_enum_variant`). Skipping is the
+    // decision, not a fallback — v2 expresses modes as config options, which
+    // pi-acp still publishes via `ConfigOptionUpdate`.
+    if matches!(notification.update, v1::SessionUpdate::CurrentModeUpdate(_)) {
+        tracing::trace!("skipping current_mode_update on the ACP v2 path");
+        return None;
+    }
+
+    // `with_message_id` is infallible in practice: it either supplies the id v2
+    // requires or leaves an update that carries none. A conversion failure here
+    // is a bug in the adapter, not a client condition, so it is logged as an
+    // error and the frame is dropped rather than being sent unconverted — but
+    // see `spawn_outbound_connector`: a dropped frame must never end the
+    // connection.
+    let notification = with_message_id(notification);
+    match agent_client_protocol_schema::v2::conversion::try_v1_to_v2(notification) {
+        Ok(converted) => Some(converted),
+        Err(error) => {
+            tracing::error!(%error, "dropping a session update with no ACP v2 form");
+            None
+        }
+    }
+}
+
+/// The `message_id` handed to a chunk that has none, on the v2 path only.
+///
+/// Monotonic per process, which is all v2 asks for: an id that groups the
+/// chunks of one message. A chunk with no message of its own (an extension
+/// notice, a replayed history frame) is genuinely its own message, so a fresh
+/// id per chunk is the honest answer rather than a shared sentinel.
+#[cfg(feature = "protocol-v2")]
+static SYNTHETIC_MESSAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Give every chunk in `notification` a `message_id`, minting one where the v1
+/// session core left it `None`.
+///
+/// v2 made `ContentChunk.message_id` **required**, so the schema's own
+/// conversion refuses a chunk without one. The v1 core only fills the id where
+/// it tracks a streamed assistant message (`Pump::current_message_id`), which
+/// leaves three producers anonymous: extension notices, replayed history and
+/// the export link. Those are real frames a client must receive, so the id is
+/// supplied here — at the single boundary — rather than at each producer, so a
+/// new producer cannot reintroduce the failure.
+///
+/// Chunks that already carry an id are untouched: the streaming path's grouping
+/// is what lets a client reassemble a message, and it must not be replaced.
+#[cfg(feature = "protocol-v2")]
+fn with_message_id(mut notification: v1::SessionNotification) -> v1::SessionNotification {
+    use std::sync::atomic::Ordering;
+
+    let mint = || {
+        let next = SYNTHETIC_MESSAGE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        v1::MessageId::new(format!("pi-synthetic-{next}"))
+    };
+
+    match &mut notification.update {
+        v1::SessionUpdate::UserMessageChunk(chunk) if chunk.message_id.is_none() => {
+            chunk.message_id = Some(mint());
+        }
+        v1::SessionUpdate::AgentMessageChunk(chunk) if chunk.message_id.is_none() => {
+            chunk.message_id = Some(mint());
+        }
+        v1::SessionUpdate::AgentThoughtChunk(chunk) if chunk.message_id.is_none() => {
+            chunk.message_id = Some(mint());
+        }
+        _ => {}
+    }
+    notification
 }
 
 /// Convert the v1 `initialize` response into its v2 form (W-562).
@@ -373,6 +445,134 @@ mod tests {
         assert!(
             with_auth.is_err(),
             "v1 auth methods without a logout capability are not representable in v2"
+        );
+    }
+
+    /// v2 made `ContentChunk.message_id` required, and the v1 session core
+    /// leaves it `None` for every producer that is not the streamed assistant
+    /// message: extension notices, replayed history, the export link. The
+    /// boundary mints one instead of letting the conversion fail.
+    ///
+    /// The regression this guards is a whole turn disappearing: an anonymous
+    /// chunk failed conversion, the outbound connector returned, and every
+    /// later frame — including the answer — was silently dropped.
+    #[cfg(feature = "protocol-v2")]
+    #[test]
+    fn a_chunk_without_a_message_id_is_given_one_for_v2() {
+        use agent_client_protocol_schema::v2::conversion::try_v1_to_v2;
+
+        let notification = v1::SessionNotification::new(
+            v1::SessionId::new("session-1"),
+            v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(v1::ContentBlock::Text(
+                v1::TextContent::new("Observational memory: running"),
+            ))),
+        );
+        assert!(
+            matches!(
+                &notification.update,
+                v1::SessionUpdate::AgentMessageChunk(chunk) if chunk.message_id.is_none()
+            ),
+            "the fixture must start without a message id"
+        );
+
+        // The raw conversion is what used to fail...
+        let raw: Result<agent_client_protocol_schema::v2::UpdateSessionNotification, _> =
+            try_v1_to_v2(notification.clone());
+        assert!(
+            raw.is_err(),
+            "a v1 chunk without a message id has no v2 form"
+        );
+
+        // ...and the boundary's own conversion succeeds, with an id supplied.
+        let converted = convert_session_update_to_v2(notification)
+            .expect("an anonymous chunk must convert once given an id");
+        let agent_client_protocol_schema::v2::SessionUpdate::AgentMessageChunk(chunk) =
+            converted.update
+        else {
+            panic!("the update must stay an agent message chunk");
+        };
+        assert!(
+            !chunk.message_id.0.is_empty(),
+            "the minted id must be non-empty"
+        );
+    }
+
+    /// A chunk that already carries an id keeps it.
+    ///
+    /// The streamed-assistant path groups chunks by id so a client can
+    /// reassemble the message; replacing that id would split one message into
+    /// many bubbles — the bug the id exists to prevent.
+    #[cfg(feature = "protocol-v2")]
+    #[test]
+    fn an_existing_message_id_is_preserved() {
+        let notification = v1::SessionNotification::new(
+            v1::SessionId::new("session-1"),
+            v1::SessionUpdate::AgentMessageChunk(
+                v1::ContentChunk::new(v1::ContentBlock::Text(v1::TextContent::new("pong")))
+                    .message_id(v1::MessageId::new("pi-msg-7")),
+            ),
+        );
+
+        let converted = convert_session_update_to_v2(notification).expect("v2 conversion");
+        let agent_client_protocol_schema::v2::SessionUpdate::AgentMessageChunk(chunk) =
+            converted.update
+        else {
+            panic!("the update must stay an agent message chunk");
+        };
+        assert_eq!(chunk.message_id.0.to_string(), "pi-msg-7");
+    }
+
+    /// Every chunk-bearing update variant the v1 core can emit is covered.
+    ///
+    /// A variant the boundary stopped covering would reintroduce the dropped
+    /// turn, so this fails if one is missed.
+    #[cfg(feature = "protocol-v2")]
+    #[test]
+    fn every_anonymous_chunk_variant_reaches_a_v2_client() {
+        let updates = [
+            v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(v1::ContentBlock::Text(
+                v1::TextContent::new("x"),
+            ))),
+            v1::SessionUpdate::UserMessageChunk(v1::ContentChunk::new(v1::ContentBlock::Text(
+                v1::TextContent::new("x"),
+            ))),
+            v1::SessionUpdate::AgentThoughtChunk(v1::ContentChunk::new(v1::ContentBlock::Text(
+                v1::TextContent::new("x"),
+            ))),
+        ];
+        for update in updates {
+            let name = format!("{update:?}");
+            assert!(
+                matches!(
+                    &update,
+                    v1::SessionUpdate::AgentMessageChunk(chunk)
+                        | v1::SessionUpdate::UserMessageChunk(chunk)
+                        | v1::SessionUpdate::AgentThoughtChunk(chunk)
+                        if chunk.message_id.is_none()
+                ),
+                "the {name} fixture must start without an id"
+            );
+            let notification =
+                v1::SessionNotification::new(v1::SessionId::new("session-1"), update);
+            let converted = convert_session_update_to_v2(notification);
+            assert!(
+                converted.is_some(),
+                "a {name} without a message id must still reach a v2 client"
+            );
+        }
+    }
+
+    /// The id helper only touches chunk-bearing updates.
+    #[cfg(feature = "protocol-v2")]
+    #[test]
+    fn an_update_without_a_chunk_is_left_alone() {
+        let notification = v1::SessionNotification::new(
+            v1::SessionId::new("session-1"),
+            v1::SessionUpdate::CurrentModeUpdate(v1::CurrentModeUpdate::new("medium")),
+        );
+        assert!(
+            convert_session_update_to_v2(notification).is_none(),
+            "current_mode_update is deliberately dropped on the v2 path"
         );
     }
 }

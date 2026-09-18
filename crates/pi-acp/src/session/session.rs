@@ -2630,55 +2630,57 @@ pub fn spawn_outbound_connector(
     mut rx: mpsc::Receiver<OutboundMessage>,
 ) -> std::result::Result<(), AcpxError> {
     let _: tokio::task::JoinHandle<std::result::Result<(), AcpxError>> = tokio::spawn(async move {
-        let run: std::result::Result<(), AcpxError> = async {
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    OutboundMessage::Notify(notif) => {
-                        // Every session update crosses the protocol boundary
-                        // here, so no unconverted frame reaches the wire.
-                        crate::protocol::send_session_update(&conn, protocol, notif)?;
-                    }
-                    OutboundMessage::AgentMessage {
-                        session_id,
-                        message_id,
-                        content,
-                    } => {
-                        crate::protocol::send_agent_message(
-                            &conn,
-                            protocol,
-                            &session_id,
-                            &message_id,
-                            content,
-                        )?;
-                    }
-                    OutboundMessage::Foreground { session_id, state } => {
-                        if let Some(notif) =
-                            foreground_state_notification(protocol, &session_id, state)
-                        {
-                            // Already in the negotiated version; send as-is.
-                            let _ = conn.send_notification(notif);
-                        }
-                    }
-                    OutboundMessage::RequestPermission(request, respond) => {
-                        let conn = conn.clone();
-                        tokio::spawn(async move {
-                            let response =
-                                crate::protocol::request_permission(&conn, protocol, request).await;
-                            let _ = respond.send(response);
-                        });
-                    }
-                    OutboundMessage::Flush(ack) => {
-                        // Everything before this marker is now enqueued on the
-                        // connection's outgoing channel; release the pump.
-                        let _ = ack.send(());
-                    }
+        while let Some(msg) = rx.recv().await {
+            // One unconvertible frame must not end the connection. The pump is
+            // the only path a session update has to the wire, so returning here
+            // on a single failure silently drops every later update — including
+            // the rest of a running turn, which then looks like a model that
+            // produced no answer. The failure is logged and the connector keeps
+            // going; `Flush` still acks so nothing that waits on it hangs.
+            let result: std::result::Result<(), AcpxError> = match msg {
+                OutboundMessage::Notify(notif) => {
+                    // Every session update crosses the protocol boundary here,
+                    // so no unconverted frame reaches the wire.
+                    crate::protocol::send_session_update(&conn, protocol, notif)
                 }
+                OutboundMessage::AgentMessage {
+                    session_id,
+                    message_id,
+                    content,
+                } => crate::protocol::send_agent_message(
+                    &conn,
+                    protocol,
+                    &session_id,
+                    &message_id,
+                    content,
+                ),
+                OutboundMessage::Foreground { session_id, state } => {
+                    if let Some(notif) = foreground_state_notification(protocol, &session_id, state)
+                    {
+                        // Already in the negotiated version; send as-is.
+                        let _ = conn.send_notification(notif);
+                    }
+                    Ok(())
+                }
+                OutboundMessage::RequestPermission(request, respond) => {
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let response =
+                            crate::protocol::request_permission(&conn, protocol, request).await;
+                        let _ = respond.send(response);
+                    });
+                    Ok(())
+                }
+                OutboundMessage::Flush(ack) => {
+                    // Everything before this marker is now enqueued on the
+                    // connection's outgoing channel; release the pump.
+                    let _ = ack.send(());
+                    Ok(())
+                }
+            };
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "session update could not be sent; continuing");
             }
-            Ok(())
-        }
-        .await;
-        if let Err(e) = run {
-            tracing::warn!(error = %e, "session outbound connector stopped");
         }
         Ok(())
     });

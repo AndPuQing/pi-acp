@@ -48,7 +48,7 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate,
     DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse,
+    LoadSessionResponse, McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse,
     PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
     SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionInfo,
@@ -69,7 +69,10 @@ use crate::commands::{self, FileSlashCommand};
 use crate::config::Config;
 use crate::error::{AcpxError, Result};
 use crate::mcp::{self, McpServerSpec};
-use crate::pi::rpc::{ImageContent, Model, QueueMode, RpcSessionState, ThinkingLevel};
+use crate::pi::rpc::{
+    clamp_thinking_level, supported_thinking_levels, ImageContent, Model, QueueMode,
+    RpcSessionState, ThinkingLevel,
+};
 use crate::pi::sessions::{
     find_pi_session, list_pi_sessions, session_file_matches_id, title_from_session_file,
 };
@@ -114,11 +117,46 @@ const ACP_INTERNAL_ERROR: i32 = -32603;
 /// `session/list` page size (mirrors the TS reference).
 const LIST_PAGE_SIZE: usize = 50;
 
-/// A model advertised to the client (`provider/id` + `provider/name` labels).
+/// A model advertised to the client (`provider/id` + `provider/name` labels),
+/// together with the thinking ladder that belongs to it.
+///
+/// The ladder is per model, not per session: pi derives it from the model's own
+/// reasoning flag and thinking-level map, so switching models changes which
+/// levels are on offer. Publishing it beside the model is what lets a client
+/// describe the levels of the model it is switching *to*, instead of showing one
+/// list for every model.
 #[derive(Debug, Clone)]
-struct AdvertisedModel {
+pub(crate) struct AdvertisedModel {
     model_id: String,
     name: String,
+    /// The levels this model supports.
+    thinking_levels: Vec<ThinkingLevel>,
+    /// Where the session's current level lands on this model's ladder — what pi
+    /// itself settles on when the model is switched to.
+    default_thinking_level: ThinkingLevel,
+}
+
+impl AdvertisedModel {
+    /// The `provider/id` value this option carries.
+    pub(crate) fn id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// The model as a client should see it, or `None` when pi gave it no usable
+    /// provider or id.
+    pub(crate) fn new(model: &Model, current_level: ThinkingLevel) -> Option<Self> {
+        let provider = model.provider.trim();
+        let id = model.id.trim();
+        if provider.is_empty() || id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            model_id: format!("{provider}/{id}"),
+            name: format!("{provider}/{}", model.name),
+            thinking_levels: supported_thinking_levels(Some(model)),
+            default_thinking_level: clamp_thinking_level(Some(model), current_level),
+        })
+    }
 }
 
 /// Model state for a session (available models + the active one).
@@ -2273,34 +2311,22 @@ fn model_state_from_parts(
     state: Option<&RpcSessionState>,
     enabled_models: Option<&[String]>,
 ) -> Option<ModelState> {
+    // Each model's ladder is derived against the session's current level, so
+    // every model is described the way pi would leave the session after
+    // switching to it.
+    let current_level = state
+        .map(|s| s.thinking_level)
+        .unwrap_or(ThinkingLevel::Medium);
     let mut available_models: Vec<AdvertisedModel> = available
         .iter()
         .filter(|m| is_model_enabled(&m.provider, &m.id, enabled_models))
-        .filter_map(|m| {
-            let provider = m.provider.trim();
-            let id = m.id.trim();
-            if provider.is_empty() || id.is_empty() {
-                return None;
-            }
-            Some(AdvertisedModel {
-                model_id: format!("{provider}/{id}"),
-                name: format!("{provider}/{}", m.name),
-            })
-        })
+        .filter_map(|m| AdvertisedModel::new(m, current_level))
         .collect();
 
-    let current_model = state.as_ref().and_then(|s| s.model.as_ref()).and_then(|m| {
-        let provider = m.provider.trim();
-        let id = m.id.trim();
-        if provider.is_empty() || id.is_empty() {
-            None
-        } else {
-            Some(AdvertisedModel {
-                model_id: format!("{provider}/{id}"),
-                name: format!("{provider}/{}", m.name),
-            })
-        }
-    });
+    let current_model = state
+        .as_ref()
+        .and_then(|s| s.model.as_ref())
+        .and_then(|m| AdvertisedModel::new(m, current_level));
 
     // Keep pi's active model selectable even when enabledModels excludes it;
     // otherwise the ACP response would advertise an invalid current value.
@@ -2360,12 +2386,9 @@ fn build_config_options(
     )];
 
     if let Some(models) = models {
-        let available: Vec<(String, String)> = models
-            .available_models
-            .iter()
-            .map(|m| (m.model_id.clone(), m.name.clone()))
-            .collect();
-        if let Some(model_option) = model_config_option(&models.current_model_id, &available) {
+        if let Some(model_option) =
+            model_config_option(&models.current_model_id, &models.available_models)
+        {
             options.insert(0, model_option);
         }
     }
@@ -2398,16 +2421,26 @@ pub(crate) fn thought_level_config_option(
 }
 
 /// Build the `model` config option (`None` when no models are advertised).
+///
+/// Each value carries the thinking ladder that belongs to it under `_meta`,
+/// ACP's channel for implementation extensions: the levels that model supports
+/// and where the session's current level lands on them. The `thought_level`
+/// option can only describe the model the session is on, so without this a
+/// client has no way to say what switching to another model would offer.
 pub(crate) fn model_config_option(
     current_model_id: &str,
-    available: &[(String, String)],
+    available: &[AdvertisedModel],
 ) -> Option<SessionConfigOption> {
     if available.is_empty() {
         return None;
     }
     let options: Vec<SessionConfigSelectOption> = available
         .iter()
-        .map(|(id, name)| SessionConfigSelectOption::new(id.clone(), name.clone()))
+        .map(|model| {
+            SessionConfigSelectOption::new(model.model_id.clone(), model.name.clone()).meta(
+                thinking_levels_meta(&model.thinking_levels, model.default_thinking_level),
+            )
+        })
         .collect();
     Some(
         SessionConfigOption::select(
@@ -2419,6 +2452,24 @@ pub(crate) fn model_config_option(
         .description("Select the model for this session")
         .category(SessionConfigOptionCategory::Model),
     )
+}
+
+/// One model's thinking ladder, as `_meta` on its `model` option value.
+fn thinking_levels_meta(levels: &[ThinkingLevel], default: ThinkingLevel) -> Meta {
+    json!({
+        "thinking_levels": levels
+            .iter()
+            .map(|level| json!({
+                "id": level.id(),
+                "name": level.label(),
+                "description": level.description(),
+            }))
+            .collect::<Vec<_>>(),
+        "default_thinking_level": default.id(),
+    })
+    .as_object()
+    .expect("static thinking_levels meta is an object")
+    .clone()
 }
 
 /// Resolve `provider/model` (or bare `model` via the available-model list) and
@@ -2847,5 +2898,96 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["anthropic/claude-sonnet-4", "openai/gpt-5"]);
         assert_eq!(models.current_model_id, "openai/gpt-5");
+    }
+
+    /// A client switching models is looking at a different ladder, and only the
+    /// `thought_level` option describes the model the session is *on*. Every
+    /// value therefore states the ladder that belongs to it, and where the
+    /// session's current level lands on that ladder.
+    #[test]
+    fn every_advertised_model_carries_its_own_thinking_ladder() {
+        use agent_client_protocol::schema::v1;
+
+        let model = |id: &str, reasoning: bool| Model {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: "mock".to_string(),
+            reasoning,
+            thinking_level_map: None,
+            base_url: None,
+            context_window: None,
+            max_tokens: None,
+            input: None,
+        };
+        let available = vec![model("reasoning", true), model("plain", false)];
+        let state = RpcSessionState {
+            model: Some(available[0].clone()),
+            thinking_level: ThinkingLevel::High,
+            is_streaming: false,
+            is_compacting: false,
+            steering_mode: QueueMode::All,
+            follow_up_mode: QueueMode::All,
+            session_file: None,
+            session_id: "test-session".to_string(),
+            session_name: None,
+            auto_compaction_enabled: false,
+            message_count: 0,
+            pending_message_count: 0,
+        };
+
+        let models = model_state_from_parts(&available, Some(&state), None).unwrap();
+        let option = model_config_option(&models.current_model_id, &models.available_models)
+            .expect("models are advertised");
+        let v1::SessionConfigKind::Select(select) = &option.kind else {
+            panic!("the model option is a select");
+        };
+        let v1::SessionConfigSelectOptions::Ungrouped(values) = &select.options else {
+            panic!("the model option is a flat list");
+        };
+
+        fn described(
+            values: &[v1::SessionConfigSelectOption],
+            value: &str,
+        ) -> (Vec<String>, String) {
+            let option = values
+                .iter()
+                .find(|option| option.value.0.as_ref() == value)
+                .unwrap_or_else(|| panic!("{value} is advertised"));
+            let meta = option
+                .meta
+                .as_ref()
+                .unwrap_or_else(|| panic!("{value} states a ladder"));
+            let ladder = meta["thinking_levels"]
+                .as_array()
+                .expect("thinking_levels is a list")
+                .iter()
+                .map(|level| level["id"].as_str().expect("a level has an id").to_string())
+                .collect();
+            let default = meta["default_thinking_level"]
+                .as_str()
+                .expect("a default level")
+                .to_string();
+            (ladder, default)
+        }
+
+        // A reasoning model keeps the whole classic ladder (xhigh/max need an
+        // explicit map entry, so they are absent here), and the session's
+        // `high` survives the switch.
+        assert_eq!(
+            described(values, "mock/reasoning"),
+            (
+                vec!["off", "minimal", "low", "medium", "high"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                "high".to_string(),
+            )
+        );
+        // A model without reasoning offers `off` alone, and `high` clamps down
+        // to it — the ladder, not a fixed list, decides.
+        assert_eq!(
+            described(values, "mock/plain"),
+            (vec!["off".to_string()], "off".to_string())
+        );
     }
 }

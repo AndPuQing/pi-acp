@@ -1723,21 +1723,13 @@ impl Pump {
                 Some(format!("{provider}/{id}"))
             }
         });
-        let available: Vec<(String, String)> = models_data
+        let available: Vec<crate::agent::AdvertisedModel> = models_data
             .get("models")
             .cloned()
             .and_then(|v| serde_json::from_value::<Vec<Model>>(v).ok())
             .unwrap_or_default()
             .iter()
-            .filter_map(|m| {
-                let provider = m.provider.trim();
-                let id = m.id.trim();
-                if provider.is_empty() || id.is_empty() {
-                    None
-                } else {
-                    Some((format!("{provider}/{id}"), format!("{provider}/{}", m.name)))
-                }
-            })
+            .filter_map(|model| crate::agent::AdvertisedModel::new(model, level))
             .collect();
         // Native levels first; fall back to the local per-model computation
         // so an older pi without the RPC still yields a dynamic list.
@@ -1757,7 +1749,7 @@ impl Pump {
             &levels,
         )];
         let current_model_id = current_model
-            .or_else(|| available.first().map(|(id, _)| id.clone()))
+            .or_else(|| available.first().map(|model| model.id().to_owned()))
             .unwrap_or_default();
         if let Some(model_option) = crate::agent::model_config_option(&current_model_id, &available)
         {

@@ -450,6 +450,115 @@ async fn v2_resume_with_start_replays_history() {
         .expect("agent run_with returned an error");
 }
 
+/// `session/resume` publishes the replayed history **before** its response, so
+/// the response is the client's completion boundary rather than a race.
+///
+/// The ACP SDK holds its dispatch loop for each registered callback before
+/// routing the next frame, so "already in the log when the response returns"
+/// means "already applied by the client". A client can therefore treat the
+/// response as "history is complete" instead of guessing with a timeout.
+#[tokio::test]
+async fn v2_resume_history_is_complete_when_the_response_returns() {
+    let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let env = MockEnv::new();
+
+    let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+    let log_in_handler = log.clone();
+    let (agent_end, client_end) = Channel::duplex();
+    let agent = Arc::new(AcpAgent::new(Config::from_env()));
+    let agent_task = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.run_with(agent_end).await })
+    };
+
+    let cwd = env.cwd.clone();
+    Client
+        .v2()
+        .name("w562-v2-boundary-client")
+        .on_receive_notification(
+            async move |notif: v2::UpdateSessionNotification, _cx| {
+                let raw = serde_json::to_value(&notif).unwrap_or(serde_json::Value::Null);
+                log_in_handler.lock().await.push(raw);
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_end, async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(
+                ProtocolVersion::V2,
+                v2::Implementation::new("w562-boundary-client", "1.0.0"),
+            ))
+            .block_task()
+            .await?;
+
+            let created = cx
+                .send_request(v2::NewSessionRequest::new(&cwd))
+                .block_task()
+                .await?;
+            let sid = created.session_id.clone();
+            cx.send_request(v2::PromptRequest::new(
+                sid.clone(),
+                vec![v2::ContentBlock::Text(v2::TextContent::new("hello"))],
+            ))
+            .block_task()
+            .await?;
+            wait_for_raw(
+                &log,
+                |v| kind(v) == Some("state_update") && update(v)["state"] == "idle",
+                "the first turn to settle",
+            )
+            .await;
+
+            // Everything from here on is what the resume publishes.
+            let boundary = log.lock().await.len();
+
+            cx.send_request(
+                v2::ResumeSessionRequest::new(sid.clone(), &cwd)
+                    .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+            )
+            .block_task()
+            .await?;
+
+            // Deliberately no `wait_for_raw`: the response is the boundary.
+            let entries = log.lock().await;
+            let after: Vec<&serde_json::Value> = entries.iter().skip(boundary).collect();
+            let user = after
+                .iter()
+                .position(|v| kind(v) == Some("user_message_chunk"))
+                .expect(
+                    "the replayed user message must already be applied when the response returns",
+                );
+            let assistant = after
+                .iter()
+                .position(|v| kind(v) == Some("agent_message_chunk"))
+                .expect(
+                    "the replayed assistant message must already be applied when the response returns",
+                );
+            assert!(
+                user < assistant,
+                "replay preserves the stored order (user message before the answer)"
+            );
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|v| kind(v) == Some("agent_message_chunk"))
+                    .count(),
+                1,
+                "loading history is not a turn: exactly the stored answer is replayed, \
+                 with no second response"
+            );
+            Ok(())
+        })
+        .await
+        .expect("v2 resume boundary client failed");
+
+    tokio::time::timeout(TIMEOUT, agent_task)
+        .await
+        .expect("agent run_with did not finish")
+        .expect("agent run_with task panicked")
+        .expect("agent run_with returned an error");
+}
+
 /// `session/resume` that omits `replayFrom` resumes **without** replaying.
 #[tokio::test]
 async fn v2_resume_without_replay_from_does_not_replay() {

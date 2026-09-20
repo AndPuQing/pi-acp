@@ -1414,6 +1414,90 @@ async fn load_session_surfaces_get_messages_failure() {
     result.expect("connection should complete");
 }
 
+/// `session/load` publishes the restored history **before** its response, so the
+/// response is the client's completion boundary.
+///
+/// Loading is not a turn: this test never prompts, and every frame that arrives
+/// before the response is the stored conversation. The ACP SDK holds each
+/// notification callback to completion before routing the next frame, so
+/// reading the log immediately after the response is a sound assertion — a
+/// client needs no timeout to decide that history is complete.
+#[tokio::test]
+async fn load_history_is_complete_when_the_response_returns() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_path_buf();
+    let agent_dir = tmp.path().join("agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(cwd.join("AGENTS.md"), "test context").unwrap();
+    write_pi_session(&agent_dir, "old-session", &cwd.to_string_lossy());
+
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
+    );
+
+    let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+    let log_in_handler = log.clone();
+
+    Client
+        .builder()
+        .name("load-boundary-client")
+        .on_receive_notification(
+            async move |notif: SessionNotification, _cx| {
+                log_in_handler
+                    .lock()
+                    .await
+                    .push((notif.session_id.0.to_string(), notif.update.clone()));
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(agent, async |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+
+            // Everything from here on is what the load publishes.
+            let boundary = log.lock().await.len();
+
+            let loaded = cx
+                .send_request(LoadSessionRequest::new("old-session", cwd.clone()))
+                .block_task()
+                .await?;
+            assert!(loaded.config_options.is_some());
+
+            // Deliberately no `wait_for`: the response is the boundary.
+            let entries = log.lock().await;
+            let after: Vec<SessionUpdate> = entries
+                .iter()
+                .skip(boundary)
+                .map(|(_, update)| update.clone())
+                .collect();
+            let user = after
+                .iter()
+                .position(|u| matches!(u, SessionUpdate::UserMessageChunk(_)))
+                .expect(
+                    "the replayed user message must already be applied when the response returns",
+                );
+            let assistant = after
+                .iter()
+                .position(|u| matches!(u, SessionUpdate::AgentMessageChunk(_)))
+                .expect(
+                    "the replayed assistant message must already be applied when the response returns",
+                );
+            assert!(
+                user < assistant,
+                "replay preserves the stored order (user message before the answer)"
+            );
+            Ok(())
+        })
+        .await
+        .expect("load boundary client failed");
+}
+
 // ---------------------------------------------------------------------------
 // Signal handling (design §8.3)
 // ---------------------------------------------------------------------------

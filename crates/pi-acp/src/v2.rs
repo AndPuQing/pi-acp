@@ -189,17 +189,16 @@ pub async fn handle_dispatch(
                                         return Ok(Handled::Yes);
                                     }
                                 };
-                            responder.respond(to_value(converted)?)?;
                             // `replayFrom` omitted means "resume without
                             // replaying": restore the session and publish the
                             // title / commands, but no history.
                             post.replay = plan.replay;
-                            let cx_for_task = cx.clone();
+                            // Publish before responding so the response is the
+                            // client's completion boundary, matching the v1
+                            // `session/load` handler.
                             let protocol = agent.protocol();
-                            cx.spawn(async move {
-                                post.send(&cx_for_task, protocol).await;
-                                Ok(())
-                            })?;
+                            post.send(cx, protocol).await;
+                            responder.respond(to_value(converted)?)?;
                             Ok(Handled::Yes)
                         }
                         Err(e) => {

@@ -213,8 +213,13 @@ impl NewSessionPostResponse {
     }
 }
 
-/// Notifications that must be sent only after the `session/load` response is
-/// queued. This keeps replay and command discovery attached to a known session.
+/// What a `session/load` publishes around its response.
+///
+/// It is sent *before* the response is queued, so the response is the client's
+/// completion boundary: the restored title, every replayed history frame and
+/// the command advertisement have all been published by the time it arrives.
+/// (A `session/new` publishes after its response instead, because there the
+/// client learns the session id from that response.)
 pub(crate) struct LoadSessionPostResponse {
     pub(crate) session: Arc<PiAcpSession>,
     history: Value,
@@ -464,13 +469,19 @@ impl AcpAgent {
                     let result = agent.handle_load_session(&req, &cx).await;
                     match result {
                         Ok((resp, post_response)) => {
-                            responder.respond(resp)?;
-                            let cx_for_task = cx.clone();
+                            // Publish the restored history *before* the
+                            // response. ACP v2's `session/resume` states it
+                            // ("the agent should replay conversation history
+                            // before responding"), and a client that treats the
+                            // response as its completion boundary needs the
+                            // history to have been sent by then.
+                            //
+                            // Unlike `session/new`, the id here is supplied by
+                            // the client, so waiting for the response before
+                            // publishing has no session-registration purpose.
                             let protocol = agent.protocol();
-                            cx.spawn(async move {
-                                post_response.send(&cx_for_task, protocol).await;
-                                Ok(())
-                            })
+                            post_response.send(&cx, protocol).await;
+                            responder.respond(resp)
                         }
                         Err(e) => responder.respond_with_error(e),
                     }

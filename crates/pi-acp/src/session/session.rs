@@ -48,13 +48,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::MessageId;
-use agent_client_protocol::schema::v1::{
-    ConfigOptionUpdate, ContentBlock, Cost, CurrentModeUpdate, Diff, PermissionOption,
-    PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UsageUpdate,
-};
+use agent_client_protocol::schema::v1::{SessionId, ToolCallStatus};
 use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -296,8 +290,21 @@ fn clear_thinking_stamp(
 /// [`spawn_outbound_connector`]; tests record and answer it directly.
 #[derive(Debug)]
 pub enum OutboundMessage {
-    /// A `session/update` notification (full frame, including the session id).
-    Notify(SessionNotification),
+    /// A session metadata update (title / timestamp / adapter `_meta`).
+    SessionInfo(SessionInfoFact),
+    /// A context-window / cost update.
+    Usage(UsageFact),
+    /// The session's current mode. v1 renders `current_mode_update`; v2 dropped
+    /// session modes and renders nothing.
+    Mode(ModeFact),
+    /// A full replacement of the session's config options.
+    ConfigOptions(ConfigOptionsFact),
+    /// A full replacement of the session's available commands.
+    AvailableCommands(AvailableCommandsFact),
+    /// A non-bash tool call upsert.
+    ToolCall(ToolCallFact),
+    /// A resource-link content chunk (the `/export` result).
+    LinkChunk(LinkChunkFact),
     /// A streamed text chunk, in the neutral form both protocols render from.
     ///
     /// v2 made `messageId` **required** on a chunk while v1 left it optional,
@@ -336,12 +343,8 @@ pub enum OutboundMessage {
     /// converted at the boundary.
     BashToolCall(BashToolCall),
     /// A `session/request_permission` request; the answer is delivered back on
-    /// the oneshot. If the responder is dropped without sending, the request
-    /// is treated as cancelled by the caller.
-    RequestPermission(
-        RequestPermissionRequest,
-        oneshot::Sender<std::result::Result<RequestPermissionResponse, AcpxError>>,
-    ),
+    /// the oneshot.
+    RequestPermission(PermissionRequest),
     /// Ordering barrier (S8 / D4): acknowledged once everything sent before it
     /// has been forwarded to the connection. The pump awaits this before
     /// resolving a turn so streamed notifications are never overtaken by the
@@ -443,6 +446,366 @@ pub enum ForegroundState {
     Idle(StopReason),
 }
 
+// ---------------------------------------------------------------------------
+// Neutral facts for the remaining outbound updates
+// ---------------------------------------------------------------------------
+//
+// Everything below states *what* changed; each protocol's renderer in
+// [`crate::render`] builds its own frame from the fact. The facts deliberately
+// avoid v1 frame types, because v1 and v2 diverge on several of them (a config
+// option's key, a diff's shape, a first-time tool call) and a fact that already
+// picked a version could only be converted — the failure mode this module
+// exists to remove.
+
+/// The shared `_meta` map shape both protocols use.
+pub type Meta = serde_json::Map<String, serde_json::Value>;
+
+/// A session metadata update (title, timestamp, adapter `_meta`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfoFact {
+    /// The session this update belongs to.
+    pub session_id: SessionId,
+    /// The new title, when the update carries one.
+    pub title: Option<String>,
+    /// ISO 8601 timestamp of last activity, when the update carries one.
+    pub updated_at: Option<String>,
+    /// Adapter-specific `_meta`.
+    pub meta: Option<Meta>,
+}
+
+/// A context-window / cost update.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageFact {
+    /// The session this update belongs to.
+    pub session_id: SessionId,
+    /// Tokens currently in context.
+    pub used: u64,
+    /// Total context window size in tokens.
+    pub size: u64,
+    /// Cumulative cost, when pi reports one.
+    pub cost: Option<CostFact>,
+}
+
+/// Cumulative session cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostFact {
+    /// The amount in `currency`.
+    pub amount: f64,
+    /// The ISO 4217 currency code.
+    pub currency: String,
+}
+
+/// The session's current mode.
+///
+/// v1 publishes this as `current_mode_update`; v2 removed session modes and
+/// expresses them as config options, so its renderer produces no frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeFact {
+    /// The session this update belongs to.
+    pub session_id: SessionId,
+    /// The mode id pi settled on.
+    pub mode_id: String,
+}
+
+/// A full replacement of the session's config options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOptionsFact {
+    /// The session this update belongs to.
+    pub session_id: SessionId,
+    /// The complete option set.
+    pub options: Vec<ConfigOptionFact>,
+}
+
+/// One config option, in the select style pi-acp publishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOptionFact {
+    /// The option's id (`model`, `thought_level`).
+    pub id: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Optional semantic category (UX only).
+    pub category: Option<ConfigCategoryFact>,
+    /// The currently selected value id.
+    pub current_value: String,
+    /// The selectable values.
+    pub choices: Vec<ConfigChoiceFact>,
+    /// Option-scoped `_meta`.
+    pub meta: Option<Meta>,
+}
+
+/// One selectable value of a config option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChoiceFact {
+    /// The value id.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Value-scoped `_meta`.
+    pub meta: Option<Meta>,
+}
+
+/// The semantic category of a config option (UX only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCategoryFact {
+    /// Session mode selector.
+    Mode,
+    /// Model selector.
+    Model,
+    /// Model-related configuration parameter.
+    ModelConfig,
+    /// Thought/reasoning level selector.
+    ThoughtLevel,
+    /// A category this adapter does not model.
+    Other(String),
+}
+
+/// A full replacement of the session's available commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableCommandsFact {
+    /// The session this update belongs to.
+    pub session_id: SessionId,
+    /// The complete command set.
+    pub commands: Vec<AvailableCommandFact>,
+}
+
+/// One available command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableCommandFact {
+    /// The command name (without the leading slash).
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Optional hint for the command's input.
+    pub input_hint: Option<String>,
+    /// Command-scoped `_meta`.
+    pub meta: Option<Meta>,
+}
+
+/// A non-bash tool call, in the upsert form both protocols can express.
+///
+/// v1 opens a call with a full `tool_call` frame and patches it with
+/// `tool_call_update`; v2 has only the patch-style `tool_call_update`, so
+/// `first` only changes what v1 renders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallFact {
+    /// The session this call belongs to.
+    pub session_id: SessionId,
+    /// The call's id.
+    pub tool_call_id: String,
+    /// Whether this frame opens the call (v1 renders a full `tool_call`).
+    pub first: bool,
+    /// Human-readable title; required when `first`.
+    pub title: Option<String>,
+    /// The tool category.
+    pub kind: Option<ToolKindFact>,
+    /// Where the call is in its lifecycle.
+    pub status: Option<ToolStatusFact>,
+    /// Content produced so far, when this frame carries any.
+    pub content: Option<Vec<ToolContentFact>>,
+    /// File locations the call touches.
+    pub locations: Vec<ToolLocationFact>,
+    /// Raw input parameters.
+    pub raw_input: Option<Value>,
+    /// Raw output, when this frame carries any.
+    pub raw_output: Option<Value>,
+    /// Call-scoped `_meta`.
+    pub meta: Option<Meta>,
+}
+
+/// A tool category both protocols name the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolKindFact {
+    /// Reading files or data.
+    Read,
+    /// Modifying files or content.
+    Edit,
+    /// Removing files or data.
+    Delete,
+    /// Moving or renaming files.
+    Move,
+    /// Searching for information.
+    Search,
+    /// Running commands or code.
+    Execute,
+    /// Internal reasoning or planning.
+    Think,
+    /// Retrieving external data.
+    Fetch,
+    /// Switching the current session mode.
+    SwitchMode,
+    /// Other tool types.
+    Other,
+    /// A category this adapter does not model.
+    Unknown(String),
+}
+
+impl From<agent_client_protocol::schema::v1::ToolKind> for ToolKindFact {
+    fn from(kind: agent_client_protocol::schema::v1::ToolKind) -> Self {
+        use agent_client_protocol::schema::v1::ToolKind as K;
+        match kind {
+            K::Read => Self::Read,
+            K::Edit => Self::Edit,
+            K::Delete => Self::Delete,
+            K::Move => Self::Move,
+            K::Search => Self::Search,
+            K::Execute => Self::Execute,
+            K::Think => Self::Think,
+            K::Fetch => Self::Fetch,
+            K::SwitchMode => Self::SwitchMode,
+            K::Other => Self::Other,
+            other => Self::Unknown(format!("{other:?}")),
+        }
+    }
+}
+
+/// A tool-call lifecycle status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolStatusFact {
+    /// Streamed but not yet executed.
+    Pending,
+    /// Running.
+    InProgress,
+    /// Ended successfully.
+    Completed,
+    /// Ended with an error.
+    Failed,
+    /// A status this adapter does not model.
+    Unknown(String),
+}
+
+impl From<agent_client_protocol::schema::v1::ToolCallStatus> for ToolStatusFact {
+    fn from(status: agent_client_protocol::schema::v1::ToolCallStatus) -> Self {
+        use agent_client_protocol::schema::v1::ToolCallStatus as S;
+        match status {
+            S::Pending => Self::Pending,
+            S::InProgress => Self::InProgress,
+            S::Completed => Self::Completed,
+            S::Failed => Self::Failed,
+            other => Self::Unknown(format!("{other:?}")),
+        }
+    }
+}
+
+/// Content a tool call produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolContentFact {
+    /// A plain text result.
+    Text(String),
+    /// A structured file modification.
+    Diff {
+        /// The file's path (absolute, as pi reported it).
+        path: String,
+        /// The file's contents after the change.
+        new_text: String,
+        /// The file's contents before the change (`None` when the file is new).
+        old_text: Option<String>,
+    },
+}
+
+/// A file location a tool call touches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolLocationFact {
+    /// The absolute path.
+    pub path: String,
+    /// Optional 1-based line number.
+    pub line: Option<u32>,
+}
+
+impl From<agent_client_protocol::schema::v1::ToolCallLocation> for ToolLocationFact {
+    fn from(location: agent_client_protocol::schema::v1::ToolCallLocation) -> Self {
+        Self {
+            path: location.path.to_string_lossy().into_owned(),
+            line: location.line,
+        }
+    }
+}
+
+/// A resource-link content chunk (the `/export` result).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkChunkFact {
+    /// The session this chunk belongs to.
+    pub session_id: SessionId,
+    /// The message this chunk belongs to; v2 requires one and mints it when
+    /// absent.
+    pub message_id: Option<String>,
+    /// Human-readable name shown for the link.
+    pub name: String,
+    /// The link target URI.
+    pub uri: String,
+    /// Optional MIME type.
+    pub mime_type: Option<String>,
+    /// Optional display title.
+    pub title: Option<String>,
+}
+
+/// A `session/request_permission` request, in the neutral form each protocol
+/// renderer builds its own request from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRequestFact {
+    /// The session the request belongs to.
+    pub session_id: SessionId,
+    /// The id of the tool call (or extension prompt) being approved.
+    pub tool_call_id: String,
+    /// Human-readable title shown to the user.
+    pub title: String,
+    /// The raw input behind the prompt.
+    pub raw_input: Value,
+    /// The choices offered.
+    pub options: Vec<PermissionOptionFact>,
+    /// Request-scoped `_meta`.
+    pub meta: Option<Meta>,
+}
+
+/// One permission choice offered to the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOptionFact {
+    /// The option id echoed back in a `Selected` outcome.
+    pub id: String,
+    /// Human-readable label.
+    pub name: String,
+    /// How the choice should be treated.
+    pub kind: PermissionOptionKindFact,
+}
+
+/// The kind of a permission choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionOptionKindFact {
+    /// Approve this one request.
+    AllowOnce,
+    /// Approve this and future requests.
+    AllowAlways,
+    /// Reject this one request.
+    RejectOnce,
+    /// Reject this and future requests.
+    RejectAlways,
+    /// A kind this adapter does not model.
+    Unknown(String),
+}
+
+/// The client's answer to a permission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionOutcomeFact {
+    /// The client chose `option_id`.
+    Selected(String),
+    /// The client dismissed the request (or chose something unmappable).
+    Cancelled,
+}
+
+/// A `session/request_permission` in flight; the answer is delivered back on
+/// the oneshot. If the responder is dropped without sending, the request is
+/// treated as cancelled by the caller.
+#[derive(Debug)]
+pub struct PermissionRequest {
+    /// The protocol-neutral request.
+    pub request: PermissionRequestFact,
+    /// Where the answer is delivered.
+    pub respond: oneshot::Sender<std::result::Result<PermissionOutcomeFact, AcpxError>>,
+}
+
 /// Parameters for spawning a session (S6 agent wiring / tests).
 pub struct SessionParams {
     /// `pi` executable to spawn.
@@ -464,11 +827,6 @@ pub struct SessionParams {
     pub additional_directories: Vec<PathBuf>,
     /// Outbound ACP message sink (see [`OutboundMessage`]).
     pub outbound: mpsc::Sender<OutboundMessage>,
-    /// The negotiated ACP version (W-562). The v2-only emissions (the
-    /// `agent_message` patch and `state_update`) are gated on it here, at the
-    /// source, so a v1 connection never puts them on the wire at all — the
-    /// boundary then only has to *convert*, not discard.
-    pub protocol: crate::protocol::Protocol,
     /// Optional pi session file to resume (`--session <path>`; used by
     /// `session/load`).
     pub session_path: Option<PathBuf>,
@@ -1572,15 +1930,61 @@ impl Pump {
 
     // --- outbound helpers ---
 
-    async fn emit(&mut self, update: SessionUpdate) {
-        let notif = SessionNotification::new(self.session_id.clone(), update);
-        if self
-            .outbound
-            .send(OutboundMessage::Notify(notif))
-            .await
-            .is_err()
-        {
+    /// Hand one protocol-neutral fact to the outbound sink, which renders it
+    /// into the connection's own protocol frame (see [`crate::render`]).
+    async fn emit_fact(&mut self, message: OutboundMessage) {
+        if self.outbound.send(message).await.is_err() {
             tracing::debug!("outbound sink closed; dropping session update");
+        }
+    }
+
+    /// Publish a session metadata update (title / timestamp / adapter `_meta`).
+    async fn emit_session_info(&mut self, fact: SessionInfoFact) {
+        self.emit_fact(OutboundMessage::SessionInfo(fact)).await;
+    }
+
+    /// Publish a context-window / cost update.
+    async fn emit_usage(&mut self, fact: UsageFact) {
+        self.emit_fact(OutboundMessage::Usage(fact)).await;
+    }
+
+    /// Publish the session's current mode (v1 only; v2 renders nothing).
+    async fn emit_mode(&mut self, mode_id: String) {
+        self.emit_fact(OutboundMessage::Mode(ModeFact {
+            session_id: self.session_id.clone(),
+            mode_id,
+        }))
+        .await;
+    }
+
+    /// Publish a full replacement of the session's config options.
+    async fn emit_config_options(&mut self, options: Vec<ConfigOptionFact>) {
+        self.emit_fact(OutboundMessage::ConfigOptions(ConfigOptionsFact {
+            session_id: self.session_id.clone(),
+            options,
+        }))
+        .await;
+    }
+
+    /// Publish a non-bash tool call upsert.
+    async fn emit_tool_call(&mut self, fact: ToolCallFact) {
+        self.emit_fact(OutboundMessage::ToolCall(fact)).await;
+    }
+
+    /// The scaffold of a non-bash tool call frame from this session.
+    fn tool_fact(&self, tool_call_id: &str, first: bool) -> ToolCallFact {
+        ToolCallFact {
+            session_id: self.session_id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            first,
+            title: None,
+            kind: None,
+            status: None,
+            content: None,
+            locations: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            meta: None,
         }
     }
 
@@ -1757,8 +2161,13 @@ impl Pump {
         .as_object()
         .expect("static queueDepth meta")
         .clone();
-        let update = SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(meta));
-        self.emit(update).await;
+        self.emit_session_info(SessionInfoFact {
+            session_id: self.session_id.clone(),
+            title: None,
+            updated_at: None,
+            meta: Some(meta),
+        })
+        .await;
     }
 
     /// Emit an ACP `usage_update` from pi's assistant-message usage (decision
@@ -1781,13 +2190,21 @@ impl Pump {
         if used == 0 && !usage.cost.as_ref().is_some_and(|c| c.total > 0.0) {
             return;
         }
-        let mut update = UsageUpdate::new(used, size);
-        if let Some(cost) = &usage.cost {
-            if cost.total > 0.0 {
-                update = update.cost(Cost::new(cost.total, "USD"));
-            }
-        }
-        self.emit(SessionUpdate::UsageUpdate(update)).await;
+        let cost = usage
+            .cost
+            .as_ref()
+            .filter(|cost| cost.total > 0.0)
+            .map(|cost| CostFact {
+                amount: cost.total,
+                currency: "USD".to_string(),
+            });
+        self.emit_usage(UsageFact {
+            session_id: self.session_id.clone(),
+            used,
+            size,
+            cost,
+        })
+        .await;
     }
 
     /// Emit the initial zero-use context window. This is separate from
@@ -1797,8 +2214,13 @@ impl Pump {
         let Some(size) = self.context_window else {
             return;
         };
-        self.emit(SessionUpdate::UsageUpdate(UsageUpdate::new(0, size)))
-            .await;
+        self.emit_usage(UsageFact {
+            session_id: self.session_id.clone(),
+            used: 0,
+            size,
+            cost: None,
+        })
+        .await;
     }
 
     /// pi's streaming `message_update` can carry an empty usage snapshot. The
@@ -1826,10 +2248,7 @@ impl Pump {
     /// `set_thinking_level` / `set_model`, the agent's explicit refresh has
     /// already re-read the same post-set state — skip the duplicate re-read.
     async fn on_thinking_level_changed(&mut self, level: ThinkingLevel) {
-        self.emit(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
-            level.id(),
-        )))
-        .await;
+        self.emit_mode(level.id().to_string()).await;
         if thinking_event_is_echo(
             *self.thinking_set_at.lock().unwrap(),
             std::time::Instant::now(),
@@ -1888,10 +2307,7 @@ impl Pump {
         {
             options.insert(0, model_option);
         }
-        self.emit(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-            options,
-        )))
-        .await;
+        self.emit_config_options(options).await;
     }
 
     async fn on_event(&mut self, ev: RpcEvent) {
@@ -2001,10 +2417,13 @@ impl Pump {
             // title stays live (fixes #102/#24).
             RpcEvent::SessionInfoChanged { name } => {
                 if let Some(name) = name {
-                    let update = SessionInfoUpdate::new()
-                        .title(name)
-                        .updated_at(utc_now_iso8601());
-                    self.emit(SessionUpdate::SessionInfoUpdate(update)).await;
+                    self.emit_session_info(SessionInfoFact {
+                        session_id: self.session_id.clone(),
+                        title: Some(name),
+                        updated_at: Some(utc_now_iso8601()),
+                        meta: None,
+                    })
+                    .await;
                 }
             }
             // pi changed the thinking level itself: push both selectors so
@@ -2391,24 +2810,19 @@ impl Pump {
         } else if existing.is_none() {
             self.current_tool_calls
                 .insert(tool_call_id.to_string(), TrackedStatus::Pending);
-            let mut call = ToolCall::new(tool_call_id.to_string(), tool_name.to_string())
-                .kind(to_tool_kind(tool_name))
-                .status(acp_status(status))
-                .locations(locations);
-            if let Some(input) = raw_input {
-                call = call.raw_input(input);
-            }
-            self.emit(SessionUpdate::ToolCall(call)).await;
+            let mut fact = self.tool_fact(tool_call_id, true);
+            fact.title = Some(tool_name.to_string());
+            fact.kind = Some(to_tool_kind(tool_name).into());
+            fact.status = Some(acp_status(status).into());
+            fact.locations = locations.into_iter().map(ToolLocationFact::from).collect();
+            fact.raw_input = raw_input;
+            self.emit_tool_call(fact).await;
         } else {
-            let fields = ToolCallUpdateFields::new()
-                .status(Some(acp_status(status)))
-                .locations(Some(locations))
-                .raw_input(raw_input);
-            self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                tool_call_id.to_string(),
-                fields,
-            )))
-            .await;
+            let mut fact = self.tool_fact(tool_call_id, false);
+            fact.status = Some(acp_status(status).into());
+            fact.locations = locations.into_iter().map(ToolLocationFact::from).collect();
+            fact.raw_input = raw_input;
+            self.emit_tool_call(fact).await;
         }
     }
 
@@ -2462,23 +2876,16 @@ impl Pump {
         }
 
         let locations = to_tool_call_locations(args, &self.cwd, line);
+        let mut fact = self.tool_fact(tool_call_id, existing.is_none());
         if existing.is_none() {
-            let call = ToolCall::new(tool_call_id.to_string(), tool_name.to_string())
-                .status(ToolCallStatus::InProgress)
-                .locations(locations)
-                .raw_input(args.clone());
-            self.emit(SessionUpdate::ToolCall(call)).await;
-        } else {
-            let fields = ToolCallUpdateFields::new()
-                .status(Some(ToolCallStatus::InProgress))
-                .locations(Some(locations))
-                .raw_input(Some(args.clone()));
-            self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                tool_call_id.to_string(),
-                fields,
-            )))
-            .await;
+            fact.title = Some(tool_name.to_string());
         }
+        // The v1 first frame here carries no explicit kind, matching the old
+        // builder exactly (a `tool_call` defaults to `other`).
+        fact.status = Some(ToolCallStatus::InProgress.into());
+        fact.locations = locations.into_iter().map(ToolLocationFact::from).collect();
+        fact.raw_input = Some(args.clone());
+        self.emit_tool_call(fact).await;
     }
 
     async fn on_tool_execution_update(&mut self, tool_call_id: &str, partial_result: &Value) {
@@ -2503,28 +2910,15 @@ impl Pump {
         } else {
             tool_result_to_text(partial_result)
         };
-        let content = if text.is_empty() {
-            None
-        } else {
-            Some(vec![ToolCallContent::Content(
-                agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
-                    TextContent::new(text),
-                )),
-            )])
-        };
-        let fields = ToolCallUpdateFields::new()
-            .status(Some(ToolCallStatus::InProgress))
-            .content(content)
-            .raw_output(if is_file_mutation {
-                None
-            } else {
-                Some(partial_result.clone())
-            });
-        self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-            tool_call_id.to_string(),
-            fields,
-        )))
-        .await;
+        let mut fact = self.tool_fact(tool_call_id, false);
+        fact.status = Some(ToolCallStatus::InProgress.into());
+        if !text.is_empty() {
+            fact.content = Some(vec![ToolContentFact::Text(text)]);
+        }
+        if !is_file_mutation {
+            fact.raw_output = Some(partial_result.clone());
+        }
+        self.emit_tool_call(fact).await;
     }
 
     async fn on_tool_execution_end(&mut self, tool_call_id: &str, result: &Value, is_error: bool) {
@@ -2549,7 +2943,7 @@ impl Pump {
 
         let text = tool_result_to_text(result);
         let snapshot = self.file_snapshots.get(tool_call_id).cloned();
-        let mut content: Vec<ToolCallContent> = Vec::new();
+        let mut content: Option<Vec<ToolContentFact>> = None;
         let mut has_structured_diff = false;
 
         if !is_error {
@@ -2560,43 +2954,34 @@ impl Pump {
                         || Some(new_text.as_str()) != snap.old_text.as_deref()
                     {
                         has_structured_diff = true;
-                        content = vec![ToolCallContent::Diff(
-                            Diff::new(snap.path.clone(), new_text).old_text(snap.old_text.clone()),
-                        )];
+                        content = Some(vec![ToolContentFact::Diff {
+                            path: snap.path.clone(),
+                            new_text,
+                            old_text: snap.old_text.clone(),
+                        }]);
                     }
                 }
             }
         }
 
         if !has_structured_diff && !text.is_empty() {
-            content = vec![ToolCallContent::Content(
-                agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
-                    TextContent::new(text),
-                )),
-            )];
+            content = Some(vec![ToolContentFact::Text(text)]);
         }
 
-        let fields = ToolCallUpdateFields::new()
-            .status(Some(if is_error {
+        let mut fact = self.tool_fact(tool_call_id, false);
+        fact.status = Some(
+            if is_error {
                 ToolCallStatus::Failed
             } else {
                 ToolCallStatus::Completed
-            }))
-            .content(if content.is_empty() {
-                None
-            } else {
-                Some(content)
-            })
-            .raw_output(if has_structured_diff {
-                None
-            } else {
-                Some(result.clone())
-            });
-        self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-            tool_call_id.to_string(),
-            fields,
-        )))
-        .await;
+            }
+            .into(),
+        );
+        fact.content = content;
+        if !has_structured_diff {
+            fact.raw_output = Some(result.clone());
+        }
+        self.emit_tool_call(fact).await;
 
         self.cleanup_tool_call(tool_call_id);
     }
@@ -2768,96 +3153,81 @@ pub fn spawn_outbound_connector(
 ) -> std::result::Result<(), AcpxError> {
     let _: tokio::task::JoinHandle<std::result::Result<(), AcpxError>> = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            // One unconvertible frame must not end the connection. The pump is
+            // One unrenderable frame must not end the connection. The pump is
             // the only path a session update has to the wire, so returning here
             // on a single failure silently drops every later update — including
             // the rest of a running turn, which then looks like a model that
             // produced no answer. The failure is logged and the connector keeps
             // going; `Flush` still acks so nothing that waits on it hangs.
             let result: std::result::Result<(), AcpxError> = match msg {
-                OutboundMessage::Notify(notif) => {
-                    // Every session update crosses the protocol boundary here,
-                    // so no unconverted frame reaches the wire.
-                    crate::protocol::send_session_update(&conn, protocol, notif)
+                OutboundMessage::SessionInfo(fact) => {
+                    crate::render::send_session_info(&conn, protocol, &fact)
+                }
+                OutboundMessage::Usage(fact) => crate::render::send_usage(&conn, protocol, &fact),
+                OutboundMessage::Mode(fact) => crate::render::send_mode(&conn, protocol, &fact),
+                OutboundMessage::ConfigOptions(fact) => {
+                    crate::render::send_config_options(&conn, protocol, &fact)
+                }
+                OutboundMessage::AvailableCommands(fact) => {
+                    crate::render::send_available_commands(&conn, protocol, &fact)
+                }
+                OutboundMessage::ToolCall(fact) => {
+                    crate::render::send_tool_call(&conn, protocol, &fact)
+                }
+                OutboundMessage::LinkChunk(fact) => {
+                    crate::render::send_link_chunk(&conn, protocol, &fact)
+                }
+                OutboundMessage::TextChunk(chunk) => {
+                    crate::render::send_text_chunk(&conn, protocol, &chunk)
                 }
                 OutboundMessage::BashToolCall(call) => {
                     // A bash call is rendered natively for the connection's
                     // protocol: v1 gets its embedded-terminal `tool_call`,
                     // v2 its agent-owned-terminal `tool_call_update`. Nothing
                     // is converted between the two (see [`crate::render`]).
-                    #[cfg(feature = "protocol-v2")]
-                    {
-                        if protocol.is_v2() {
-                            send_v2_frames(&conn, crate::render::bash_v2_frames(&call))
-                        } else {
-                            send_v1_frames(&conn, crate::render::bash_v1_frames(&call))
+                    let mut result = Ok(());
+                    if protocol.is_v2() {
+                        for frame in crate::render::bash_v2_frames(&call) {
+                            if let Err(e) = crate::render::send_v2(&conn, frame) {
+                                result = Err(e);
+                            }
+                        }
+                    } else {
+                        for frame in crate::render::bash_v1_frames(&call) {
+                            if let Err(e) = crate::render::send_v1(&conn, frame) {
+                                result = Err(e);
+                            }
                         }
                     }
-                    #[cfg(not(feature = "protocol-v2"))]
-                    {
-                        let _ = protocol;
-                        send_v1_frames(&conn, crate::render::bash_v1_frames(&call))
-                    }
-                }
-                OutboundMessage::TextChunk(chunk) => {
-                    // A streamed chunk is rendered natively for the protocol:
-                    // v1's `messageId` is optional, v2's is required and filled
-                    // here for anonymous producers. Nothing is converted.
-                    #[cfg(feature = "protocol-v2")]
-                    {
-                        if protocol.is_v2() {
-                            let _ = conn.send_notification(crate::render::text_chunk_v2(&chunk));
-                            Ok(())
-                        } else {
-                            send_v1_frames(&conn, vec![crate::render::text_chunk_v1(&chunk)])
-                        }
-                    }
-                    #[cfg(not(feature = "protocol-v2"))]
-                    {
-                        let _ = protocol;
-                        send_v1_frames(&conn, vec![crate::render::text_chunk_v1(&chunk)])
-                    }
+                    result
                 }
                 OutboundMessage::MessagePatch(patch) => {
                     // v1 has no complete-message update; the v2 renderer builds
                     // `agent_message` directly.
-                    #[cfg(feature = "protocol-v2")]
-                    {
-                        if protocol.is_v2() {
-                            let _ = conn.send_notification(crate::render::message_patch_v2(&patch));
-                        }
+                    if protocol.is_v2() {
+                        crate::render::send_v2(&conn, crate::render::message_patch_v2(&patch))
+                    } else {
+                        Ok(())
                     }
-                    #[cfg(not(feature = "protocol-v2"))]
-                    {
-                        let _ = protocol;
-                        let _ = patch;
-                    }
-                    Ok(())
                 }
                 OutboundMessage::Foreground { session_id, state } => {
                     // v2 gets a native `state_update`; v1 reports completion in
                     // the prompt response and has no such update type.
-                    #[cfg(feature = "protocol-v2")]
-                    {
-                        if protocol.is_v2() {
-                            let _ = conn.send_notification(crate::render::foreground_v2(
-                                &session_id,
-                                state,
-                            ));
-                        }
+                    if protocol.is_v2() {
+                        crate::render::send_v2(
+                            &conn,
+                            crate::render::foreground_v2(&session_id, state),
+                        )
+                    } else {
+                        Ok(())
                     }
-                    #[cfg(not(feature = "protocol-v2"))]
-                    {
-                        let _ = (&session_id, state);
-                    }
-                    let _ = protocol;
-                    Ok(())
                 }
-                OutboundMessage::RequestPermission(request, respond) => {
+                OutboundMessage::RequestPermission(permission) => {
                     let conn = conn.clone();
                     tokio::spawn(async move {
+                        let PermissionRequest { request, respond } = permission;
                         let response =
-                            crate::protocol::request_permission(&conn, protocol, request).await;
+                            crate::render::send_permission_request(&conn, protocol, &request).await;
                         let _ = respond.send(response);
                     });
                     Ok(())
@@ -2876,44 +3246,6 @@ pub fn spawn_outbound_connector(
         Ok(())
     });
     Ok(())
-}
-
-/// Send a protocol frame, translating a transport failure into an error.
-///
-/// A send failure is reported but never aborts the loop: the caller logs it and
-/// keeps forwarding, because one bad frame must not end the connection.
-fn send_v1_frames(
-    conn: &ConnectionTo<Client>,
-    frames: Vec<agent_client_protocol::schema::v1::SessionNotification>,
-) -> std::result::Result<(), AcpxError> {
-    let mut result = Ok(());
-    for notif in frames {
-        if let Err(e) = conn.send_notification(notif) {
-            result = Err(AcpxError::RpcFailed {
-                command: "session/update".into(),
-                message: e.to_string(),
-            });
-        }
-    }
-    result
-}
-
-/// Send a native v2 frame, with the same never-abort contract as the v1 path.
-#[cfg(feature = "protocol-v2")]
-fn send_v2_frames(
-    conn: &ConnectionTo<Client>,
-    frames: Vec<agent_client_protocol_schema::v2::UpdateSessionNotification>,
-) -> std::result::Result<(), AcpxError> {
-    let mut result = Ok(());
-    for notif in frames {
-        if let Err(e) = conn.send_notification(notif) {
-            result = Err(AcpxError::RpcFailed {
-                command: "session/update".into(),
-                message: e.to_string(),
-            });
-        }
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -3034,21 +3366,19 @@ async fn handle_extension_select(
     if raw_options.is_empty() {
         return Some(cancelled(id));
     }
-    let permission_options: Vec<PermissionOption> = raw_options
+    let permission_options: Vec<PermissionOptionFact> = raw_options
         .iter()
         .enumerate()
-        .map(|(i, name)| {
-            PermissionOption::new(
-                format!("{CHOICE_PREFIX}{i}"),
-                name.clone(),
-                PermissionOptionKind::AllowOnce,
-            )
+        .map(|(i, name)| PermissionOptionFact {
+            id: format!("{CHOICE_PREFIX}{i}"),
+            name: name.clone(),
+            kind: PermissionOptionKindFact::AllowOnce,
         })
         .collect();
 
     match request_permission(session_id, id, title, req, permission_options, outbound).await {
-        Ok(RequestPermissionOutcome::Selected(selected)) => {
-            let idx = option_index(selected.option_id.0.as_ref());
+        Ok(PermissionOutcomeFact::Selected(option_id)) => {
+            let idx = option_index(&option_id);
             match idx.and_then(|i| raw_options.get(i)) {
                 Some(value) => Some(ExtensionUiResponse::Value {
                     id: id.to_string(),
@@ -3070,13 +3400,21 @@ async fn handle_extension_confirm(
     outbound: &mpsc::Sender<OutboundMessage>,
 ) -> Option<ExtensionUiResponse> {
     let permission_options = vec![
-        PermissionOption::new(CONFIRM_YES, "Yes", PermissionOptionKind::AllowOnce),
-        PermissionOption::new(CONFIRM_NO, "No", PermissionOptionKind::RejectOnce),
+        PermissionOptionFact {
+            id: CONFIRM_YES.to_string(),
+            name: "Yes".to_string(),
+            kind: PermissionOptionKindFact::AllowOnce,
+        },
+        PermissionOptionFact {
+            id: CONFIRM_NO.to_string(),
+            name: "No".to_string(),
+            kind: PermissionOptionKindFact::RejectOnce,
+        },
     ];
     match request_permission(session_id, id, title, req, permission_options, outbound).await {
-        Ok(RequestPermissionOutcome::Selected(selected)) => Some(ExtensionUiResponse::Confirmed {
+        Ok(PermissionOutcomeFact::Selected(option_id)) => Some(ExtensionUiResponse::Confirmed {
             id: id.to_string(),
-            confirmed: selected.option_id.0.as_ref() == CONFIRM_YES,
+            confirmed: option_id == CONFIRM_YES,
         }),
         _ => Some(cancelled(id)),
     }
@@ -3089,20 +3427,22 @@ async fn request_permission(
     id: &str,
     title: &str,
     req: &ExtensionUiRequest,
-    options: Vec<PermissionOption>,
+    options: Vec<PermissionOptionFact>,
     outbound: &mpsc::Sender<OutboundMessage>,
-) -> Result<RequestPermissionOutcome> {
-    let fields = ToolCallUpdateFields::new()
-        .kind(Some(ToolKind::Other))
-        .status(Some(ToolCallStatus::Pending))
-        .title(Some(title.to_string()))
-        .raw_input(Some(extension_ui_raw_input(req)));
-    let tool_call = ToolCallUpdate::new(ToolCallId::new(format!("pi-ui-{id}")), fields);
-    let request = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
-
+) -> Result<PermissionOutcomeFact> {
     let (tx, rx) = oneshot::channel();
     outbound
-        .send(OutboundMessage::RequestPermission(request, tx))
+        .send(OutboundMessage::RequestPermission(PermissionRequest {
+            request: PermissionRequestFact {
+                session_id: session_id.clone(),
+                tool_call_id: format!("pi-ui-{id}"),
+                title: title.to_string(),
+                raw_input: extension_ui_raw_input(req),
+                options,
+                meta: None,
+            },
+            respond: tx,
+        }))
         .await
         .map_err(|_| AcpxError::RpcFailed {
             command: "request_permission".into(),
@@ -3122,7 +3462,7 @@ async fn request_permission(
         command: "request_permission".into(),
         message: "permission responder dropped".into(),
     })??;
-    Ok(response.outcome)
+    Ok(response)
 }
 
 async fn send_extension_notice(
@@ -3396,11 +3736,11 @@ mod tests {
         // 10ms timeout under coarse OS timer granularity (Windows ~15.6ms),
         // flaking with "permission responder dropped".
         let waiter = tokio::spawn(async move {
-            let Some(OutboundMessage::RequestPermission(_, responder)) = outbound_rx.recv().await
+            let Some(OutboundMessage::RequestPermission(permission)) = outbound_rx.recv().await
             else {
                 panic!("permission request was not sent");
             };
-            let _hold = responder;
+            let _hold = permission.respond;
             std::future::pending::<()>().await;
         });
         let result = permission.await;

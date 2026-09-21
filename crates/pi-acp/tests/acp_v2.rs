@@ -1,9 +1,9 @@
 //! W-562: ACP **v2** end-to-end, driven **in-process** over `Channel::duplex`.
 //!
-//! pi-acp's session core is v1; the `protocol-v2` feature registers a v2
-//! implementation on the SDK's `AgentProtocolRouter`, which negotiates the
-//! version from `initialize` and then becomes a raw-frame pass-through. These
-//! tests therefore exercise the whole boundary:
+//! One pi-acp binary serves both versions: the SDK's `AgentProtocolRouter`
+//! negotiates from `initialize` and then becomes a raw-frame pass-through. The
+//! v1 and v2 implementations are native and separate (no conversion), so these
+//! tests exercise the whole v2 surface:
 //!
 //! - a real v2 `initialize` / `session/new` / `session/prompt` handshake;
 //! - `message_id` grouping across a message's chunks;
@@ -20,7 +20,6 @@
 //! no real pi and no network. The agent runs **inside** this test process, so
 //! the environment it reads is this process's own — the tests therefore mutate
 //! shared process env and are serialized by `ENV_LOCK`.
-#![cfg(feature = "protocol-v2")]
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -734,10 +733,8 @@ async fn v2_resume_rejects_unknown_replay_cursor() {
 /// Negotiation: a v2 client talking to a **v1-only** agent is told so
 /// explicitly, instead of silently running a mismatched protocol.
 ///
-/// A pi-acp built **without** the `protocol-v2` feature registers only a v1
-/// implementation. That is simulated here with a v1-only agent component — the
-/// exact shape the router sees in a feature-off build — so this asserts the
-/// negotiation failure path rather than the v2 success path.
+/// This simulates the mismatch with a v1-only agent component, so it asserts
+/// the negotiation failure path rather than the v2 success path.
 #[tokio::test]
 async fn v2_client_against_v1_only_agent_is_rejected() {
     let (agent_end, client_end) = Channel::duplex();
@@ -841,10 +838,82 @@ async fn v2_session_close_disposes_and_is_idempotent() {
         .expect("agent run_with returned an error");
 }
 
-/// A v1 client still gets v1 when the `protocol-v2` feature is compiled in:
-/// the feature adds a v2 implementation, it does not change v1 behavior.
+/// The native v2 handlers for `session/set_config_option`, `session/list` and
+/// `session/delete` answer in v2 types directly (no v1↔v2 conversion). The
+/// config-option response in particular must use v2's `configId` key.
 #[tokio::test]
-async fn v1_client_still_negotiates_v1_with_the_feature_enabled() {
+async fn v2_config_option_list_and_delete_are_native() {
+    let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let env = MockEnv::new();
+
+    let (agent_end, client_end) = Channel::duplex();
+    let agent = Arc::new(AcpAgent::new(Config::from_env()));
+    let agent_task = tokio::spawn(async move { agent.run_with(agent_end).await });
+
+    let cwd = env.cwd.clone();
+    Client
+        .v2()
+        .name("w562-v2-config-client")
+        .connect_with(client_end, async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(
+                ProtocolVersion::V2,
+                v2::Implementation::new("w562-config-client", "1.0.0"),
+            ))
+            .block_task()
+            .await?;
+
+            let created = cx
+                .send_request(v2::NewSessionRequest::new(&cwd))
+                .block_task()
+                .await?;
+            let sid = created.session_id.clone();
+
+            // v2 expresses the thinking level as a config option; setting it
+            // must answer with the refreshed v2 option set.
+            let updated = cx
+                .send_request(v2::SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    v2::SessionConfigId::new("thought_level"),
+                    v2::SessionConfigOptionValue::Id {
+                        value: v2::SessionConfigValueId::new("low"),
+                    },
+                ))
+                .block_task()
+                .await?;
+            assert!(
+                !updated.config_options.is_empty(),
+                "the v2 set_config_option response carries the refreshed options"
+            );
+
+            // `session/list` is native; the cwd filter round-trips through the
+            // v2 `AbsolutePath` type.
+            cx.send_request(v2::ListSessionsRequest::new().cwd(cwd.clone()))
+                .block_task()
+                .await?;
+
+            // `session/delete` is idempotent, like v1's.
+            cx.send_request(v2::DeleteSessionRequest::new(sid.clone()))
+                .block_task()
+                .await?;
+            cx.send_request(v2::DeleteSessionRequest::new(sid.clone()))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await
+        .expect("v2 config client failed");
+
+    tokio::time::timeout(TIMEOUT, agent_task)
+        .await
+        .expect("agent run_with did not finish")
+        .expect("agent run_with task panicked")
+        .expect("agent run_with returned an error");
+}
+
+/// A v1 client still gets v1 from the same agent that serves v2: registering a
+/// v2 implementation does not change v1 behavior.
+#[tokio::test]
+async fn v1_client_still_negotiates_v1_when_the_agent_serves_both() {
     let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     let env = MockEnv::new();
 

@@ -98,6 +98,75 @@ pub fn prompt_to_pi_message(blocks: &[ContentBlock]) -> PiPrompt {
     PiPrompt { message, images }
 }
 
+/// Convert ACP **v2** prompt content blocks into a pi message + images.
+///
+/// The v2 block set is the same idea with reshaped members (`MediaType` instead
+/// of raw strings, `AbsolutePath` resources); it is a separate function because
+/// the shared engine consumes the neutral [`PiPrompt`], not a v1 block list.
+pub fn prompt_to_pi_message_v2(
+    blocks: &[agent_client_protocol_schema::v2::ContentBlock],
+) -> PiPrompt {
+    use agent_client_protocol_schema::v2::{ContentBlock, EmbeddedResourceResource};
+    let mut message = String::new();
+    let mut images: Vec<PiImage> = Vec::new();
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text(t) => message.push_str(&t.text),
+
+            ContentBlock::ResourceLink(link) => {
+                message.push_str(&format!("\n[Context] {}", link.uri));
+            }
+
+            ContentBlock::Image(img) => {
+                images.push(PiImage {
+                    mime_type: img.mime_type.to_string(),
+                    data: img.data.clone(),
+                });
+            }
+
+            ContentBlock::Resource(resource) => match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(text) => {
+                    let mime = text
+                        .mime_type
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "text/plain".to_string());
+                    message.push_str(&format!(
+                        "\n[Embedded Context] {} ({mime})\n{}",
+                        text.uri, text.text
+                    ));
+                }
+                EmbeddedResourceResource::BlobResourceContents(blob) => {
+                    let mime = blob
+                        .mime_type
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    let bytes = base64_decoded_len(&blob.blob);
+                    message.push_str(&format!(
+                        "\n[Embedded Context] {} ({mime}, {bytes} bytes)",
+                        blob.uri
+                    ));
+                }
+                _ => {}
+            },
+
+            ContentBlock::Audio(audio) => {
+                let bytes = base64_decoded_len(&audio.data);
+                message.push_str(&format!(
+                    "\n[Audio] ({}, {bytes} bytes) not supported by pi-acp",
+                    audio.mime_type
+                ));
+            }
+
+            _ => {}
+        }
+    }
+
+    PiPrompt { message, images }
+}
+
 /// Number of decoded bytes a base64 payload carries without decoding it
 /// (mirrors `Buffer.byteLength(data, 'base64')`; lenient on malformed input).
 fn base64_decoded_len(data: &str) -> usize {

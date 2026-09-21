@@ -1,32 +1,26 @@
-//! ACP v2 boundary adapter (W-562).
+//! Native ACP v2 inbound handlers.
 //!
-//! On a v2 connection the SDK speaks **v2 method names and v2 types**, while
-//! pi-acp's whole session core is v1. Rather than re-typing the core (which the
-//! issue forbids), this module adapts at the edge: it takes the raw v2 request,
-//! maps it to the equivalent v1 request, calls the *same* v1 handler, and
-//! converts the v1 response back to v2. Outbound `session/update` notifications
-//! take the mirror-image path in [`crate::protocol`].
+//! One binary serves both versions. In `initialize` the SDK's
+//! [`AgentProtocolRouter`](agent_client_protocol::AgentProtocolRouter) decides
+//! which of two **native** implementations owns the connection; this module is
+//! the v2 one's request surface. It parses v2 method names and v2 types, drives
+//! the same shared engine as the v1 handlers (through the protocol-neutral
+//! parameters and facts in [`crate::agent`]), and builds v2 responses directly.
+//! No v1 frame is ever converted into a v2 one.
 //!
-//! Two v1→v2 conversions are lossy by design and are resolved here rather than
-//! by guessing:
+//! Two v2 design changes are handled here rather than by a converter:
 //!
-//! - **`modes`**: v2 removed session modes (`session/set_mode` is gone; modes are
-//!   expressed through config options). A v1 response carrying `modes` cannot be
-//!   converted, so the v2 response drops that field — the decision table's "v2
-//!   expresses mode via config options" — and keeps `configOptions`, which is
-//!   where pi-acp already publishes its model and thinking selectors.
-//! - **`authMethods`**: v2 requires that advertising any auth method implies
-//!   implementing the `auth/login` *and* `auth/logout` pair. pi-acp implements
-//!   `authenticate` as a no-op and has no logout; its real auth mechanism is the
-//!   v1 terminal-login affordance that v2 replaced. The v2 `initialize`
-//!   therefore omits auth methods instead of advertising RPCs it would fail.
+//! - **`replayFrom`**: v2's resume cursor has exactly two shapes, `start` and
+//!   an unknown future cursor. An unknown cursor is *rejected* rather than
+//!   guessed at (see [`plan_resume`]).
+//! - **`session/set_mode`**: v2 removed session modes, so it stays
+//!   `methodNotFound` rather than silently accepting a method v2 does not
+//!   define.
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1;
 use agent_client_protocol::{ConnectionTo, Dispatch, Handled, UntypedMessage};
 use agent_client_protocol_schema::v2;
-use agent_client_protocol_schema::v2::conversion::{try_v1_to_v2, try_v2_to_v1};
 use serde_json::Value;
 
 use crate::agent::AcpAgent;
@@ -38,8 +32,6 @@ type Client = agent_client_protocol::Client;
 const ACP_METHOD_NOT_FOUND: i32 = -32601;
 /// ACP `invalidParams` JSON-RPC code.
 const ACP_INVALID_PARAMS: i32 = -32602;
-/// ACP `internalError` JSON-RPC code.
-const ACP_INTERNAL_ERROR: i32 = -32603;
 
 fn method_not_found(method: &str, protocol: &str) -> agent_client_protocol::Error {
     agent_client_protocol::Error::new(
@@ -52,10 +44,6 @@ fn invalid_params(message: impl ToString) -> agent_client_protocol::Error {
     agent_client_protocol::Error::new(ACP_INVALID_PARAMS, message.to_string())
 }
 
-fn internal_error(message: impl ToString) -> agent_client_protocol::Error {
-    agent_client_protocol::Error::new(ACP_INTERNAL_ERROR, message.to_string())
-}
-
 fn parse<T: serde::de::DeserializeOwned>(
     params: &Value,
     method: &str,
@@ -63,31 +51,12 @@ fn parse<T: serde::de::DeserializeOwned>(
     serde_json::from_value(params.clone()).map_err(|e| invalid_params(format!("{method}: {e}")))
 }
 
-/// v2 request -> v1 request (the schema crate's own conversion).
-fn to_v1<T, U>(value: T, method: &str) -> Result<U, agent_client_protocol::Error>
-where
-    U: TryFrom<T>,
-    agent_client_protocol_schema::v2::conversion::ProtocolConversionError:
-        From<<U as TryFrom<T>>::Error>,
-{
-    try_v2_to_v1(value).map_err(|e| invalid_params(format!("{method}: {e}")))
-}
-
-/// v1 response -> v2 response (the schema crate's own conversion).
-fn to_v2<T, U>(value: T, what: &str) -> Result<U, agent_client_protocol::Error>
-where
-    U: TryFrom<T>,
-    agent_client_protocol_schema::v2::conversion::ProtocolConversionError:
-        From<<U as TryFrom<T>>::Error>,
-{
-    try_v1_to_v2(value).map_err(|e| internal_error(format!("{what}: {e}")))
-}
-
 fn to_value<T: serde::Serialize>(value: T) -> Result<Value, agent_client_protocol::Error> {
-    serde_json::to_value(value).map_err(internal_error)
+    serde_json::to_value(value)
+        .map_err(|e| invalid_params(format!("failed to serialize response: {e}")))
 }
 
-/// Handle one raw ACP v2 request by adapting it to the v1 core.
+/// Handle one raw ACP v2 request by dispatching it to the native v2 handler.
 ///
 /// Returns [`Handled::No`] for a method this adapter does not implement, so the
 /// SDK answers with `methodNotFound` rather than the adapter inventing one.
@@ -109,20 +78,14 @@ pub async fn handle_dispatch(
 
     match method.as_str() {
         "session/new" => {
-            let request: v1::NewSessionRequest =
-                to_v1(parse::<v2::NewSessionRequest>(&params, &method)?, &method)?;
-            match agent.handle_new_session(&request, cx).await {
+            let request: v2::NewSessionRequest = parse(&params, &method)?;
+            match agent.handle_new_session_v2(&request, cx).await {
                 Ok((response, post)) => {
-                    // v2 has no `modes`; drop it before converting.
-                    let mut response = response;
-                    response.modes = None;
-                    let converted: v2::NewSessionResponse =
-                        to_v2(response, "session/new response")?;
                     // Publish the empty context state before the handler
                     // returns, so a client cannot race the post-response task
                     // with its first prompt (same ordering as v1).
                     let _ = post.session.publish_initial_usage().await;
-                    responder.respond(to_value(converted)?)?;
+                    responder.respond(to_value(response)?)?;
                     let cx_for_task = cx.clone();
                     let protocol = agent.protocol();
                     cx.spawn(async move {
@@ -138,20 +101,15 @@ pub async fn handle_dispatch(
             }
         }
         "session/prompt" => {
-            let request: v1::PromptRequest =
-                to_v1(parse::<v2::PromptRequest>(&params, &method)?, &method)?;
+            let request: v2::PromptRequest = parse(&params, &method)?;
             let agent = agent.clone();
             let cx_for_task = cx.clone();
-            // The v1 handler runs the turn and responds when it settles; keep
-            // the SDK dispatch loop free for `session/cancel` by spawning.
+            // The handler runs the turn; keep the SDK dispatch loop free for
+            // `session/cancel` by spawning.
             cx.spawn(async move {
-                match agent.handle_prompt(&request, &cx_for_task).await {
-                    Ok((_response, persisted)) => {
-                        // v2 reports completion through `state_update`
-                        // (published by the session pump) and its
-                        // `PromptResponse` carries only `_meta`, so the v1
-                        // `stopReason` is intentionally not carried over.
-                        let answered = responder.respond(to_value(v2::PromptResponse::new())?);
+                match agent.handle_prompt_v2(&request, &cx_for_task).await {
+                    Ok((response, persisted)) => {
+                        let answered = responder.respond(to_value(response)?);
                         if let Some(session) = persisted {
                             agent.persist_session_if_ready(&session).await;
                         }
@@ -164,69 +122,49 @@ pub async fn handle_dispatch(
         }
         "session/resume" => {
             let request = parse::<v2::ResumeSessionRequest>(&params, &method)?;
-            match plan_resume(request) {
+            let replay = match plan_resume(&request) {
+                Ok(replay) => replay,
+                Err(e) => {
+                    responder.respond_with_error(e)?;
+                    return Ok(Handled::Yes);
+                }
+            };
+            match agent.handle_resume_session_v2(request, replay, cx).await {
+                Ok((response, post)) => {
+                    // Publish before responding so the response is the client's
+                    // completion boundary, matching the v1 `session/load`
+                    // handler.
+                    let protocol = agent.protocol();
+                    post.send(cx, protocol).await;
+                    responder.respond(to_value(response)?)?;
+                    Ok(Handled::Yes)
+                }
                 Err(e) => {
                     responder.respond_with_error(e)?;
                     Ok(Handled::Yes)
                 }
-                Ok(plan) => {
-                    let load: v1::LoadSessionRequest = match to_v1(plan.request, &method) {
-                        Ok(load) => load,
-                        Err(e) => {
-                            responder.respond_with_error(e)?;
-                            return Ok(Handled::Yes);
-                        }
-                    };
-                    match agent.handle_load_session(&load, cx).await {
-                        Ok((response, mut post)) => {
-                            let mut response = response;
-                            response.modes = None;
-                            let converted: v2::ResumeSessionResponse =
-                                match to_v2(response, "session/resume response") {
-                                    Ok(converted) => converted,
-                                    Err(e) => {
-                                        responder.respond_with_error(e)?;
-                                        return Ok(Handled::Yes);
-                                    }
-                                };
-                            // `replayFrom` omitted means "resume without
-                            // replaying": restore the session and publish the
-                            // title / commands, but no history.
-                            post.replay = plan.replay;
-                            // Publish before responding so the response is the
-                            // client's completion boundary, matching the v1
-                            // `session/load` handler.
-                            let protocol = agent.protocol();
-                            post.send(cx, protocol).await;
-                            responder.respond(to_value(converted)?)?;
-                            Ok(Handled::Yes)
-                        }
-                        Err(e) => {
-                            responder.respond_with_error(e)?;
-                            Ok(Handled::Yes)
-                        }
-                    }
-                }
             }
         }
         "session/close" => {
-            // v2 advertises this capability, so it is implemented (not just
-            // marked): closing disposes the session and is idempotent.
+            // v2's capability model has no `close` flag, but the method exists
+            // and closing is idempotent.
             let request: v2::CloseSessionRequest = parse(&params, &method)?;
-            let session_id: v1::SessionId = to_v1(request.session_id, &method)?;
-            let response = agent.handle_close_session(&session_id).await;
-            let converted: v2::CloseSessionResponse = to_v2(response, "session/close response")?;
-            responder.respond(to_value(converted)?)?;
-            Ok(Handled::Yes)
+            match agent.handle_close_session_v2(&request).await {
+                Ok(response) => {
+                    responder.respond(to_value(response)?)?;
+                    Ok(Handled::Yes)
+                }
+                Err(e) => {
+                    responder.respond_with_error(e)?;
+                    Ok(Handled::Yes)
+                }
+            }
         }
         "session/list" => {
-            let request: v1::ListSessionsRequest =
-                to_v1(parse::<v2::ListSessionsRequest>(&params, &method)?, &method)?;
-            match agent.handle_list_sessions(&request).await {
+            let request: v2::ListSessionsRequest = parse(&params, &method)?;
+            match agent.handle_list_sessions_v2(&request).await {
                 Ok(response) => {
-                    let converted: v2::ListSessionsResponse =
-                        to_v2(response, "session/list response")?;
-                    responder.respond(to_value(converted)?)?;
+                    responder.respond(to_value(response)?)?;
                     Ok(Handled::Yes)
                 }
                 Err(e) => {
@@ -236,15 +174,10 @@ pub async fn handle_dispatch(
             }
         }
         "session/delete" => {
-            let request: v1::DeleteSessionRequest = to_v1(
-                parse::<v2::DeleteSessionRequest>(&params, &method)?,
-                &method,
-            )?;
-            match agent.handle_delete_session(&request).await {
+            let request: v2::DeleteSessionRequest = parse(&params, &method)?;
+            match agent.handle_delete_session_v2(&request).await {
                 Ok(response) => {
-                    let converted: v2::DeleteSessionResponse =
-                        to_v2(response, "session/delete response")?;
-                    responder.respond(to_value(converted)?)?;
+                    responder.respond(to_value(response)?)?;
                     Ok(Handled::Yes)
                 }
                 Err(e) => {
@@ -254,15 +187,10 @@ pub async fn handle_dispatch(
             }
         }
         "session/set_config_option" => {
-            let request: v1::SetSessionConfigOptionRequest = to_v1(
-                parse::<v2::SetSessionConfigOptionRequest>(&params, &method)?,
-                &method,
-            )?;
-            match agent.handle_set_config_option(&request, cx).await {
+            let request: v2::SetSessionConfigOptionRequest = parse(&params, &method)?;
+            match agent.handle_set_config_option_v2(&request, cx).await {
                 Ok(response) => {
-                    let converted: v2::SetSessionConfigOptionResponse =
-                        to_v2(response, "session/set_config_option response")?;
-                    responder.respond(to_value(converted)?)?;
+                    responder.respond(to_value(response)?)?;
                     Ok(Handled::Yes)
                 }
                 Err(e) => {
@@ -270,6 +198,19 @@ pub async fn handle_dispatch(
                     Ok(Handled::Yes)
                 }
             }
+        }
+        "session/set_model" => {
+            // v2 has no typed request for this unstable method either, so the
+            // shared raw-JSON handler serves both versions.
+            let agent = agent.clone();
+            let cx_for_task = cx.clone();
+            cx.spawn(async move {
+                match agent.handle_set_session_model(&params, &cx_for_task).await {
+                    Ok(()) => responder.respond(serde_json::json!({})),
+                    Err(e) => responder.respond_with_error(e),
+                }
+            })?;
+            Ok(Handled::Yes)
         }
         "auth/login" => {
             // v2's successor to `authenticate`. pi-acp's is a no-op: real auth
@@ -292,15 +233,7 @@ pub async fn handle_dispatch(
     }
 }
 
-/// What a v2 `session/resume` request maps onto.
-struct ResumePlan {
-    /// The equivalent v1 load request.
-    request: v2::ResumeSessionRequest,
-    /// Whether the historical conversation should be replayed.
-    replay: bool,
-}
-
-/// Enforce v2's replay-cursor semantics.
+/// Enforce v2's replay-cursor semantics, returning whether to replay history.
 ///
 /// v2's `ReplayFrom` has exactly two shapes: `Start` (replay everything) and an
 /// untagged `Other` for cursors this version does not define. There is no
@@ -313,14 +246,9 @@ struct ResumePlan {
 ///   `_`-prefixed extension — is rejected. The schema is explicit that a
 ///   receiver which does not understand a cursor must *"reject the request
 ///   rather than guessing where to replay from"*.
-fn plan_resume(
-    request: v2::ResumeSessionRequest,
-) -> Result<ResumePlan, agent_client_protocol::Error> {
+fn plan_resume(request: &v2::ResumeSessionRequest) -> Result<bool, agent_client_protocol::Error> {
     match &request.replay_from {
-        Some(v2::ReplayFrom::Start(_)) => Ok(ResumePlan {
-            request,
-            replay: true,
-        }),
+        Some(v2::ReplayFrom::Start(_)) => Ok(true),
         Some(other_cursor) => Err(invalid_params(format!(
             "session/resume: unknown replayFrom cursor `{}`; this agent supports only \
              `{{\"type\":\"start\"}}` or no replayFrom at all",
@@ -330,17 +258,6 @@ fn plan_resume(
                 _ => "unknown".to_string(),
             }
         ))),
-        None => Ok(ResumePlan {
-            // The schema conversion from v2 `ResumeSessionRequest` to v1
-            // `LoadSessionRequest` only accepts `replayFrom: start`, so supply
-            // it to make the mapping total and carry the real intent in
-            // `replay` — the caller suppresses the history publication.
-            request: {
-                let mut request = request;
-                request.replay_from = Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new()));
-                request
-            },
-            replay: false,
-        }),
+        None => Ok(false),
     }
 }

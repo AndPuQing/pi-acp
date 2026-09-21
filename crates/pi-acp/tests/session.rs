@@ -17,12 +17,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ContentBlock, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
 };
 use pi_acp::error::AcpxError;
 use pi_acp::pi::rpc::ImageContent;
-use pi_acp::session::{OutboundMessage, PiAcpSession, SessionManager, SessionParams, StopReason};
+use pi_acp::session::{
+    OutboundMessage, PermissionOutcomeFact, PermissionRequestFact, PiAcpSession, SessionManager,
+    SessionParams, StopReason,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, Mutex};
@@ -39,22 +41,22 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// v2 ones. Recording the *rendered* frame (rather than the neutral fact) is
 /// what lets a test assert what actually reaches the client.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // test-only recorder; readability beats boxing
 enum Recorded {
     /// A v1-rendered `session/update`.
     Notify(SessionUpdate),
     /// A v2-rendered frame, kept as JSON (the v2 types are a different set and
-    /// the assertions read them by field). Only the `protocol-v2` build renders
-    /// one.
-    #[cfg(feature = "protocol-v2")]
+    /// the assertions read them by field).
     V2(serde_json::Value),
-    Permission(RequestPermissionRequest),
+    /// A permission request, in the neutral form both protocols render from.
+    Permission(PermissionRequestFact),
 }
 
 struct Fixture {
     _tmp: TempDir,
     session: Arc<PiAcpSession>,
     recorded: Arc<Mutex<Vec<Recorded>>>,
-    permission_answers: mpsc::Sender<RequestPermissionResponse>,
+    permission_answers: mpsc::Sender<PermissionOutcomeFact>,
     scenarios: PathBuf,
     command_log: PathBuf,
     extension_log: PathBuf,
@@ -68,7 +70,6 @@ async fn fixture(extra_args: &[&str]) -> Fixture {
 /// A fixture whose session believes it is serving an ACP **v2** client, so the
 /// v2-only emissions (the `agent_message` patch, `state_update`) are produced
 /// (W-562). v1 sessions never emit them.
-#[cfg(feature = "protocol-v2")]
 async fn fixture_v2() -> Fixture {
     fixture_with_options(&[], Duration::ZERO, pi_acp::protocol::Protocol::V2).await
 }
@@ -113,7 +114,6 @@ async fn fixture_with_options(
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
-        protocol,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
@@ -138,75 +138,98 @@ async fn fixture_with_options(
 async fn run_recorder(
     mut rx: mpsc::Receiver<OutboundMessage>,
     recorded: Arc<Mutex<Vec<Recorded>>>,
-    mut permission_answers: mpsc::Receiver<RequestPermissionResponse>,
+    mut permission_answers: mpsc::Receiver<PermissionOutcomeFact>,
     protocol: pi_acp::protocol::Protocol,
 ) {
     let is_v2 = protocol.is_v2();
     while let Some(msg) = rx.recv().await {
         match msg {
-            OutboundMessage::Notify(notif) => {
-                recorded.lock().await.push(Recorded::Notify(notif.update));
-            }
-            OutboundMessage::RequestPermission(request, respond) => {
-                recorded
-                    .lock()
+            OutboundMessage::RequestPermission(permission) => {
+                let pi_acp::session::PermissionRequest { request, respond } = permission;
+                recorded.lock().await.push(Recorded::Permission(request));
+                let answer = permission_answers
+                    .recv()
                     .await
-                    .push(Recorded::Permission(request.clone()));
-                let answer = permission_answers.recv().await.unwrap_or_else(|| {
-                    RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
-                });
+                    .unwrap_or(PermissionOutcomeFact::Cancelled);
                 let _ = respond.send(Ok(answer));
             }
             // The harness renders the neutral facts for the fixture's protocol,
             // exactly as the real connector does, and records the frames.
-            OutboundMessage::TextChunk(chunk) => {
-                let mut frames = recorded.lock().await;
-                #[cfg(feature = "protocol-v2")]
+            OutboundMessage::SessionInfo(fact) => {
                 if is_v2 {
-                    frames.push(Recorded::V2(
-                        serde_json::to_value(pi_acp::render::text_chunk_v2(&chunk)).unwrap(),
-                    ));
-                    continue;
+                    record_v2(&recorded, pi_acp::render::session_info_v2(&fact)).await;
+                } else {
+                    record_v1(&recorded, pi_acp::render::session_info_v1(&fact)).await;
                 }
-                let _ = is_v2;
-                frames.push(Recorded::Notify(
-                    pi_acp::render::text_chunk_v1(&chunk).update,
-                ));
+            }
+            OutboundMessage::Usage(fact) => {
+                if is_v2 {
+                    record_v2(&recorded, pi_acp::render::usage_v2(&fact)).await;
+                } else {
+                    record_v1(&recorded, pi_acp::render::usage_v1(&fact)).await;
+                }
+            }
+            OutboundMessage::Mode(fact) => {
+                // v2 has no session modes and renders nothing.
+                if !is_v2 {
+                    record_v1(&recorded, pi_acp::render::mode_v1(&fact)).await;
+                }
+            }
+            OutboundMessage::ConfigOptions(fact) => {
+                if is_v2 {
+                    record_v2(&recorded, pi_acp::render::config_options_update_v2(&fact)).await;
+                } else {
+                    record_v1(&recorded, pi_acp::render::config_options_update_v1(&fact)).await;
+                }
+            }
+            OutboundMessage::AvailableCommands(fact) => {
+                if is_v2 {
+                    record_v2(&recorded, pi_acp::render::available_commands_v2(&fact)).await;
+                } else {
+                    record_v1(&recorded, pi_acp::render::available_commands_v1(&fact)).await;
+                }
+            }
+            OutboundMessage::ToolCall(fact) => {
+                if is_v2 {
+                    record_v2(&recorded, pi_acp::render::tool_call_v2(&fact)).await;
+                } else {
+                    record_v1(&recorded, pi_acp::render::tool_call_v1(&fact)).await;
+                }
+            }
+            OutboundMessage::LinkChunk(fact) => {
+                if is_v2 {
+                    record_v2(&recorded, pi_acp::render::link_chunk_v2(&fact)).await;
+                } else {
+                    record_v1(&recorded, pi_acp::render::link_chunk_v1(&fact)).await;
+                }
+            }
+            OutboundMessage::TextChunk(chunk) => {
+                if is_v2 {
+                    record_v2(&recorded, pi_acp::render::text_chunk_v2(&chunk)).await;
+                } else {
+                    record_v1(&recorded, pi_acp::render::text_chunk_v1(&chunk)).await;
+                }
             }
             OutboundMessage::MessagePatch(patch) => {
-                let mut frames = recorded.lock().await;
-                #[cfg(feature = "protocol-v2")]
-                if is_v2 {
-                    frames.push(Recorded::V2(
-                        serde_json::to_value(pi_acp::render::message_patch_v2(&patch)).unwrap(),
-                    ));
-                }
-                let _ = (&mut frames, &patch, is_v2);
                 // v1 has no complete-message update: nothing is recorded.
+                if is_v2 {
+                    record_v2(&recorded, pi_acp::render::message_patch_v2(&patch)).await;
+                }
             }
             OutboundMessage::Foreground { session_id, state } => {
-                let mut frames = recorded.lock().await;
-                #[cfg(feature = "protocol-v2")]
                 if is_v2 {
-                    frames.push(Recorded::V2(
-                        serde_json::to_value(pi_acp::render::foreground_v2(&session_id, state))
-                            .unwrap(),
-                    ));
+                    record_v2(&recorded, pi_acp::render::foreground_v2(&session_id, state)).await;
                 }
-                let _ = (&mut frames, &session_id, state, is_v2);
             }
             OutboundMessage::BashToolCall(call) => {
-                let mut frames = recorded.lock().await;
-                #[cfg(feature = "protocol-v2")]
                 if is_v2 {
                     for notif in pi_acp::render::bash_v2_frames(&call) {
-                        frames.push(Recorded::V2(serde_json::to_value(notif).unwrap()));
+                        record_v2(&recorded, notif).await;
                     }
-                    continue;
-                }
-                let _ = is_v2;
-                for notif in pi_acp::render::bash_v1_frames(&call) {
-                    frames.push(Recorded::Notify(notif.update));
+                } else {
+                    for notif in pi_acp::render::bash_v1_frames(&call) {
+                        record_v1(&recorded, notif).await;
+                    }
                 }
             }
             OutboundMessage::Flush(ack) => {
@@ -215,6 +238,25 @@ async fn run_recorder(
             }
         }
     }
+}
+
+/// Record one v1-rendered frame.
+async fn record_v1(
+    recorded: &Arc<Mutex<Vec<Recorded>>>,
+    notif: agent_client_protocol::schema::v1::SessionNotification,
+) {
+    recorded.lock().await.push(Recorded::Notify(notif.update));
+}
+
+/// Record one v2-rendered frame.
+async fn record_v2(
+    recorded: &Arc<Mutex<Vec<Recorded>>>,
+    notif: agent_client_protocol_schema::v2::UpdateSessionNotification,
+) {
+    recorded
+        .lock()
+        .await
+        .push(Recorded::V2(serde_json::to_value(notif).unwrap()));
 }
 
 /// Write the n-th prompt's scenario file (one JSON event per line).
@@ -437,7 +479,6 @@ async fn message_ids_group_chunks_per_assistant_message() {
 
     // v1 has no full-object update and no foreground state: rendering the
     // neutral facts for v1 must never produce a v2 frame.
-    #[cfg(feature = "protocol-v2")]
     assert!(
         !recorded.iter().any(|r| matches!(r, Recorded::V2(_))),
         "a v1 connection must never receive a v2-rendered frame"
@@ -447,7 +488,6 @@ async fn message_ids_group_chunks_per_assistant_message() {
 /// W-562: the v2-only patch object is built from pi's authoritative
 /// `message_end.message` (the full content array), and reuses the id minted at
 /// `message_start` so the client can patch what it accumulated.
-#[cfg(feature = "protocol-v2")]
 #[tokio::test]
 async fn message_end_yields_the_v2_patch_with_the_same_message_id() {
     let fx = fixture_v2().await;
@@ -1260,19 +1300,15 @@ async fn extension_select_bridges_to_permission_and_answers_value() {
         permission
             .options
             .iter()
-            .map(|o| o.option_id.0.as_ref())
+            .map(|o| o.id.as_str())
             .collect::<Vec<_>>(),
         vec!["choice-0", "choice-1"]
     );
-    assert_eq!(permission.tool_call.fields.title.as_deref(), Some("Pick"));
+    assert_eq!(permission.title, "Pick");
 
     // The user picks "beta" (choice-1).
     fx.permission_answers
-        .send(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Selected(
-                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new("choice-1"),
-            ),
-        ))
+        .send(PermissionOutcomeFact::Selected("choice-1".to_string()))
         .await
         .unwrap();
 
@@ -1312,11 +1348,7 @@ async fn extension_confirm_yes_answers_confirmed() {
     .await;
 
     fx.permission_answers
-        .send(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Selected(
-                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new("yes"),
-            ),
-        ))
+        .send(PermissionOutcomeFact::Selected("yes".to_string()))
         .await
         .unwrap();
 
@@ -1579,7 +1611,6 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
-        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
@@ -1775,7 +1806,6 @@ async fn session_id_override_mismatch_is_rejected() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
-        protocol: pi_acp::protocol::Protocol::V1,
         session_path: Some(session_file),
         session_id_override: Some("requested-session-id".into()),
         file_commands: vec![],
@@ -1813,7 +1843,6 @@ async fn session_manager_registers_and_disposes_sessions() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
-        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],
@@ -1853,7 +1882,6 @@ async fn session_manager_replacement_disposes_previous_instance() {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound,
-        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],

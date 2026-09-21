@@ -8,16 +8,9 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-[features]
-# ACP protocol v2 (unstable draft) support, W-562. **Off by default**: with the
-# feature disabled the build, the dependency set, the CLI behavior and the ACP
-# semantics are exactly as before. Enabling it registers a v2 implementation
-# next to the v1 one on the SDK's `AgentProtocolRouter`; the v1 session core is
-# untouched and every v1 <-> v2 conversion happens once, at the boundary.
-protocol-v2 = [
-    "agent-client-protocol/unstable_protocol_v2",
-    "agent-client-protocol-schema/unstable_protocol_v2",
-]
+# ACP protocol v2 (unstable draft) has no cargo feature: one binary serves both
+# versions, negotiated in `initialize` by the SDK's `AgentProtocolRouter`. Both
+# protocol implementations are always compiled.
 
 [[bin]]
 name = "pi-acp"
@@ -30,11 +23,16 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-agent-client-protocol.workspace = true
-agent-client-protocol-schema.workspace = true
+# `unstable_protocol_v2` is enabled unconditionally: pi-acp always compiles both
+# protocol implementations and the negotiated version picks one at runtime.
+agent-client-protocol = { workspace = true, features = ["unstable_protocol_v2"] }
+agent-client-protocol-schema = { workspace = true, features = ["unstable_protocol_v2"] }
 tokio.workspace = true
 # home-dir / agent-dir resolution (settings.rs, commands.rs)
 dirs.workspace = true
+# Git --patch text for a native v2 `Diff` (v1 carries old/new text, which v2
+# replaced with structured changes plus a renderable patch).
+diffy = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "process"] }

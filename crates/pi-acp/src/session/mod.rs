@@ -20,8 +20,13 @@
 mod session;
 
 pub use session::{
-    spawn_outbound_connector, BashToolCall, BashToolStatus, ForegroundState, MessagePatch,
-    OutboundMessage, PiAcpSession, SessionParams, StopReason, TextChunk, TextChunkKind,
+    spawn_outbound_connector, AvailableCommandFact, AvailableCommandsFact, BashToolCall,
+    BashToolStatus, ConfigCategoryFact, ConfigChoiceFact, ConfigOptionFact, ConfigOptionsFact,
+    CostFact, ForegroundState, LinkChunkFact, MessagePatch, ModeFact, OutboundMessage,
+    PermissionOptionFact, PermissionOptionKindFact, PermissionOutcomeFact, PermissionRequest,
+    PermissionRequestFact, PiAcpSession, SessionInfoFact, SessionParams, StopReason, TextChunk,
+    TextChunkKind, ToolCallFact, ToolContentFact, ToolKindFact, ToolLocationFact, ToolStatusFact,
+    UsageFact,
 };
 
 use std::collections::HashMap;

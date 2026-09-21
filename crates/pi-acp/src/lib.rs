@@ -10,11 +10,13 @@
 //!
 //! ## Module map
 //! - [`agent`] — ACP `Agent` role implementation (initialize / new / prompt / ...).
-//! - [`protocol`] — the ACP version boundary: v1 <-> v2 conversion, the
-//!   negotiated version, and the `message_id` / patch-object helpers. With the
-//!   `protocol-v2` feature (off by default) the agent additionally serves ACP
-//!   v2 clients through the SDK's protocol router, converting at the edge so
-//!   the session core stays v1-only.
+//! - [`protocol`] — the negotiated ACP version, and the per-connection record of
+//!   it. v1 and v2 are **separate native implementations** selected in
+//!   `initialize` by the SDK's `AgentProtocolRouter`; there is no conversion
+//!   between them.
+//! - [`render`] — native outbound frame construction, one renderer per protocol
+//!   version, from the protocol-neutral facts in [`session`].
+//! - [`v2`] — native ACP v2 inbound handlers.
 //! - [`session`] — per-session state machine (turn queue, event pump, tool tracking).
 //! - [`pi`] — pi subprocess RPC client + session-file scanning.
 //! - [`translate`] — pure pi ⇄ ACP translation functions.
@@ -68,7 +70,6 @@ pub mod settings;
 pub mod startup;
 pub mod time;
 pub mod translate;
-#[cfg(feature = "protocol-v2")]
 pub mod v2;
 
 pub use error::AcpxError;

@@ -51,6 +51,28 @@ fn count_commands(cmds: &[String]) -> HashMap<String, usize> {
     counts
 }
 
+/// Render a neutral outbound fact as its v1 `session/update`.
+///
+/// The perf suite asserts timing and RPC counts, not wire frames, so the v1
+/// shape is enough to keep its recorder shape unchanged.
+fn v1_update_of(msg: OutboundMessage) -> Option<SessionUpdate> {
+    Some(match msg {
+        OutboundMessage::SessionInfo(fact) => pi_acp::render::session_info_v1(&fact).update,
+        OutboundMessage::Usage(fact) => pi_acp::render::usage_v1(&fact).update,
+        OutboundMessage::Mode(fact) => pi_acp::render::mode_v1(&fact).update,
+        OutboundMessage::ConfigOptions(fact) => {
+            pi_acp::render::config_options_update_v1(&fact).update
+        }
+        OutboundMessage::AvailableCommands(fact) => {
+            pi_acp::render::available_commands_v1(&fact).update
+        }
+        OutboundMessage::ToolCall(fact) => pi_acp::render::tool_call_v1(&fact).update,
+        OutboundMessage::LinkChunk(fact) => pi_acp::render::link_chunk_v1(&fact).update,
+        OutboundMessage::TextChunk(chunk) => pi_acp::render::text_chunk_v1(&chunk).update,
+        _ => return None,
+    })
+}
+
 /// Spawn a session directly against the mock pi with a per-RPC delay and a
 /// command log. Returns the session plus a recorder of outbound updates.
 struct SessionFixture {
@@ -76,29 +98,26 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
     tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
             match msg {
-                OutboundMessage::Notify(notif) => {
-                    rec.lock().await.push((notif.update, Instant::now()));
+                OutboundMessage::Flush(ack) => {
+                    let _ = ack.send(());
                 }
-                OutboundMessage::RequestPermission(_, respond) => {
-                    let _ =
-                        respond.send(Err(pi_acp::error::AcpxError::SessionClosed("perf".into())));
-                }
-                OutboundMessage::TextChunk(chunk) => {
-                    rec.lock()
-                        .await
-                        .push((pi_acp::render::text_chunk_v1(&chunk).update, Instant::now()));
+                OutboundMessage::RequestPermission(permission) => {
+                    let _ = permission
+                        .respond
+                        .send(Err(pi_acp::error::AcpxError::SessionClosed("perf".into())));
                 }
                 OutboundMessage::MessagePatch(_) | OutboundMessage::Foreground { .. } => {}
-                // A bash call is rendered per protocol by the connector; these
-                // tests assert timing, not frames, so recording the v1 shape is
-                // enough.
+                // These tests assert timing, not frames, so the v1 shape of each
+                // fact is enough.
                 OutboundMessage::BashToolCall(call) => {
                     for notif in pi_acp::render::bash_v1_frames(&call) {
                         rec.lock().await.push((notif.update, Instant::now()));
                     }
                 }
-                OutboundMessage::Flush(ack) => {
-                    let _ = ack.send(());
+                other => {
+                    if let Some(update) = v1_update_of(other) {
+                        rec.lock().await.push((update, Instant::now()));
+                    }
                 }
             }
         }
@@ -112,7 +131,6 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
         cwd: tmp.path().to_path_buf(),
         additional_directories: vec![],
         outbound: outbound_tx,
-        protocol: pi_acp::protocol::Protocol::V1,
         session_path: None,
         session_id_override: None,
         file_commands: vec![],

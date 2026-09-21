@@ -207,6 +207,105 @@ fn normalize_one(server: &McpServer) -> Result<McpServerSpec, String> {
     }
 }
 
+/// Validate + normalize ACP **v2** `mcp_servers` into adapter definitions.
+///
+/// v2 reshaped the transports: `stdio` is now a tagged variant, `sse` was
+/// removed, and unknown transports are preserved as `Other`. The v1 and v2
+/// normalizers are deliberately separate — a v1 stdio server is untagged on the
+/// wire, so one parser for both would mis-tag one of them.
+pub fn normalize_mcp_servers_v2(
+    servers: &[agent_client_protocol_schema::v2::McpServer],
+) -> Result<Vec<McpServerSpec>, String> {
+    let mut out = Vec::with_capacity(servers.len());
+    let mut seen = HashSet::new();
+    for server in servers {
+        let spec = normalize_one_v2(server)?;
+        if !seen.insert(spec.name.clone()) {
+            return Err(format!(
+                "MCP server \"{}\" is declared more than once",
+                spec.name
+            ));
+        }
+        out.push(spec);
+    }
+    Ok(out)
+}
+
+fn normalize_one_v2(
+    server: &agent_client_protocol_schema::v2::McpServer,
+) -> Result<McpServerSpec, String> {
+    use agent_client_protocol_schema::v2;
+    match server {
+        v2::McpServer::Stdio(stdio) => {
+            let name = checked_name(&stdio.name)?;
+            if stdio.command.0.as_os_str().is_empty() {
+                return Err(format!(
+                    "MCP server \"{name}\": stdio transport requires a non-empty command"
+                ));
+            }
+            let mut env = HashMap::new();
+            for var in &stdio.env {
+                if var.name.trim().is_empty() {
+                    return Err(format!(
+                        "MCP server \"{name}\": env variable with an empty name"
+                    ));
+                }
+                env.insert(var.name.clone(), var.value.clone());
+            }
+            Ok(McpServerSpec {
+                name,
+                definition: ServerEntry {
+                    command: Some(stdio.command.0.to_string_lossy().to_string()),
+                    args: Some(stdio.args.clone()),
+                    env: if env.is_empty() { None } else { Some(env) },
+                    url: None,
+                    headers: None,
+                    http_transport: None,
+                },
+            })
+        }
+        v2::McpServer::Http(http) => {
+            let name = checked_name(&http.name)?;
+            let url = checked_http_url(&http.url, &name)?;
+            let headers = headers_map_v2(&http.headers, &name)?;
+            Ok(McpServerSpec {
+                name,
+                definition: ServerEntry {
+                    command: None,
+                    args: None,
+                    env: None,
+                    url: Some(url),
+                    headers,
+                    http_transport: None,
+                },
+            })
+        }
+        // v2 removed the SSE transport, and MCP-over-ACP is out of scope:
+        // reject loudly so a requested server is never silently dropped.
+        _ => Err(
+            "unsupported MCP transport: ACP v2 supports only stdio and http servers \
+             (SSE was removed and MCP-over-ACP is not implemented)"
+                .to_string(),
+        ),
+    }
+}
+
+fn headers_map_v2(
+    headers: &[agent_client_protocol_schema::v2::HttpHeader],
+    server: &str,
+) -> Result<Option<HashMap<String, String>>, String> {
+    let mut map = HashMap::new();
+    for h in headers {
+        if h.name.trim().is_empty() {
+            return Err(format!(
+                "MCP server \"{server}\": header with an empty name"
+            ));
+        }
+        map.insert(h.name.clone(), h.value.clone());
+    }
+    Ok(if map.is_empty() { None } else { Some(map) })
+}
+
 /// Names must be non-empty (adapter fails closed on those), single-line, and
 /// free of `:` and whitespace: they travel in the line-based
 /// `PI_ACP_MCP:<kind>:<name>:...` stdout markers, and the parser splits the

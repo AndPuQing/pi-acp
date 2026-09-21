@@ -81,6 +81,12 @@ fn terminal_meta(call: &BashToolCall) -> Option<v1::Meta> {
 /// The first frame opens the call with `ToolCallContent::Terminal` and the
 /// `terminal_info` `_meta`; every later frame is a status + output/exit update.
 /// This is the v1 shape clients (Zed) already consume, byte for byte.
+///
+/// Every frame re-states `kind` and `title`, as the renderer did before the
+/// native v1/v2 split. The opening frame is sent from the streamed
+/// `toolcall_start`, which has the tool's *name* and not yet its arguments (see
+/// `surface_tool_call`); the command is only known one frame later, so a client
+/// told the title once is left with the placeholder `"bash"`.
 pub fn bash_v1_frames(call: &BashToolCall) -> Vec<v1::SessionNotification> {
     let status = v1_status(call);
     if call.first {
@@ -98,7 +104,10 @@ pub fn bash_v1_frames(call: &BashToolCall) -> Vec<v1::SessionNotification> {
         )];
     }
 
-    let fields = v1::ToolCallUpdateFields::new().status(Some(status));
+    let fields = v1::ToolCallUpdateFields::new()
+        .kind(Some(v1::ToolKind::Execute))
+        .title(Some(call.command.clone()))
+        .status(Some(status));
     let update = match terminal_meta(call) {
         Some(meta) => v1::ToolCallUpdate::new(call.tool_call_id.clone(), fields).meta(meta),
         None => v1::ToolCallUpdate::new(call.tool_call_id.clone(), fields),
@@ -152,23 +161,27 @@ fn v2_status(status: BashToolStatus) -> v2::ToolCallStatus {
 
 /// The native v2 frames for a bash call.
 ///
-/// v2 dropped v1's client-owned terminal, so the opening frame is a
-/// `tool_call_update` that names the call (`kind: execute`, `title`, and the
-/// command in `rawInput`) and every frame streams the terminal through the
+/// v2 dropped v1's client-owned terminal, so the call is named by the
+/// `tool_call_update` itself (`kind: execute`, `title`, and the command in
+/// `rawInput`) and every frame streams the terminal through the
 /// `terminal_output` / `terminal_exit` `_meta`. The frames are built in v2 types
 /// directly — nothing is converted from v1.
+///
+/// Every frame names the call, not only the first. The opening frame is sent
+/// from the streamed `toolcall_start`, which has the tool's name but not yet its
+/// arguments, so its `title`/`rawInput` can only be the placeholder `"bash"`.
+/// The command arrives one frame later and has to replace it — v2 patches are
+/// exactly the mechanism for that — or the client shows `"bash"` with the
+/// command gone.
 pub fn bash_v2_frames(call: &BashToolCall) -> Vec<v2::UpdateSessionNotification> {
-    let mut update =
-        v2::ToolCallUpdate::new(call.tool_call_id.clone()).status(v2_status(call.status));
-    if call.first {
-        update = update
-            .kind(v2::ToolKind::Execute)
-            .title(call.command.clone())
-            .raw_input(match &call.cwd {
-                Some(cwd) => json!({ "command": call.command, "cwd": cwd }),
-                None => json!({ "command": call.command }),
-            });
-    }
+    let mut update = v2::ToolCallUpdate::new(call.tool_call_id.clone())
+        .kind(v2::ToolKind::Execute)
+        .title(call.command.clone())
+        .raw_input(match &call.cwd {
+            Some(cwd) => json!({ "command": call.command, "cwd": cwd }),
+            None => json!({ "command": call.command }),
+        })
+        .status(v2_status(call.status));
     if let Some(meta) = terminal_meta(call) {
         update = update.meta(meta);
     }
@@ -1212,6 +1225,50 @@ mod tests {
         let meta = update.meta.value().expect("terminal meta");
         assert_eq!(meta["terminal_output"]["data"], "done\n");
         assert_eq!(meta["terminal_exit"]["exit_code"], 0);
+    }
+
+    /// The streamed `toolcall_start` opens a bash call before pi has sent the
+    /// arguments, so the opening frame can only name it `"bash"`. The command
+    /// arrives one frame later, and that frame has to carry the name or the
+    /// client keeps the placeholder for the whole call.
+    #[test]
+    fn v2_continuation_replaces_the_placeholder_with_the_command() {
+        let mut placeholder = call(true, S::Pending);
+        placeholder.command = "bash".to_owned();
+        let opening = bash_v2_frames(&placeholder);
+        let v2::SessionUpdate::ToolCallUpdate(open) = &opening[0].update else {
+            panic!("a bash call is a tool_call_update on v2");
+        };
+        assert_eq!(open.title.value().map(String::as_str), Some("bash"));
+
+        let mut named = call(false, S::InProgress);
+        named.command = "ls -la".to_owned();
+        named.cwd = Some("/work".to_owned());
+        let frames = bash_v2_frames(&named);
+        let v2::SessionUpdate::ToolCallUpdate(update) = &frames[0].update else {
+            panic!("a bash continuation is a tool_call_update on v2");
+        };
+        assert_eq!(update.kind.value(), Some(&v2::ToolKind::Execute));
+        assert_eq!(update.title.value().map(String::as_str), Some("ls -la"));
+        assert_eq!(
+            update.raw_input.value().and_then(|v| v.get("command")),
+            Some(&json!("ls -la"))
+        );
+    }
+
+    /// v1's continuation frame carries the name too, as it did before the
+    /// native split: the opening `tool_call` is sent before the command is
+    /// known, so the update has to correct it.
+    #[test]
+    fn v1_continuation_re_states_the_command() {
+        let mut c = call(false, S::InProgress);
+        c.command = "ls -la".to_owned();
+        let frames = bash_v1_frames(&c);
+        let v1::SessionUpdate::ToolCallUpdate(update) = &frames[0].update else {
+            panic!("a bash continuation is a tool_call_update on v1");
+        };
+        assert_eq!(update.fields.kind, Some(v1::ToolKind::Execute));
+        assert_eq!(update.fields.title.as_deref(), Some("ls -la"));
     }
 
     /// The bug this module exists to fix, pinned as a regression.

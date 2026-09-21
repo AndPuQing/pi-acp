@@ -416,8 +416,9 @@ pub struct BashToolCall {
     pub output_delta: String,
     /// The process exit code, once the call has ended.
     pub exit_code: Option<i32>,
-    /// Whether this is the call's first frame (which opens the tool call and,
-    /// on v2, announces the terminal).
+    /// Whether this is the call's first frame. On v1 it opens the tool call and
+    /// embeds the terminal; every frame names the call, so this only records
+    /// that the opening frame has been sent.
     pub first: bool,
 }
 

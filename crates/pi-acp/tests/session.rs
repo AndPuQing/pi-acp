@@ -1084,6 +1084,68 @@ async fn tool_statuses_are_monotonic_and_bash_terminals_stream() {
     assert_eq!(exit_codes, vec![0]);
 }
 
+/// The v2 end-to-end shape of the same bash sequence: the streamed
+/// `toolcall_start` opens the call before the command is known, so the command
+/// must arrive on a later frame. Naming the call only on the opening frame made
+/// every client show `"bash"` with the command gone.
+#[tokio::test]
+async fn v2_bash_call_is_named_with_its_command_after_the_streamed_open() {
+    let fx = fixture_v2().await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "message_update",
+                "usage": {},
+                "assistantMessageEvent": { "type": "toolcall_start", "contentIndex": 0, "id": "t-bash", "toolName": "bash" }
+            }),
+            json!({
+                "type": "tool_execution_start",
+                "toolCallId": "t-bash",
+                "toolName": "bash",
+                "args": { "command": "printf hello" }
+            }),
+            json!({
+                "type": "tool_execution_end",
+                "toolCallId": "t-bash",
+                "toolName": "bash",
+                "result": { "details": { "stdout": "hello", "exitCode": 0 } },
+                "isError": false
+            }),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "run a command").await.unwrap(),
+        StopReason::EndTurn
+    );
+
+    let recorded = fx.recorded.lock().await.clone();
+    let titles: Vec<&str> = recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::V2(v)
+                if v["update"]["sessionUpdate"] == "tool_call_update"
+                    && v["update"]["toolCallId"] == "t-bash" =>
+            {
+                v["update"]["title"].as_str()
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        titles.contains(&"printf hello"),
+        "the command never reached the v2 client: {titles:?}"
+    );
+    assert_eq!(
+        titles.last().copied(),
+        Some("printf hello"),
+        "the last frame must leave the client with the command, not the placeholder: {titles:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Structured diffs
 // ---------------------------------------------------------------------------

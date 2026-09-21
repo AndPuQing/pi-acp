@@ -83,7 +83,20 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
                     let _ =
                         respond.send(Err(pi_acp::error::AcpxError::SessionClosed("perf".into())));
                 }
-                OutboundMessage::AgentMessage { .. } | OutboundMessage::Foreground { .. } => {}
+                OutboundMessage::TextChunk(chunk) => {
+                    rec.lock()
+                        .await
+                        .push((pi_acp::render::text_chunk_v1(&chunk).update, Instant::now()));
+                }
+                OutboundMessage::MessagePatch(_) | OutboundMessage::Foreground { .. } => {}
+                // A bash call is rendered per protocol by the connector; these
+                // tests assert timing, not frames, so recording the v1 shape is
+                // enough.
+                OutboundMessage::BashToolCall(call) => {
+                    for notif in pi_acp::render::bash_v1_frames(&call) {
+                        rec.lock().await.push((notif.update, Instant::now()));
+                    }
+                }
                 OutboundMessage::Flush(ack) => {
                     let _ = ack.send(());
                 }

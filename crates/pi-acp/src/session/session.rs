@@ -49,8 +49,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1::MessageId;
 use agent_client_protocol::schema::v1::{
-    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, CurrentModeUpdate, Diff,
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    ConfigOptionUpdate, ContentBlock, Cost, CurrentModeUpdate, Diff, PermissionOption,
+    PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate,
     TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, UsageUpdate,
@@ -68,8 +68,7 @@ use crate::pi::rpc::{
 };
 use crate::time::utc_now_iso8601;
 use crate::translate::bash::{
-    bash_command, bash_exit_code, bash_output_delta, bash_result_text, bash_terminal_content,
-    bash_terminal_exit_meta, bash_terminal_info_meta, bash_terminal_output_meta, is_bash_tool,
+    bash_command, bash_exit_code, bash_output_delta, bash_result_text, is_bash_tool,
 };
 use crate::translate::tools::{
     edit_old_texts, find_unique_line_number, to_tool_call_locations, to_tool_kind, tool_path,
@@ -193,9 +192,11 @@ fn assistant_error_text(reason: &str, error: &Value) -> String {
 /// thinking / tool-call blocks; v2's `agent_message.content` carries content
 /// blocks, so the text blocks map one-to-one. A non-assistant or shapeless
 /// message yields no blocks and no patch is sent.
-fn assistant_text_blocks(message: &Value) -> Vec<ContentBlock> {
+/// The concatenated text blocks of a pi assistant message, joined without a
+/// separator (the blocks are consecutive runs of one message).
+fn assistant_message_text(message: &Value) -> String {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return Vec::new();
+        return String::new();
     }
     message
         .get("content")
@@ -205,9 +206,8 @@ fn assistant_text_blocks(message: &Value) -> Vec<ContentBlock> {
                 .iter()
                 .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .filter(|text| !text.is_empty())
-                .map(|text| ContentBlock::Text(TextContent::new(text.to_string())))
-                .collect()
+                .collect::<Vec<_>>()
+                .join("")
         })
         .unwrap_or_default()
 }
@@ -298,18 +298,21 @@ fn clear_thinking_stamp(
 pub enum OutboundMessage {
     /// A `session/update` notification (full frame, including the session id).
     Notify(SessionNotification),
-    /// A v2-only `agent_message` patch: the authoritative complete content of
-    /// `message_id` (W-562). The connector drops this on a v1 connection, where
-    /// no such update exists, so the pump stays protocol-agnostic and the
-    /// decision lives at the boundary.
-    AgentMessage {
-        /// The session this update belongs to.
-        session_id: SessionId,
-        /// The message being patched (the id minted at `message_start`).
-        message_id: agent_client_protocol::schema::v1::MessageId,
-        /// The complete replacement content.
-        content: Vec<ContentBlock>,
-    },
+    /// A streamed text chunk, in the neutral form both protocols render from.
+    ///
+    /// v2 made `messageId` **required** on a chunk while v1 left it optional,
+    /// so the id is minted once here (a protocol-neutral string) and each
+    /// renderer spells it in its own types. The alternative — building a v1
+    /// chunk and converting it — is what forced the boundary to patch missing
+    /// ids back in, a fix-up that only existed because the shape was wrong.
+    TextChunk(TextChunk),
+    /// A v2-only complete-message patch: the authoritative replacement content
+    /// of `message_id`.
+    ///
+    /// The pump states the text once; the v2 renderer builds `agent_message`
+    /// from it and the v1 renderer sends nothing, because v1 has no such type
+    /// and fabricating one is wrong (v1 clients consume chunks).
+    MessagePatch(MessagePatch),
     /// A v2-only `state_update` notification (W-562). v2 reports turn
     /// completion through session updates instead of the `session/prompt`
     /// response's `stopReason`, so the pump publishes the transition here.
@@ -320,6 +323,18 @@ pub enum OutboundMessage {
         /// The transition itself.
         state: ForegroundState,
     },
+    /// A bash tool call, rendered natively by the connector for the
+    /// connection's protocol.
+    ///
+    /// v1 and v2 model "the agent runs a command" differently and neither shape
+    /// is a rename of the other: v1 embeds a **client-owned** terminal
+    /// (`ToolCallContent::Terminal` + `terminal_*` `_meta`) and has no
+    /// agent-owned stream, while v2 has no v1-style `Terminal` tool content and
+    /// carries an **agent-owned** terminal through `terminal_update` /
+    /// `terminal_output_chunk`. The schema refuses to convert v1 `Terminal`
+    /// content into v2, so the frame is built per version here instead of being
+    /// converted at the boundary.
+    BashToolCall(BashToolCall),
     /// A `session/request_permission` request; the answer is delivered back on
     /// the oneshot. If the responder is dropped without sending, the request
     /// is treated as cancelled by the caller.
@@ -332,6 +347,88 @@ pub enum OutboundMessage {
     /// resolving a turn so streamed notifications are never overtaken by the
     /// `session/prompt` response (TS `flushEmits` parity).
     Flush(oneshot::Sender<()>),
+}
+
+/// One streamed text chunk, in the neutral form both protocols render from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextChunk {
+    /// The session this update belongs to.
+    pub session_id: SessionId,
+    /// The message this chunk belongs to. `None` for a producer that has no
+    /// message of its own (an extension notice, a replayed history frame); the
+    /// v2 renderer mints an id for those, which is the one place v2 requires
+    /// one and v1 does not.
+    pub message_id: Option<String>,
+    /// Which stream the chunk belongs to.
+    pub kind: TextChunkKind,
+    /// The chunk's text.
+    pub text: String,
+    /// Chunk-scoped `_meta`, when the producer carries any.
+    pub meta: Option<agent_client_protocol::schema::v1::Meta>,
+}
+
+/// The three streamed text channels ACP defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextChunkKind {
+    /// The agent's answer (`agent_message_chunk`).
+    Agent,
+    /// The agent's reasoning (`agent_thought_chunk`).
+    Thought,
+    /// A user message (`user_message_chunk`).
+    User,
+}
+
+/// A complete-message patch, in the neutral form the v2 renderer builds from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePatch {
+    /// The session this update belongs to.
+    pub session_id: SessionId,
+    /// The message being patched (the id minted at `message_start`).
+    pub message_id: String,
+    /// The complete replacement text.
+    pub text: String,
+}
+
+/// One bash tool call, in the neutral form both protocols render from.
+///
+/// The pump tracks the command, its output and its exit code once; the v1 and
+/// v2 connectors each render that into their own native frame. This is the
+/// seam that replaces "build a v1 frame and convert it": the facts are shared,
+/// the wire shapes are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashToolCall {
+    /// The session this call belongs to.
+    pub session_id: SessionId,
+    /// The tool call's id (the terminal is named after it in both protocols).
+    pub tool_call_id: String,
+    /// The command line, shown as the call's title and v2 terminal command.
+    pub command: String,
+    /// The working directory, when known.
+    pub cwd: Option<String>,
+    /// Where the call is in its lifecycle.
+    pub status: BashToolStatus,
+    /// The complete output accumulated so far.
+    pub output: String,
+    /// The output appended since the call's previous frame.
+    pub output_delta: String,
+    /// The process exit code, once the call has ended.
+    pub exit_code: Option<i32>,
+    /// Whether this is the call's first frame (which opens the tool call and,
+    /// on v2, announces the terminal).
+    pub first: bool,
+}
+
+/// Where a bash call is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashToolStatus {
+    /// Streamed but not yet executed.
+    Pending,
+    /// Running.
+    InProgress,
+    /// Ended successfully.
+    Completed,
+    /// Ended with an error.
+    Failed,
 }
 
 /// Foreground work state transitions the pump publishes as v2 `state_update`s
@@ -613,6 +710,10 @@ struct Pump {
     file_snapshots: HashMap<String, FileSnapshot>,
     bash_tool_call_ids: HashSet<String>,
     bash_output_snapshots: HashMap<String, String>,
+    /// The command each tracked bash call was opened with. Later frames carry
+    /// only status/output, so the command is remembered here to keep every
+    /// frame's facts complete for whichever protocol renders it.
+    bash_commands: HashMap<String, String>,
     /// The active model's context window (tokens), from `get_state` at spawn
     /// and refreshed on `set_model`. Feeds ACP `usage_update.size` (S6).
     context_window: Option<u64>,
@@ -626,8 +727,6 @@ struct Pump {
     /// local uniqueness is all the protocol requires; sessions are told apart
     /// by `session_id`.
     next_message_seq: u64,
-    /// The negotiated ACP version; gates the v2-only emissions (W-562).
-    protocol: crate::protocol::Protocol,
 }
 
 impl PiAcpSession {
@@ -727,10 +826,10 @@ impl PiAcpSession {
             file_snapshots: HashMap::new(),
             bash_tool_call_ids: HashSet::new(),
             bash_output_snapshots: HashMap::new(),
+            bash_commands: HashMap::new(),
             context_window: state.model.as_ref().and_then(|m| m.context_window),
             current_message_id: None,
             next_message_seq: 0,
-            protocol: params.protocol,
         };
         tokio::spawn(pump_loop(pump));
 
@@ -1485,6 +1584,20 @@ impl Pump {
         }
     }
 
+    /// Hand a bash call's facts to the outbound sink, which renders them into
+    /// the connection's own protocol frames (see [`crate::render`]). Nothing
+    /// protocol-shaped is built here.
+    async fn emit_bash(&mut self, call: BashToolCall) {
+        if self
+            .outbound
+            .send(OutboundMessage::BashToolCall(call))
+            .await
+            .is_err()
+        {
+            tracing::debug!("outbound sink closed; dropping bash tool call");
+        }
+    }
+
     /// Mint the `message_id` for an assistant/user message that just started
     /// (W-562). pi's RPC messages carry no id, so the adapter assigns one here,
     /// at `message_start`, and every chunk of that message reuses it via
@@ -1502,6 +1615,13 @@ impl Pump {
         id
     }
 
+    /// The current message's id as a plain string, minting one if the stream
+    /// has not started one. What a chunk carries is a protocol-neutral string;
+    /// each renderer wraps it in its own `MessageId` type.
+    fn current_message_id_string(&mut self) -> String {
+        self.current_message_id().0.to_string()
+    }
+
     /// The `message_id` a streamed chunk belongs to. Falls back to minting one
     /// when pi streams a delta without a preceding `message_start` (older pi
     /// producers), so a chunk is never anonymous once the feature is in place.
@@ -1513,10 +1633,34 @@ impl Pump {
     }
 
     /// Tag an outgoing chunk with the current message's id.
-    async fn emit_chunk(&mut self, wrap: fn(ContentChunk) -> SessionUpdate, content: ContentBlock) {
-        let message_id = self.current_message_id();
-        let chunk = ContentChunk::new(content).message_id(message_id);
-        self.emit(wrap(chunk)).await;
+    async fn emit_chunk(&mut self, kind: TextChunkKind, text: String) {
+        let message_id = Some(self.current_message_id_string());
+        self.emit_text_chunk(kind, message_id, text, None).await;
+    }
+
+    /// Hand a text chunk's facts to the outbound sink, which renders them into
+    /// the connection's own protocol frame.
+    async fn emit_text_chunk(
+        &mut self,
+        kind: TextChunkKind,
+        message_id: Option<String>,
+        text: String,
+        meta: Option<agent_client_protocol::schema::v1::Meta>,
+    ) {
+        if self
+            .outbound
+            .send(OutboundMessage::TextChunk(TextChunk {
+                session_id: self.session_id.clone(),
+                message_id,
+                kind,
+                text,
+                meta,
+            }))
+            .await
+            .is_err()
+        {
+            tracing::debug!("outbound sink closed; dropping text chunk");
+        }
     }
 
     /// Publish a foreground-work transition for v2 clients (W-562). v2 dropped
@@ -1524,10 +1668,8 @@ impl Pump {
     /// completion from the response, so the connector drops this there.
     async fn emit_foreground(&mut self, state: ForegroundState) {
         // v2 reports completion through state updates; v1 reads it from the
-        // prompt response (and v1 has no state_update type at all).
-        if !self.protocol.is_v2() {
-            return;
-        }
+        // prompt response. The renderer decides what to send, so the fact is
+        // always published here.
         if self
             .outbound
             .send(OutboundMessage::Foreground {
@@ -1546,30 +1688,24 @@ impl Pump {
     ///
     /// v2 `agent_message.content` has patch semantics: a concrete array
     /// replaces everything previously accumulated for that `messageId`, which
-    /// is how the streamed chunks and the final object converge. The update is
-    /// handed to the outbound sink, which drops it on a v1 connection — v1 has
-    /// no full-object update and fabricating one would be wrong (v1 clients
-    /// consume chunks).
+    /// is how the streamed chunks and the final object converge. The pump
+    /// states the text once and the v2 renderer builds the patch; on v1 the
+    /// renderer sends nothing (v1 has no full-object update).
     async fn emit_message_patch(&mut self, message: &Value) {
-        // v1 has no full-object update type; fabricating one is explicitly
-        // forbidden by the W-562 constraints, so the v1 path stops here.
-        if !self.protocol.is_v2() {
-            return;
-        }
         let Some(message_id) = self.current_message_id.clone() else {
             return;
         };
-        let content = assistant_text_blocks(message);
-        if content.is_empty() {
+        let text = assistant_message_text(message);
+        if text.is_empty() {
             return;
         }
         if self
             .outbound
-            .send(OutboundMessage::AgentMessage {
+            .send(OutboundMessage::MessagePatch(MessagePatch {
                 session_id: self.session_id.clone(),
-                message_id,
-                content,
-            })
+                message_id: message_id.0.to_string(),
+                text,
+            }))
             .await
             .is_err()
         {
@@ -1595,11 +1731,8 @@ impl Pump {
     }
 
     async fn emit_text(&mut self, text: &str) {
-        self.emit_chunk(
-            SessionUpdate::AgentMessageChunk,
-            ContentBlock::Text(TextContent::new(text.to_string())),
-        )
-        .await;
+        self.emit_chunk(TextChunkKind::Agent, text.to_string())
+            .await;
     }
 
     /// Surface a pi assistant failure as a visible ACP text chunk. A single
@@ -2189,11 +2322,7 @@ impl Pump {
                 self.emit_text(delta).await;
             }
             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                self.emit_chunk(
-                    SessionUpdate::AgentThoughtChunk,
-                    ContentBlock::Text(TextContent::new(delta.clone())),
-                )
-                .await;
+                self.emit_chunk(TextChunkKind::Thought, delta.clone()).await;
             }
             AssistantMessageEvent::Error { reason, error } => {
                 self.emit_message_error(assistant_error_text(reason, error))
@@ -2256,7 +2385,6 @@ impl Pump {
                 tool_name,
                 raw_input.as_ref(),
                 status,
-                locations,
                 existing.is_none(),
             )
             .await;
@@ -2292,13 +2420,11 @@ impl Pump {
             .insert(tool_call_id.to_string(), TrackedStatus::InProgress);
 
         if is_bash_tool(tool_name) {
-            let locations = to_tool_call_locations(args, &self.cwd, None);
             self.emit_bash_tool_call(
                 tool_call_id,
                 tool_name,
                 Some(args),
                 TrackedStatus::InProgress,
-                locations,
                 existing.is_none(),
             )
             .await;
@@ -2487,59 +2613,65 @@ impl Pump {
             .get(id)
             .cloned()
             .unwrap_or_default();
+        let output = prev + delta;
         self.bash_output_snapshots
-            .insert(id.to_string(), prev + delta);
-        let fields = ToolCallUpdateFields::new().status(Some(ToolCallStatus::InProgress));
-        let update =
-            ToolCallUpdate::new(id.to_string(), fields).meta(bash_terminal_output_meta(id, delta));
-        self.emit(SessionUpdate::ToolCallUpdate(update)).await;
+            .insert(id.to_string(), output.clone());
+        self.emit_bash(BashToolCall {
+            session_id: self.session_id.clone(),
+            tool_call_id: id.to_string(),
+            command: self.bash_command(id),
+            cwd: Some(self.cwd.to_string_lossy().into_owned()),
+            status: BashToolStatus::InProgress,
+            output,
+            output_delta: delta.to_string(),
+            exit_code: None,
+            first: false,
+        })
+        .await;
     }
 
     // --- bash terminal rendering ---
 
-    /// Emit (or update) a bash tool call as an ACP `execute` tool with an
-    /// embedded terminal. The terminal (content + `terminal_info` meta) is
-    /// attached on the *first* emission; later transitions only carry status.
+    /// State the facts of a bash call for the connector to render.
+    ///
+    /// The pump no longer builds an ACP frame here: v1 and v2 have different
+    /// native shapes for a command (see [`crate::render`]), so the call is
+    /// described once and each protocol's renderer builds its own frame.
     async fn emit_bash_tool_call(
         &mut self,
         tool_call_id: &str,
         tool_name: &str,
         args: Option<&Value>,
         status: TrackedStatus,
-        locations: Vec<agent_client_protocol::schema::v1::ToolCallLocation>,
         include_terminal: bool,
     ) {
         self.bash_tool_call_ids.insert(tool_call_id.to_string());
-        let title = args
+        let command = args
             .and_then(bash_command)
             .unwrap_or_else(|| tool_name.to_string());
-        if include_terminal {
-            let call = ToolCall::new(tool_call_id.to_string(), title)
-                .kind(ToolKind::Execute)
-                .status(acp_status(status))
-                .locations(locations)
-                .content(bash_terminal_content(tool_call_id))
-                .meta(bash_terminal_info_meta(
-                    tool_call_id,
-                    &self.cwd.to_string_lossy(),
-                ));
-            self.emit(SessionUpdate::ToolCall(call)).await;
-        } else {
-            let fields = ToolCallUpdateFields::new()
-                .kind(Some(ToolKind::Execute))
-                .title(Some(title))
-                .status(Some(acp_status(status)))
-                .locations(Some(locations));
-            self.emit(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                tool_call_id.to_string(),
-                fields,
-            )))
-            .await;
-        }
+        self.bash_commands
+            .insert(tool_call_id.to_string(), command.clone());
+        let output = self
+            .bash_output_snapshots
+            .get(tool_call_id)
+            .cloned()
+            .unwrap_or_default();
+        self.emit_bash(BashToolCall {
+            session_id: self.session_id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            command,
+            cwd: Some(self.cwd.to_string_lossy().into_owned()),
+            status: bash_status(status),
+            output,
+            output_delta: String::new(),
+            exit_code: None,
+            first: include_terminal,
+        })
+        .await;
     }
 
-    /// Stream a delta of the accumulated bash output into the tool's terminal,
-    /// and close it with an exit code on completion/failure.
+    /// Stream a delta of the accumulated bash output, and close the call with
+    /// an exit code on completion/failure.
     async fn emit_bash_output_update(
         &mut self,
         tool_call_id: &str,
@@ -2555,25 +2687,37 @@ impl Pump {
             .unwrap_or_default();
         let delta = bash_output_delta(&previous, &text);
         self.bash_output_snapshots
-            .insert(tool_call_id.to_string(), text);
+            .insert(tool_call_id.to_string(), text.clone());
+        let ended = matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed);
+        self.emit_bash(BashToolCall {
+            session_id: self.session_id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            command: self.bash_command(tool_call_id),
+            cwd: Some(self.cwd.to_string_lossy().into_owned()),
+            status: match status {
+                ToolCallStatus::Pending => BashToolStatus::Pending,
+                ToolCallStatus::InProgress => BashToolStatus::InProgress,
+                ToolCallStatus::Completed => BashToolStatus::Completed,
+                ToolCallStatus::Failed => BashToolStatus::Failed,
+                // `ToolCallStatus` is `#[non_exhaustive]`; an unknown future
+                // state is still running as far as this frame is concerned.
+                _ => BashToolStatus::InProgress,
+            },
+            output: text,
+            output_delta: delta,
+            exit_code: ended.then(|| bash_exit_code(result, is_error)),
+            first: false,
+        })
+        .await;
+    }
 
-        let mut meta = serde_json::Map::new();
-        if !delta.is_empty() {
-            meta.extend(bash_terminal_output_meta(tool_call_id, &delta));
-        }
-        if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
-            meta.extend(bash_terminal_exit_meta(
-                tool_call_id,
-                bash_exit_code(result, is_error),
-            ));
-        }
-        let fields = ToolCallUpdateFields::new().status(Some(status));
-        let update = if meta.is_empty() {
-            ToolCallUpdate::new(tool_call_id.to_string(), fields)
-        } else {
-            ToolCallUpdate::new(tool_call_id.to_string(), fields).meta(meta)
-        };
-        self.emit(SessionUpdate::ToolCallUpdate(update)).await;
+    /// The command a tracked bash call was opened with, for later frames that
+    /// only carry status/output.
+    fn bash_command(&self, tool_call_id: &str) -> String {
+        self.bash_commands
+            .get(tool_call_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn cleanup_tool_call(&mut self, tool_call_id: &str) {
@@ -2582,6 +2726,7 @@ impl Pump {
         self.file_mutation_tool_call_ids.remove(tool_call_id);
         self.bash_tool_call_ids.remove(tool_call_id);
         self.bash_output_snapshots.remove(tool_call_id);
+        self.bash_commands.remove(tool_call_id);
     }
 
     // --- extension UI bridge ---
@@ -2635,23 +2780,77 @@ pub fn spawn_outbound_connector(
                     // so no unconverted frame reaches the wire.
                     crate::protocol::send_session_update(&conn, protocol, notif)
                 }
-                OutboundMessage::AgentMessage {
-                    session_id,
-                    message_id,
-                    content,
-                } => crate::protocol::send_agent_message(
-                    &conn,
-                    protocol,
-                    &session_id,
-                    &message_id,
-                    content,
-                ),
-                OutboundMessage::Foreground { session_id, state } => {
-                    if let Some(notif) = foreground_state_notification(protocol, &session_id, state)
+                OutboundMessage::BashToolCall(call) => {
+                    // A bash call is rendered natively for the connection's
+                    // protocol: v1 gets its embedded-terminal `tool_call`,
+                    // v2 its agent-owned-terminal `tool_call_update`. Nothing
+                    // is converted between the two (see [`crate::render`]).
+                    #[cfg(feature = "protocol-v2")]
                     {
-                        // Already in the negotiated version; send as-is.
-                        let _ = conn.send_notification(notif);
+                        if protocol.is_v2() {
+                            send_v2_frames(&conn, crate::render::bash_v2_frames(&call))
+                        } else {
+                            send_v1_frames(&conn, crate::render::bash_v1_frames(&call))
+                        }
                     }
+                    #[cfg(not(feature = "protocol-v2"))]
+                    {
+                        let _ = protocol;
+                        send_v1_frames(&conn, crate::render::bash_v1_frames(&call))
+                    }
+                }
+                OutboundMessage::TextChunk(chunk) => {
+                    // A streamed chunk is rendered natively for the protocol:
+                    // v1's `messageId` is optional, v2's is required and filled
+                    // here for anonymous producers. Nothing is converted.
+                    #[cfg(feature = "protocol-v2")]
+                    {
+                        if protocol.is_v2() {
+                            let _ = conn.send_notification(crate::render::text_chunk_v2(&chunk));
+                            Ok(())
+                        } else {
+                            send_v1_frames(&conn, vec![crate::render::text_chunk_v1(&chunk)])
+                        }
+                    }
+                    #[cfg(not(feature = "protocol-v2"))]
+                    {
+                        let _ = protocol;
+                        send_v1_frames(&conn, vec![crate::render::text_chunk_v1(&chunk)])
+                    }
+                }
+                OutboundMessage::MessagePatch(patch) => {
+                    // v1 has no complete-message update; the v2 renderer builds
+                    // `agent_message` directly.
+                    #[cfg(feature = "protocol-v2")]
+                    {
+                        if protocol.is_v2() {
+                            let _ = conn.send_notification(crate::render::message_patch_v2(&patch));
+                        }
+                    }
+                    #[cfg(not(feature = "protocol-v2"))]
+                    {
+                        let _ = protocol;
+                        let _ = patch;
+                    }
+                    Ok(())
+                }
+                OutboundMessage::Foreground { session_id, state } => {
+                    // v2 gets a native `state_update`; v1 reports completion in
+                    // the prompt response and has no such update type.
+                    #[cfg(feature = "protocol-v2")]
+                    {
+                        if protocol.is_v2() {
+                            let _ = conn.send_notification(crate::render::foreground_v2(
+                                &session_id,
+                                state,
+                            ));
+                        }
+                    }
+                    #[cfg(not(feature = "protocol-v2"))]
+                    {
+                        let _ = (&session_id, state);
+                    }
+                    let _ = protocol;
                     Ok(())
                 }
                 OutboundMessage::RequestPermission(request, respond) => {
@@ -2679,46 +2878,42 @@ pub fn spawn_outbound_connector(
     Ok(())
 }
 
-/// Build the v2 `state_update` frame for a foreground transition, or `None` on
-/// a v1 connection (v1 reports turn completion in the prompt response).
-#[cfg(feature = "protocol-v2")]
-fn foreground_state_notification(
-    protocol: crate::protocol::Protocol,
-    session_id: &SessionId,
-    state: ForegroundState,
-) -> Option<agent_client_protocol_schema::v2::UpdateSessionNotification> {
-    use agent_client_protocol::schema::v1::StopReason as AcpStopReason;
-    use agent_client_protocol_schema::v2;
-    use agent_client_protocol_schema::v2::conversion::try_v1_to_v2;
-
-    if !protocol.is_v2() {
-        return None;
-    }
-    let state = match state {
-        ForegroundState::Running => v2::StateUpdate::Running(v2::RunningStateUpdate::new()),
-        ForegroundState::Idle(reason) => {
-            let reason = match reason {
-                StopReason::EndTurn => AcpStopReason::EndTurn,
-                StopReason::Cancelled => AcpStopReason::Cancelled,
-            };
-            let stop_reason: v2::StopReason = try_v1_to_v2(reason).ok()?;
-            v2::StateUpdate::Idle(v2::IdleStateUpdate::new().stop_reason(stop_reason))
+/// Send a protocol frame, translating a transport failure into an error.
+///
+/// A send failure is reported but never aborts the loop: the caller logs it and
+/// keeps forwarding, because one bad frame must not end the connection.
+fn send_v1_frames(
+    conn: &ConnectionTo<Client>,
+    frames: Vec<agent_client_protocol::schema::v1::SessionNotification>,
+) -> std::result::Result<(), AcpxError> {
+    let mut result = Ok(());
+    for notif in frames {
+        if let Err(e) = conn.send_notification(notif) {
+            result = Err(AcpxError::RpcFailed {
+                command: "session/update".into(),
+                message: e.to_string(),
+            });
         }
-    };
-    let session_id: v2::SessionId = try_v1_to_v2(session_id.clone()).ok()?;
-    Some(v2::UpdateSessionNotification::new(
-        session_id,
-        v2::SessionUpdate::StateUpdate(state),
-    ))
+    }
+    result
 }
 
-#[cfg(not(feature = "protocol-v2"))]
-fn foreground_state_notification(
-    _protocol: crate::protocol::Protocol,
-    _session_id: &SessionId,
-    _state: ForegroundState,
-) -> Option<agent_client_protocol::schema::v1::SessionNotification> {
-    None
+/// Send a native v2 frame, with the same never-abort contract as the v1 path.
+#[cfg(feature = "protocol-v2")]
+fn send_v2_frames(
+    conn: &ConnectionTo<Client>,
+    frames: Vec<agent_client_protocol_schema::v2::UpdateSessionNotification>,
+) -> std::result::Result<(), AcpxError> {
+    let mut result = Ok(());
+    for notif in frames {
+        if let Err(e) = conn.send_notification(notif) {
+            result = Err(AcpxError::RpcFailed {
+                command: "session/update".into(),
+                message: e.to_string(),
+            });
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -2936,15 +3131,16 @@ async fn send_extension_notice(
     text: &str,
     meta: Option<agent_client_protocol::schema::v1::Meta>,
 ) {
-    let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-    if let Some(meta) = meta {
-        chunk = chunk.meta(meta);
-    }
+    // An extension notice has no message of its own; the v2 renderer mints an
+    // id for it (v2 requires one), the v1 renderer leaves it out.
     let _ = outbound
-        .send(OutboundMessage::Notify(SessionNotification::new(
-            session_id.clone(),
-            SessionUpdate::AgentMessageChunk(chunk),
-        )))
+        .send(OutboundMessage::TextChunk(TextChunk {
+            session_id: session_id.clone(),
+            message_id: None,
+            kind: TextChunkKind::Agent,
+            text: text.to_string(),
+            meta,
+        }))
         .await;
 }
 
@@ -3039,6 +3235,14 @@ fn acp_status(status: TrackedStatus) -> ToolCallStatus {
     match status {
         TrackedStatus::Pending => ToolCallStatus::Pending,
         TrackedStatus::InProgress => ToolCallStatus::InProgress,
+    }
+}
+
+/// The neutral lifecycle a tracked (pending/in-progress) tool maps to.
+fn bash_status(status: TrackedStatus) -> BashToolStatus {
+    match status {
+        TrackedStatus::Pending => BashToolStatus::Pending,
+        TrackedStatus::InProgress => BashToolStatus::InProgress,
     }
 }
 

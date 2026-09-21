@@ -305,52 +305,6 @@ pub async fn request_permission(
     }
 }
 
-/// Send the v2-only complete-message patch (`agent_message`).
-///
-/// `content` is the authoritative, complete content of the message identified
-/// by `message_id`; v2 clients patch their accumulated content with it, which
-/// is what converges the streamed chunks into the final message. The v1 path
-/// has no such type and this is a no-op there.
-pub fn send_agent_message(
-    cx: &ConnectionTo<Client>,
-    protocol: Protocol,
-    session_id: &v1::SessionId,
-    message_id: &v1::MessageId,
-    content: Vec<v1::ContentBlock>,
-) -> Result<(), AcpxError> {
-    match protocol {
-        Protocol::V1 => Ok(()),
-        Protocol::V2 => {
-            #[cfg(feature = "protocol-v2")]
-            {
-                use agent_client_protocol_schema::v2;
-                use agent_client_protocol_schema::v2::conversion::try_v1_to_v2;
-
-                let content: Vec<v2::ContentBlock> = content
-                    .into_iter()
-                    .map(try_v1_to_v2)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| conversion_error("agent_message->v2", e))?;
-                let message_id: v2::MessageId = try_v1_to_v2(message_id.clone())
-                    .map_err(|e| conversion_error("agent_message->v2", e))?;
-                let session_id: v2::SessionId = try_v1_to_v2(session_id.clone())
-                    .map_err(|e| conversion_error("agent_message->v2", e))?;
-                let message = v2::AgentMessage::new(message_id).content(content);
-                cx.send_notification(v2::UpdateSessionNotification::new(
-                    session_id,
-                    v2::SessionUpdate::AgentMessage(message),
-                ))
-                .map_err(|e| conversion_error("agent_message", e))
-            }
-            #[cfg(not(feature = "protocol-v2"))]
-            {
-                let _ = (cx, session_id, message_id, content);
-                Ok(())
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

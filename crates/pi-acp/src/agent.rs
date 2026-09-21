@@ -55,7 +55,7 @@ use agent_client_protocol::schema::v1::{
     SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionNotification,
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
     SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{
     on_receive_dispatch, on_receive_notification, on_receive_request, Agent, ConnectTo,
@@ -79,7 +79,7 @@ use crate::pi::sessions::{
 use crate::protocol::{NegotiatedProtocol, Protocol};
 use crate::session::{
     spawn_outbound_connector, PiAcpSession, SessionManager, SessionParams,
-    StopReason as SessionStopReason,
+    StopReason as SessionStopReason, TextChunk, TextChunkKind,
 };
 use crate::session_store::{SessionStore, StoredSession};
 use crate::settings::{
@@ -87,10 +87,7 @@ use crate::settings::{
 };
 use crate::startup::{build_startup_info_with_roots, build_update_notice, fetch_pi_version};
 use crate::time::utc_now_iso8601;
-use crate::translate::bash::{
-    bash_exit_code, bash_terminal_content, bash_terminal_exit_meta, bash_terminal_info_meta,
-    bash_terminal_output_meta,
-};
+use crate::translate::bash::bash_exit_code;
 use crate::translate::messages::{replay_message, ReplayMessage};
 use crate::translate::prompt::prompt_to_pi_message;
 use crate::translate::tools::{to_tool_kind, tool_result_to_text};
@@ -2269,12 +2266,22 @@ async fn send_text_chunk(
     session_id: &SessionId,
     text: &str,
 ) {
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-    let _ = crate::protocol::send_session_update(
-        cx,
-        protocol,
-        SessionNotification::new(session_id.clone(), SessionUpdate::AgentMessageChunk(chunk)),
-    );
+    // A notice has no message of its own; the renderer mints an id on v2 (where
+    // it is required) and omits it on v1. The frame is built natively for each
+    // protocol rather than converted.
+    let chunk = crate::session::TextChunk {
+        session_id: session_id.clone(),
+        message_id: None,
+        kind: crate::session::TextChunkKind::Agent,
+        text: text.to_string(),
+        meta: None,
+    };
+    if protocol.is_v2() {
+        #[cfg(feature = "protocol-v2")]
+        let _ = cx.send_notification(crate::render::text_chunk_v2(&chunk));
+    } else {
+        let _ = cx.send_notification(crate::render::text_chunk_v1(&chunk));
+    }
 }
 
 /// Fetch `session_configuration`: configOptions + model/mode states.
@@ -2536,26 +2543,10 @@ async fn replay_history(
         };
         match replay {
             ReplayMessage::UserText(text) => {
-                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
-                let _ = crate::protocol::send_session_update(
-                    cx,
-                    protocol,
-                    SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::UserMessageChunk(chunk),
-                    ),
-                );
+                send_replay_text(cx, protocol, &session_id, TextChunkKind::User, &text);
             }
             ReplayMessage::AssistantText(text) => {
-                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
-                let _ = crate::protocol::send_session_update(
-                    cx,
-                    protocol,
-                    SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::AgentMessageChunk(chunk),
-                    ),
-                );
+                send_replay_text(cx, protocol, &session_id, TextChunkKind::Agent, &text);
             }
             ReplayMessage::ToolResult(t) => {
                 let tool_call_id = t.tool_call_id.unwrap_or_else(|| {
@@ -2563,38 +2554,39 @@ async fn replay_history(
                     format!("pi-replay-{synthetic_id}")
                 });
                 if t.is_bash {
-                    let call = ToolCall::new(tool_call_id.clone(), t.title.clone())
-                        .kind(ToolKind::Execute)
-                        .status(ToolCallStatus::Completed)
-                        .content(bash_terminal_content(&tool_call_id))
-                        .meta(bash_terminal_info_meta(&tool_call_id, &cwd));
-                    let _ = crate::protocol::send_session_update(
-                        cx,
-                        protocol,
-                        SessionNotification::new(session_id.clone(), SessionUpdate::ToolCall(call)),
-                    );
-                    let mut meta = serde_json::Map::new();
-                    if !t.text.is_empty() {
-                        meta.extend(bash_terminal_output_meta(&tool_call_id, &t.text));
-                    }
-                    meta.extend(bash_terminal_exit_meta(
-                        &tool_call_id,
-                        bash_exit_code(&t.raw, t.is_error),
-                    ));
-                    let fields = ToolCallUpdateFields::new().status(Some(if t.is_error {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    }));
-                    let update = ToolCallUpdate::new(tool_call_id.clone(), fields).meta(meta);
-                    let _ = crate::protocol::send_session_update(
-                        cx,
-                        protocol,
-                        SessionNotification::new(
+                    // A replayed command is rendered natively per protocol: v1
+                    // embeds a client-owned terminal, v2 streams an agent-owned
+                    // one. Converting the v1 frame is impossible (the schema
+                    // refuses v1 `Terminal` content on v2), so each protocol
+                    // builds its own frame — the bug that made every replayed
+                    // bash call show as `other` with no output.
+                    let exit_code = bash_exit_code(&t.raw, t.is_error);
+                    let output = t.text.clone();
+                    let command = t.title.clone();
+                    if protocol.is_v2() {
+                        #[cfg(feature = "protocol-v2")]
+                        let _ = cx.send_notification(crate::render::bash_replay_v2(
                             session_id.clone(),
-                            SessionUpdate::ToolCallUpdate(update),
-                        ),
-                    );
+                            &tool_call_id,
+                            &command,
+                            &cwd,
+                            &output,
+                            exit_code,
+                            t.is_error,
+                        ));
+                        #[cfg(not(feature = "protocol-v2"))]
+                        let _ = (&tool_call_id, &command, &cwd, &output, exit_code);
+                    } else {
+                        let _ = cx.send_notification(crate::render::bash_replay_v1(
+                            session_id.clone(),
+                            &tool_call_id,
+                            &command,
+                            &cwd,
+                            &output,
+                            exit_code,
+                            t.is_error,
+                        ));
+                    }
                 } else {
                     let call = ToolCall::new(tool_call_id.clone(), t.title.clone())
                         .kind(to_tool_kind(&t.tool_name))
@@ -2638,6 +2630,33 @@ async fn replay_history(
                 }
             }
         }
+    }
+}
+
+/// Send one replayed text chunk, rendered natively for the connection.
+///
+/// A replayed message has no message id of its own: v1 omits it, v2 requires
+/// one and the renderer mints it. The frame is built per protocol, never
+/// converted.
+fn send_replay_text(
+    cx: &ConnectionTo<Client>,
+    protocol: Protocol,
+    session_id: &SessionId,
+    kind: TextChunkKind,
+    text: &str,
+) {
+    let chunk = TextChunk {
+        session_id: session_id.clone(),
+        message_id: None,
+        kind,
+        text: text.to_string(),
+        meta: None,
+    };
+    if protocol.is_v2() {
+        #[cfg(feature = "protocol-v2")]
+        let _ = cx.send_notification(crate::render::text_chunk_v2(&chunk));
+    } else {
+        let _ = cx.send_notification(crate::render::text_chunk_v1(&chunk));
     }
 }
 

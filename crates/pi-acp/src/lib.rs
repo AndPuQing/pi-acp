@@ -61,6 +61,7 @@ pub mod error;
 pub mod mcp;
 pub mod pi;
 pub mod protocol;
+pub mod render;
 pub mod session;
 pub mod session_store;
 pub mod settings;

@@ -20,8 +20,8 @@
 mod session;
 
 pub use session::{
-    spawn_outbound_connector, ForegroundState, OutboundMessage, PiAcpSession, SessionParams,
-    StopReason,
+    spawn_outbound_connector, BashToolCall, BashToolStatus, ForegroundState, MessagePatch,
+    OutboundMessage, PiAcpSession, SessionParams, StopReason, TextChunk, TextChunkKind,
 };
 
 use std::collections::HashMap;

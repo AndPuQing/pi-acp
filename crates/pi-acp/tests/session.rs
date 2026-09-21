@@ -32,18 +32,22 @@ const BIN: &str = env!("CARGO_BIN_EXE_pi-acp");
 /// Test deadline; the mock responds instantly, so 10s is generous.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The interesting parts of [`OutboundMessage`] recorded by the harness.
+/// The interesting parts of an outbound frame recorded by the harness.
+///
+/// The harness renders frames for the fixture's protocol, exactly as the real
+/// connector does, so a v1 fixture records v1 updates and a v2 fixture records
+/// v2 ones. Recording the *rendered* frame (rather than the neutral fact) is
+/// what lets a test assert what actually reaches the client.
 #[derive(Debug, Clone)]
 enum Recorded {
+    /// A v1-rendered `session/update`.
     Notify(SessionUpdate),
+    /// A v2-rendered frame, kept as JSON (the v2 types are a different set and
+    /// the assertions read them by field). Only the `protocol-v2` build renders
+    /// one.
+    #[cfg(feature = "protocol-v2")]
+    V2(serde_json::Value),
     Permission(RequestPermissionRequest),
-    /// A v2-only complete-message patch (W-562); never produced on v1.
-    AgentMessage {
-        message_id: agent_client_protocol::schema::v1::MessageId,
-        content: Vec<agent_client_protocol::schema::v1::ContentBlock>,
-    },
-    /// A v2-only foreground-state transition (W-562); never produced on v1.
-    Foreground(pi_acp::session::ForegroundState),
 }
 
 struct Fixture {
@@ -64,6 +68,7 @@ async fn fixture(extra_args: &[&str]) -> Fixture {
 /// A fixture whose session believes it is serving an ACP **v2** client, so the
 /// v2-only emissions (the `agent_message` patch, `state_update`) are produced
 /// (W-562). v1 sessions never emit them.
+#[cfg(feature = "protocol-v2")]
 async fn fixture_v2() -> Fixture {
     fixture_with_options(&[], Duration::ZERO, pi_acp::protocol::Protocol::V2).await
 }
@@ -98,7 +103,7 @@ async fn fixture_with_options(
     let (answer_tx, answer_rx) = mpsc::channel(16);
     let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
     let rec = recorded.clone();
-    tokio::spawn(run_recorder(outbound_rx, rec, answer_rx));
+    tokio::spawn(run_recorder(outbound_rx, rec, answer_rx, protocol));
 
     let session = PiAcpSession::spawn(SessionParams {
         pi_command: BIN.to_string(),
@@ -134,7 +139,9 @@ async fn run_recorder(
     mut rx: mpsc::Receiver<OutboundMessage>,
     recorded: Arc<Mutex<Vec<Recorded>>>,
     mut permission_answers: mpsc::Receiver<RequestPermissionResponse>,
+    protocol: pi_acp::protocol::Protocol,
 ) {
+    let is_v2 = protocol.is_v2();
     while let Some(msg) = rx.recv().await {
         match msg {
             OutboundMessage::Notify(notif) => {
@@ -150,23 +157,57 @@ async fn run_recorder(
                 });
                 let _ = respond.send(Ok(answer));
             }
-            // v2-only frames (W-562): recorded so v2 tests can assert on
-            // them; the v1 path never produces them.
-            OutboundMessage::AgentMessage {
-                session_id: _,
-                message_id,
-                content,
-            } => {
-                recorded.lock().await.push(Recorded::AgentMessage {
-                    message_id,
-                    content,
-                });
+            // The harness renders the neutral facts for the fixture's protocol,
+            // exactly as the real connector does, and records the frames.
+            OutboundMessage::TextChunk(chunk) => {
+                let mut frames = recorded.lock().await;
+                #[cfg(feature = "protocol-v2")]
+                if is_v2 {
+                    frames.push(Recorded::V2(
+                        serde_json::to_value(pi_acp::render::text_chunk_v2(&chunk)).unwrap(),
+                    ));
+                    continue;
+                }
+                let _ = is_v2;
+                frames.push(Recorded::Notify(
+                    pi_acp::render::text_chunk_v1(&chunk).update,
+                ));
             }
-            OutboundMessage::Foreground {
-                session_id: _,
-                state,
-            } => {
-                recorded.lock().await.push(Recorded::Foreground(state));
+            OutboundMessage::MessagePatch(patch) => {
+                let mut frames = recorded.lock().await;
+                #[cfg(feature = "protocol-v2")]
+                if is_v2 {
+                    frames.push(Recorded::V2(
+                        serde_json::to_value(pi_acp::render::message_patch_v2(&patch)).unwrap(),
+                    ));
+                }
+                let _ = (&mut frames, &patch, is_v2);
+                // v1 has no complete-message update: nothing is recorded.
+            }
+            OutboundMessage::Foreground { session_id, state } => {
+                let mut frames = recorded.lock().await;
+                #[cfg(feature = "protocol-v2")]
+                if is_v2 {
+                    frames.push(Recorded::V2(
+                        serde_json::to_value(pi_acp::render::foreground_v2(&session_id, state))
+                            .unwrap(),
+                    ));
+                }
+                let _ = (&mut frames, &session_id, state, is_v2);
+            }
+            OutboundMessage::BashToolCall(call) => {
+                let mut frames = recorded.lock().await;
+                #[cfg(feature = "protocol-v2")]
+                if is_v2 {
+                    for notif in pi_acp::render::bash_v2_frames(&call) {
+                        frames.push(Recorded::V2(serde_json::to_value(notif).unwrap()));
+                    }
+                    continue;
+                }
+                let _ = is_v2;
+                for notif in pi_acp::render::bash_v1_frames(&call) {
+                    frames.push(Recorded::Notify(notif.update));
+                }
             }
             OutboundMessage::Flush(ack) => {
                 // Ordering barrier: everything before it is already recorded.
@@ -394,25 +435,19 @@ async fn message_ids_group_chunks_per_assistant_message() {
     assert_ne!(ids[1], ids[2], "a new message starts a new id");
     assert_eq!(ids[2].as_deref(), Some("pi-msg-2"));
 
-    // v1 has no full-object update and no foreground state: the patch and the
-    // v2 state transitions must never appear on a v1 connection.
+    // v1 has no full-object update and no foreground state: rendering the
+    // neutral facts for v1 must never produce a v2 frame.
+    #[cfg(feature = "protocol-v2")]
     assert!(
-        !recorded
-            .iter()
-            .any(|r| matches!(r, Recorded::AgentMessage { .. })),
-        "v1 must not emit the v2 agent_message patch"
-    );
-    assert!(
-        !recorded
-            .iter()
-            .any(|r| matches!(r, Recorded::Foreground(_))),
-        "v1 must not emit the v2 state_update"
+        !recorded.iter().any(|r| matches!(r, Recorded::V2(_))),
+        "a v1 connection must never receive a v2-rendered frame"
     );
 }
 
 /// W-562: the v2-only patch object is built from pi's authoritative
 /// `message_end.message` (the full content array), and reuses the id minted at
 /// `message_start` so the client can patch what it accumulated.
+#[cfg(feature = "protocol-v2")]
 #[tokio::test]
 async fn message_end_yields_the_v2_patch_with_the_same_message_id() {
     let fx = fixture_v2().await;
@@ -442,50 +477,38 @@ async fn message_end_yields_the_v2_patch_with_the_same_message_id() {
     );
 
     let recorded = fx.recorded.lock().await.clone();
+    // The harness rendered the v2 frames, so the patch is a v2 `agent_message`.
     let patch = recorded
         .iter()
         .find_map(|r| match r {
-            Recorded::AgentMessage {
-                message_id,
-                content,
-            } => Some((message_id.clone(), content.clone())),
+            Recorded::V2(v) if v["update"]["sessionUpdate"] == "agent_message" => Some(v),
             _ => None,
         })
         .expect("message_end carries the authoritative message and must yield a patch");
 
     assert_eq!(
-        patch.0 .0.as_ref(),
-        "pi-msg-1",
+        patch["update"]["messageId"], "pi-msg-1",
         "the patch reuses the streamed id"
     );
-    assert_eq!(patch.1.len(), 1);
-    match &patch.1[0] {
-        agent_client_protocol::schema::v1::ContentBlock::Text(t) => {
-            assert_eq!(
-                t.text, "hello world",
-                "the patch carries the complete content"
-            );
-        }
-        other => panic!("expected a text block, got {other:?}"),
-    }
+    let content = patch["update"]["content"]
+        .as_array()
+        .expect("patch content");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["text"], "hello world");
 
     // The same v2 session also publishes the turn's foreground transitions,
     // which is how v2 reports completion (v1 uses the prompt response).
-    let states: Vec<pi_acp::session::ForegroundState> = recorded
+    let states: Vec<&serde_json::Value> = recorded
         .iter()
         .filter_map(|r| match r {
-            Recorded::Foreground(state) => Some(*state),
+            Recorded::V2(v) if v["update"]["sessionUpdate"] == "state_update" => Some(&v["update"]),
             _ => None,
         })
         .collect();
-    assert_eq!(
-        states,
-        vec![
-            pi_acp::session::ForegroundState::Running,
-            pi_acp::session::ForegroundState::Idle(StopReason::EndTurn),
-        ],
-        "the v2 turn publishes running -> idle(end_turn)"
-    );
+    assert_eq!(states.len(), 2, "running then idle: {recorded:#?}");
+    assert_eq!(states[0]["state"], "running");
+    assert_eq!(states[1]["state"], "idle");
+    assert_eq!(states[1]["stopReason"], "end_turn");
 }
 
 /// pi's streaming usage can be empty; the final assistant message carries the
@@ -1539,7 +1562,12 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
     let (answer_tx, answer_rx) = mpsc::channel(16);
     let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
     let rec = recorded.clone();
-    tokio::spawn(run_recorder(outbound_rx, rec, answer_rx));
+    tokio::spawn(run_recorder(
+        outbound_rx,
+        rec,
+        answer_rx,
+        pi_acp::protocol::Protocol::V1,
+    ));
     let _ = answer_tx;
 
     let session = PiAcpSession::spawn(SessionParams {

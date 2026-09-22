@@ -5,9 +5,8 @@
 //! - `PI_ACP_ENABLE_EMBEDDED_CONTEXT` — advertise ACP `embeddedContext` support (`true` to enable).
 //! - `PI_ACP_VERSION_CHECK` — enable the startup update notice (default: **off**, decision 2).
 //! - `PI_ACP_RPC_TIMEOUT_SECS` — per-request pi RPC deadline (default `30`).
-//! - `PI_ACP_SETTLE_TIMEOUT_SECS` — deadline for a turn's `agent_settled`
-//!   after pi accepts the prompt (default `600`; `0` disables — design §11
-//!   risk #84 mitigation).
+//! - `PI_ACP_SETTLE_TIMEOUT_SECS` — silence budget for an accepted turn
+//!   (default `600`; `0` disables — design §11 risk #84 mitigation).
 //! - `PI_ACP_ENABLE_MCP` — advertise ACP MCP transports and wire
 //!   `session/new|load` `mcp_servers` through pi-mcp-adapter's
 //!   `runtime-register` event (default: **off**; W-483).
@@ -15,11 +14,15 @@
 /// Default per-request pi RPC deadline in seconds (design D2).
 pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
 
-/// Default settle deadline for a turn's `agent_settled` in seconds (design
-/// §11 risk #84 mitigation): a pi that accepts a prompt but never settles
+/// Default silence budget for an accepted turn, in seconds (design §11 risk
+/// #84 mitigation): a pi that accepts a prompt and then does nothing at all
 /// (e.g. an extension slash command that never enters the agent loop) must
-/// not hang `session/prompt` forever. Generous enough to never fire on
-/// legitimate long turns; `PI_ACP_SETTLE_TIMEOUT_SECS=0` opts out.
+/// not hang `session/prompt` forever.
+///
+/// It bounds *silence*, not the turn. Every event pi sends re-arms it, and it
+/// stands down while a tool is executing, so a long build or a long streamed
+/// answer is never mistaken for a stuck pi. `PI_ACP_SETTLE_TIMEOUT_SECS=0`
+/// opts out.
 pub const DEFAULT_SETTLE_TIMEOUT_SECS: u64 = 600;
 
 /// Resolved runtime configuration.

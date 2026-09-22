@@ -1698,6 +1698,71 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
     session.dispose().await;
 }
 
+/// A tool pi is still executing is proof of life: a quiet command (a long
+/// build, a `sleep`, a download) must not be mistaken for a stuck pi, however
+/// long it runs and however little it says. Only silence with nothing running
+/// trips the fallback.
+#[tokio::test]
+async fn a_running_tool_keeps_the_settle_fallback_off() {
+    let fx = fixture_with_settle_timeout(&[], Duration::from_millis(500)).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({
+                "type": "tool_execution_start",
+                "toolCallId": "t-quiet",
+                "toolName": "bash",
+                "args": { "command": "sleep 5" }
+            }),
+            // Quiet for longer than the whole budget while the tool runs; the
+            // exemption is what keeps the turn alive.
+            json!({"__directive__": "wait_ms", "ms": 900}),
+            json!({
+                "type": "tool_execution_end",
+                "toolCallId": "t-quiet",
+                "toolName": "bash",
+                "result": { "details": { "stdout": "", "exitCode": 0 } },
+                "isError": false
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "run a slow command").await.unwrap(),
+        StopReason::EndTurn
+    );
+}
+
+/// A turn that keeps streaming is alive even when it outlives the whole
+/// budget: every event re-arms the silence clock, so a long answer is not
+/// killed at a fixed wall-clock mark.
+#[tokio::test]
+async fn streamed_activity_re_arms_the_settle_fallback() {
+    let fx = fixture_with_settle_timeout(&[], Duration::from_millis(1_000)).await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({"type": "message_update", "usage": {}, "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "a"}}),
+            json!({"__directive__": "wait_ms", "ms": 300}),
+            json!({"type": "message_update", "usage": {}, "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "b"}}),
+            json!({"__directive__": "wait_ms", "ms": 300}),
+            json!({"type": "message_update", "usage": {}, "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "c"}}),
+            json!({"__directive__": "wait_ms", "ms": 300}),
+            json!({"type": "message_update", "usage": {}, "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "d"}}),
+            json!({"__directive__": "wait_ms", "ms": 300}),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+
+    assert_eq!(
+        prompt_turn(&fx, "write a long answer").await.unwrap(),
+        StopReason::EndTurn
+    );
+}
+
 /// A settle timeout resolves the stuck turn (and everything queued behind it)
 /// with `SettleTimeout` — but the session stays usable (W-480): later prompts
 /// run instead of failing with `SessionClosed`, and `cancel` keeps working.

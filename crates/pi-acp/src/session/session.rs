@@ -1053,14 +1053,21 @@ struct Pump {
     recovery_settled: bool,
     /// True while pi's agent loop is running (`agent_start` .. `agent_end`).
     in_agent_loop: bool,
-    /// Deadline by which the in-flight turn's `agent_settled` must arrive
-    /// (design §11 risk #84 mitigation: a pi that accepts a prompt but never
-    /// settles must not hang `session/prompt` forever). Armed when the prompt
-    /// is accepted; cleared at resolution. `None` = no deadline (disabled or
-    /// no turn in flight).
+    /// Deadline by which the in-flight turn must show a sign of life (design
+    /// §11 risk #84 mitigation: a pi that accepts a prompt but never settles
+    /// must not hang `session/prompt` forever). Armed when the prompt is
+    /// accepted, re-armed by every event pi sends, and stood down while a tool
+    /// is executing, so it bounds *silence* rather than the turn. Cleared at
+    /// resolution. `None` = no deadline (disabled or no turn in flight).
     settle_deadline: Option<tokio::time::Instant>,
-    /// The settle deadline duration (from [`SessionParams::settle_timeout`]).
+    /// The silence budget for the settle fallback (from
+    /// [`SessionParams::settle_timeout`]).
     settle_timeout: Duration,
+    /// Tool calls pi has started executing and has not finished
+    /// (`tool_execution_start` .. `tool_execution_end`). A tool that is still
+    /// running is proof of life for the settle fallback, however long it runs
+    /// and however little it says while it does.
+    executing_tool_calls: HashSet<String>,
 
     /// Monotonic tool statuses (`tool_call_id` -> status).
     current_tool_calls: HashMap<String, TrackedStatus>,
@@ -1180,6 +1187,7 @@ impl PiAcpSession {
             in_agent_loop: false,
             settle_deadline: None,
             settle_timeout: params.settle_timeout,
+            executing_tool_calls: HashSet::new(),
             current_tool_calls: HashMap::new(),
             file_mutation_tool_call_ids: HashSet::new(),
             file_snapshots: HashMap::new(),
@@ -1552,6 +1560,17 @@ async fn pump_loop(mut pump: Pump) {
     let mut shutdown_done: Option<oneshot::Sender<()>> = None;
 
     loop {
+        // A tool pi has started and not ended is proof of life however long it
+        // runs, so the fallback stands down while one is outstanding;
+        // `note_turn_activity` re-arms it when the tool ends, and the deadline
+        // otherwise measures silence. Read before `select!` because the branch
+        // futures borrow disjoint `pump` fields, and a predicate over the whole
+        // pump would collide with them.
+        let settle_deadline = if pump.has_running_tool() {
+            None
+        } else {
+            pump.settle_deadline
+        };
         tokio::select! {
             cmd = pump.cmd_rx.recv() => {
                 match cmd {
@@ -1622,7 +1641,7 @@ async fn pump_loop(mut pump: Pump) {
             // deadline is copied out of the pump so the async block only
             // borrows the copy, not the pump (the other arms mutate it).
             _settle_deadline = {
-                let deadline = pump.settle_deadline;
+                let deadline = settle_deadline;
                 async move {
                     match deadline {
                         Some(d) => tokio::time::sleep_until(d).await,
@@ -2311,7 +2330,33 @@ impl Pump {
         self.emit_config_options(options).await;
     }
 
+    /// Refreshes the settle fallback.
+    ///
+    /// The deadline measures how long pi has been *silent*, not how long the
+    /// turn has run. A turn that streams a long answer, retries, or runs a
+    /// long tool is alive; the fallback exists for the case where pi accepted
+    /// the prompt and then did nothing at all (design §11 risk #84).
+    fn note_turn_activity(&mut self) {
+        if self.settle_deadline.is_some() {
+            self.settle_deadline = Some(tokio::time::Instant::now() + self.settle_timeout);
+        }
+    }
+
+    /// Whether pi has started a tool it has not finished.
+    ///
+    /// A running tool cannot speak for itself when the command it runs is
+    /// quiet — a long compile, a `sleep`, a download — so the fallback stands
+    /// down until the tool ends rather than killing a turn that is
+    /// demonstrably executing. A tool that never ends is the host's to bound;
+    /// this adapter's fallback is for a prompt that never got going.
+    fn has_running_tool(&self) -> bool {
+        !self.executing_tool_calls.is_empty()
+    }
+
     async fn on_event(&mut self, ev: RpcEvent) {
+        // Every event pi sends is evidence the turn is alive: the settle
+        // fallback bounds silence, not elapsed time (design §11 risk #84).
+        self.note_turn_activity();
         match ev {
             RpcEvent::MessageUpdate {
                 usage,
@@ -2833,6 +2878,7 @@ impl Pump {
         let existing = self.current_tool_calls.get(tool_call_id).copied();
         self.current_tool_calls
             .insert(tool_call_id.to_string(), TrackedStatus::InProgress);
+        self.executing_tool_calls.insert(tool_call_id.to_string());
 
         if is_bash_tool(tool_name) {
             self.emit_bash_tool_call(
@@ -3108,6 +3154,7 @@ impl Pump {
 
     fn cleanup_tool_call(&mut self, tool_call_id: &str) {
         self.current_tool_calls.remove(tool_call_id);
+        self.executing_tool_calls.remove(tool_call_id);
         self.file_snapshots.remove(tool_call_id);
         self.file_mutation_tool_call_ids.remove(tool_call_id);
         self.bash_tool_call_ids.remove(tool_call_id);

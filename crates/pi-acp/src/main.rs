@@ -299,11 +299,11 @@ async fn run_mock_rpc() -> Result<()> {
             .and_then(|v| v.parse().ok());
     }
 
-    let mock_session_file = session_arg
+    let mut mock_session_file = session_arg
         .clone()
         .or_else(|| env_session_file.clone())
         .unwrap_or_else(|| PathBuf::from("/tmp/mock-session.jsonl"));
-    let mock_session_id = session_arg
+    let mut mock_session_id = session_arg
         .as_deref()
         .and_then(read_mock_session_id)
         .unwrap_or_else(|| "mock-session-id".to_string());
@@ -478,6 +478,26 @@ async fn run_mock_rpc() -> Result<()> {
                 "levels": mock_supported_levels(&mock_model)
             }),
             "export_html" => serde_json::json!({"path": "/tmp/mock.html"}),
+            "clone" => {
+                if std::env::var_os("PI_ACP_MOCK_CLONE_CANCEL").is_some() {
+                    serde_json::json!({"cancelled": true})
+                } else {
+                    let source = std::fs::read_to_string(&mock_session_file)?;
+                    let (header, tail) = source.split_once('\n').ok_or_else(|| {
+                        anyhow::anyhow!("mock clone requires a persisted source session")
+                    })?;
+                    let mut header: serde_json::Value = serde_json::from_str(header)?;
+                    let child_id = format!("{}-fork-{}", mock_session_id, std::process::id());
+                    let child_file =
+                        pi_acp::pi::sessions::pi_sessions_dir().join(format!("{child_id}.jsonl"));
+                    std::fs::create_dir_all(child_file.parent().unwrap())?;
+                    header["id"] = serde_json::Value::String(child_id.clone());
+                    std::fs::write(&child_file, format!("{header}\n{tail}"))?;
+                    mock_session_file = child_file;
+                    mock_session_id = child_id;
+                    serde_json::json!({"cancelled": false})
+                }
+            }
             "set_model" => command
                 .get("modelId")
                 .and_then(serde_json::Value::as_str)

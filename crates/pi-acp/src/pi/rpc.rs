@@ -179,6 +179,9 @@ pub enum RpcCommand {
         streaming_behavior: Option<StreamingBehavior>,
     },
     Abort,
+    /// Copy the active branch to a new Pi session. The issuing process
+    /// switches to the copy, so callers must use a disposable helper process.
+    Clone,
     GetState,
     GetAvailableModels,
     SetModel {
@@ -229,6 +232,7 @@ impl RpcCommand {
         match self {
             RpcCommand::Prompt { .. } => "prompt",
             RpcCommand::Abort => "abort",
+            RpcCommand::Clone => "clone",
             RpcCommand::GetState => "get_state",
             RpcCommand::GetAvailableModels => "get_available_models",
             RpcCommand::GetAvailableThinkingLevels => "get_available_thinking_levels",

@@ -100,6 +100,19 @@ pub async fn handle_dispatch(
                 }
             }
         }
+        "session/fork" => {
+            let request: v2::ForkSessionRequest = parse(&params, &method)?;
+            match agent.handle_fork_session_v2(&request, cx).await {
+                Ok(response) => {
+                    responder.respond(to_value(response)?)?;
+                    Ok(Handled::Yes)
+                }
+                Err(error) => {
+                    responder.respond_with_error(error)?;
+                    Ok(Handled::Yes)
+                }
+            }
+        }
         "session/prompt" => {
             let request: v2::PromptRequest = parse(&params, &method)?;
             let agent = agent.clone();

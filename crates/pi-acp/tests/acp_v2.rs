@@ -910,6 +910,100 @@ async fn v2_config_option_list_and_delete_are_native() {
         .expect("agent run_with returned an error");
 }
 
+#[tokio::test]
+async fn v2_tip_fork_uses_a_distinct_persisted_branch() {
+    let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let env = MockEnv::new();
+    let source_file = env._tmp.path().join("agent/sessions/source-session.jsonl");
+    std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+    let original = format!(
+        "{{\"type\":\"session\",\"id\":\"source-session\",\"cwd\":\"{}\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"before fork\"}}}}\n",
+        env.cwd.display()
+    );
+    std::fs::write(&source_file, &original).unwrap();
+    let cwd = env.cwd.clone();
+    let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+    let notifications = log.clone();
+    let (agent_end, client_end) = Channel::duplex();
+    let agent = Arc::new(AcpAgent::new(Config::from_env()));
+    let agent_task = tokio::spawn(async move { agent.run_with(agent_end).await });
+
+    Client
+        .v2()
+        .name("tip-fork-v2")
+        .on_receive_notification(
+            async move |notif: v2::UpdateSessionNotification, _cx| {
+                notifications
+                    .lock()
+                    .await
+                    .push(serde_json::to_value(notif).unwrap());
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_end, async move |cx| {
+            let init = cx
+                .send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("tip-fork-v2", "1"),
+                ))
+                .block_task()
+                .await?;
+            assert!(init.capabilities.session.as_ref().unwrap().fork.is_some());
+            let forked = cx
+                .send_request(v2::ForkSessionRequest::new("source-session", &cwd))
+                .block_task()
+                .await?;
+            let child = forked.session_id;
+            assert_ne!(child.0.as_ref(), "source-session");
+            assert!(!forked.config_options.is_empty());
+            let child_file = source_file.with_file_name(format!("{}.jsonl", child.0));
+            assert!(std::fs::read_to_string(&child_file)
+                .unwrap()
+                .contains("before fork"));
+            let raw = std::fs::read_to_string(&child_file).unwrap();
+            let header: serde_json::Value =
+                serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+            assert_eq!(
+                header["parentSession"],
+                source_file.to_string_lossy().as_ref()
+            );
+            assert_eq!(std::fs::read_to_string(&source_file).unwrap(), original);
+            cx.send_request(v2::PromptRequest::new(
+                child.clone(),
+                vec![v2::ContentBlock::Text(v2::TextContent::new("continue"))],
+            ))
+            .block_task()
+            .await?;
+            wait_for_raw(
+                &log,
+                |v| kind(v) == Some("state_update") && update(v)["state"] == "idle",
+                "forked prompt completion",
+            )
+            .await;
+            cx.send_request(v2::ResumeSessionRequest::new(child.clone(), &cwd))
+                .block_task()
+                .await?;
+            cx.send_request(v2::ResumeSessionRequest::new("source-session", &cwd))
+                .block_task()
+                .await?;
+            assert_eq!(std::fs::read_to_string(&source_file).unwrap(), original);
+            assert!(cx
+                .send_request(v2::ForkSessionRequest::new("unknown-session", &cwd))
+                .block_task()
+                .await
+                .is_err());
+            Ok(())
+        })
+        .await
+        .expect("v2 fork client failed");
+    tokio::time::timeout(TIMEOUT, agent_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
 /// A v1 client still gets v1 from the same agent that serves v2: registering a
 /// v2 implementation does not change v1 behavior.
 #[tokio::test]

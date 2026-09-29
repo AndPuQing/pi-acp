@@ -34,6 +34,52 @@ async fn spawn_mock(extra: &[&str]) -> PiProcess {
         .unwrap()
 }
 
+/// Offline smoke test for Pi's actual `clone` RPC, without a model prompt.
+/// Run with `PI_ACP_REAL_PI_BIN=/path/to/pi cargo test --test pi_process
+/// real_pi_clone_preserves_the_source -- --ignored`.
+#[tokio::test]
+#[ignore = "requires the installed real Pi CLI"]
+async fn real_pi_clone_preserves_the_source() {
+    let command = std::env::var("PI_ACP_REAL_PI_BIN").expect("set PI_ACP_REAL_PI_BIN");
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+    let source = tmp.path().join("source.jsonl");
+    let original = format!(
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"source-id\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n{{\"type\":\"message\",\"id\":\"a1b2c3d4\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"before fork\",\"timestamp\":1767225601000}}}}\n{{\"type\":\"message\",\"id\":\"b2c3d4e5\",\"parentId\":\"a1b2c3d4\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"ready\"}}],\"api\":\"openai-responses\",\"provider\":\"openai\",\"model\":\"gpt-5\",\"usage\":{{\"input\":0,\"output\":0}},\"stopReason\":\"stop\",\"timestamp\":1767225602000}}}}\n",
+        cwd.display()
+    );
+    fs::write(&source, &original).unwrap();
+    let snapshot = tmp.path().join("snapshot.jsonl");
+    fs::copy(&source, &snapshot).unwrap();
+    let mut pi = PiProcess::spawn_with_args_in_dir_and_env(
+        &command,
+        &[],
+        Some(&snapshot),
+        &cwd,
+        &[(
+            "PI_CODING_AGENT_DIR".into(),
+            agent_dir.to_string_lossy().into_owned(),
+        )],
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pi.get_state().await.unwrap().session_id, "source-id");
+    let result = pi.request(&RpcCommand::Clone).await.unwrap();
+    assert_eq!(result["cancelled"], false);
+    let child = pi.get_state().await.unwrap();
+    assert_ne!(child.session_id, "source-id");
+    let child_file = child.session_file.unwrap();
+    assert!(fs::read_to_string(child_file)
+        .unwrap()
+        .contains("before fork"));
+    assert_eq!(fs::read_to_string(source).unwrap(), original);
+    pi.dispose().await;
+}
+
 #[tokio::test]
 async fn spawn_in_dir_sets_pi_cwd() {
     let tmp = tempfile::tempdir().unwrap();

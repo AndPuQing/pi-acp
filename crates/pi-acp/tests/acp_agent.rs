@@ -1498,6 +1498,157 @@ async fn load_history_is_complete_when_the_response_returns() {
         .expect("load boundary client failed");
 }
 
+#[tokio::test]
+async fn v1_tip_fork_preserves_source_and_restores_the_child() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    fs::create_dir_all(&cwd).unwrap();
+    let source_file = write_pi_session(&agent_dir, "source-session", &cwd.to_string_lossy());
+    let original = fs::read(&source_file).unwrap();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
+    );
+    Client
+        .builder()
+        .name("tip-fork-v1")
+        .connect_with(agent, async |cx| {
+            let init = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            assert!(init.agent_capabilities.session_capabilities.fork.is_some());
+            let response = cx
+                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                    "source-session",
+                    &cwd,
+                ))
+                .block_task()
+                .await?;
+            let child = response.session_id;
+            assert_ne!(child.0.as_ref(), "source-session");
+            let child_file = agent_dir
+                .join("sessions")
+                .join(format!("{}.jsonl", child.0));
+            assert_eq!(fs::read(&source_file).unwrap(), original);
+            let child_text = fs::read_to_string(&child_file).unwrap();
+            assert!(child_text.contains("first user message"));
+            assert!(child_text
+                .lines()
+                .next()
+                .unwrap()
+                .contains(child.0.as_ref()));
+            let header: Value = serde_json::from_str(child_text.lines().next().unwrap()).unwrap();
+            assert_eq!(
+                header["parentSession"],
+                source_file.to_string_lossy().as_ref()
+            );
+            cx.send_request(prompt_for(&child, "continue"))
+                .block_task()
+                .await?;
+            cx.send_request(LoadSessionRequest::new(child.clone(), &cwd))
+                .block_task()
+                .await?;
+            cx.send_request(LoadSessionRequest::new("source-session", &cwd))
+                .block_task()
+                .await?;
+            assert_eq!(fs::read(&source_file).unwrap(), original);
+            let unknown = cx
+                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                    "not-a-session",
+                    &cwd,
+                ))
+                .block_task()
+                .await;
+            assert!(unknown.is_err());
+            Ok(())
+        })
+        .await
+        .expect("v1 fork client failed");
+}
+
+#[tokio::test]
+async fn failed_tip_fork_does_not_delete_the_source_or_leave_a_child() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    fs::create_dir_all(&cwd).unwrap();
+    let source = write_pi_session(&agent_dir, "source-session", &cwd.to_string_lossy());
+    let original = fs::read(&source).unwrap();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_ACP_MOCK_MODELS_ERROR", "models unavailable")
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
+    );
+    Client
+        .builder()
+        .name("tip-fork-failure")
+        .connect_with(agent, async |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            assert!(cx
+                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                    "source-session",
+                    &cwd
+                ))
+                .block_task()
+                .await
+                .is_err());
+            Ok(())
+        })
+        .await
+        .expect("failure client failed");
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(fs::read_dir(agent_dir.join("sessions")).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_tip_fork_leaves_only_the_source_session() {
+    let _test_guard = acquire_test_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    fs::create_dir_all(&cwd).unwrap();
+    let source = write_pi_session(&agent_dir, "source-session", &cwd.to_string_lossy());
+    let original = fs::read(&source).unwrap();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(BIN)
+            .env("PI_ACP_MOCK", "1")
+            .env("PI_ACP_PI_COMMAND", BIN)
+            .env("PI_ACP_MOCK_CLONE_CANCEL", "1")
+            .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
+    );
+    Client
+        .builder()
+        .name("tip-fork-cancel")
+        .connect_with(agent, async |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            assert!(cx
+                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                    "source-session",
+                    &cwd
+                ))
+                .block_task()
+                .await
+                .is_err());
+            Ok(())
+        })
+        .await
+        .expect("cancel client failed");
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(fs::read_dir(agent_dir.join("sessions")).unwrap().count(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Signal handling (design §8.3)
 // ---------------------------------------------------------------------------

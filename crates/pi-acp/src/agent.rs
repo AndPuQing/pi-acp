@@ -14,6 +14,8 @@
 //!   thought_level selects) + modes, startup info metadata, `closeAllExcept`
 //!   policy, then post-response startup and `available_commands_update`
 //!   notifications.
+//! - `session/fork` — tip-only clone from a persisted session using a
+//!   disposable Pi process and source snapshot; the source remains untouched.
 //! - `session/prompt` — restore-or-use session, expand file slash commands,
 //!   handle built-in slash commands headlessly, else run the turn through the
 //!   session queue. The handler **spawns** the turn and responds from the task
@@ -43,13 +45,13 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionId, SessionInfo, SessionMode, SessionModeId, SessionModeState,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason,
+    DeleteSessionRequest, DeleteSessionResponse, ForkSessionRequest, ForkSessionResponse,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
+    Meta, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionId, SessionInfo,
+    SessionMode, SessionModeId, SessionModeState, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
 };
 use agent_client_protocol::{
     on_receive_dispatch, on_receive_notification, on_receive_request, Agent, ConnectTo,
@@ -64,8 +66,9 @@ use crate::commands::{self, FileSlashCommand};
 use crate::config::Config;
 use crate::error::{AcpxError, Result};
 use crate::mcp::{self, McpServerSpec};
+use crate::pi::process::PiProcess;
 use crate::pi::rpc::{
-    clamp_thinking_level, supported_thinking_levels, ImageContent, Model, QueueMode,
+    clamp_thinking_level, supported_thinking_levels, ImageContent, Model, QueueMode, RpcCommand,
     RpcSessionState, ThinkingLevel,
 };
 use crate::pi::sessions::{
@@ -185,6 +188,14 @@ pub(crate) struct NewSessionParams {
     pub(crate) cwd: PathBuf,
     pub(crate) additional_directories: Vec<PathBuf>,
     /// MCP servers, already validated into adapter definitions.
+    pub(crate) mcp_specs: Vec<McpServerSpec>,
+}
+
+/// Parameters for a tip fork; checkpoint selection is not an ACP method.
+pub(crate) struct ForkSessionParams {
+    pub(crate) source_id: SessionId,
+    pub(crate) cwd: PathBuf,
+    pub(crate) additional_directories: Vec<PathBuf>,
     pub(crate) mcp_specs: Vec<McpServerSpec>,
 }
 
@@ -436,6 +447,7 @@ impl AcpAgent {
         let agent = self.clone();
         let a_init = agent.clone();
         let a_new = agent.clone();
+        let a_fork = agent.clone();
         let a_prompt = agent.clone();
         let a_cancel = agent.clone();
         let a_load = agent.clone();
@@ -474,6 +486,15 @@ impl AcpAgent {
                             })
                         }
                         Err(e) => responder.respond_with_error(e),
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ForkSessionRequest, responder, cx| {
+                    match a_fork.handle_fork_session(&req, &cx).await {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
                     }
                 },
                 on_receive_request!(),
@@ -732,10 +753,10 @@ impl AcpAgent {
                     .embedded_context(self.cfg.enable_embedded_context),
             )
             .session_capabilities(
-                // v1 capabilities are unchanged: the v1 ACP method surface must
-                // not move. v2 builds its own capability block from the same
-                // config (see `handle_initialize_v2`).
+                // Tip fork is the only ACP fork shape: this capability does
+                // not claim historical message or checkpoint selection.
                 SessionCapabilities::new()
+                    .fork(agent_client_protocol::schema::v1::SessionForkCapabilities::new())
                     .list(agent_client_protocol::schema::v1::SessionListCapabilities::new())
                     .delete(agent_client_protocol::schema::v1::SessionDeleteCapabilities::new())
                     .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
@@ -783,6 +804,7 @@ impl AcpAgent {
             prompt = prompt.embedded_context(Some(v2::PromptEmbeddedContextCapabilities::new()));
         }
         let session = v2::SessionCapabilities::new()
+            .fork(v2::SessionForkCapabilities::new())
             .delete(v2::SessionDeleteCapabilities::new())
             .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new())
             .prompt(Some(prompt))
@@ -854,6 +876,49 @@ impl AcpAgent {
             }))
             .meta(facts.meta);
         Ok((response, post))
+    }
+
+    /// Fork only the current tip of a persisted Pi session. ACP has no
+    /// checkpoint parameter; the source session is never advanced by this call.
+    pub(crate) async fn handle_fork_session_v2(
+        &self,
+        req: &v2::ForkSessionRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<v2::ForkSessionResponse, AcpError> {
+        let cwd = req.cwd.0.clone();
+        if !cwd.is_absolute() {
+            return Err(invalid_params("session/fork: cwd must be absolute"));
+        }
+        let additional_directories: Vec<PathBuf> = req
+            .additional_directories
+            .iter()
+            .map(|path| path.0.clone())
+            .collect();
+        validate_additional_directories("session/fork", &additional_directories)?;
+        let mcp_specs = check_mcp_specs(
+            "session/fork",
+            mcp::normalize_mcp_servers_v2(&req.mcp_servers),
+            self.cfg.enable_mcp,
+        )?;
+        let facts = self
+            .handle_fork_session_params(
+                ForkSessionParams {
+                    source_id: Self::to_v1_session_id(&req.session_id),
+                    cwd,
+                    additional_directories,
+                    mcp_specs,
+                },
+                cx,
+            )
+            .await?;
+        Ok(
+            v2::ForkSessionResponse::new(Self::to_v2_session_id(&facts.session_id)).config_options(
+                crate::render::config_options_v2(&ConfigOptionsFact {
+                    session_id: facts.session_id,
+                    options: facts.config_options,
+                }),
+            ),
+        )
     }
 
     /// The native ACP v2 `session/resume`.
@@ -1041,6 +1106,246 @@ impl AcpAgent {
             }))
             .meta(facts.meta);
         Ok((response, post))
+    }
+
+    /// The stable ACP v1 `session/fork` adapter.
+    pub(crate) async fn handle_fork_session(
+        &self,
+        req: &ForkSessionRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<ForkSessionResponse, AcpError> {
+        if !req.cwd.is_absolute() {
+            return Err(invalid_params("session/fork: cwd must be absolute"));
+        }
+        validate_additional_directories("session/fork", &req.additional_directories)?;
+        let mcp_specs = check_mcp_servers("session/fork", &req.mcp_servers, self.cfg.enable_mcp)?;
+        let facts = self
+            .handle_fork_session_params(
+                ForkSessionParams {
+                    source_id: req.session_id.clone(),
+                    cwd: req.cwd.clone(),
+                    additional_directories: req.additional_directories.clone(),
+                    mcp_specs,
+                },
+                cx,
+            )
+            .await?;
+        Ok(ForkSessionResponse::new(facts.session_id.clone())
+            .modes(mode_state_to_acp(&facts.modes))
+            .config_options(crate::render::config_options_v1(&ConfigOptionsFact {
+                session_id: facts.session_id,
+                options: facts.config_options,
+            })))
+    }
+
+    /// Copy the persisted active branch using a disposable Pi process. Pi's
+    /// `clone` rebinds its *own* process, so sending it to the source's live
+    /// process would silently move the original thread onto the child.
+    async fn handle_fork_session_params(
+        &self,
+        params: ForkSessionParams,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<NewSessionFacts, AcpError> {
+        let _lifecycle = self.session_lifecycle.lock().await;
+        let stored = self
+            .find_stored_session(&params.source_id.0)
+            .ok_or_else(|| invalid_params("session/fork: source session is not persisted"))?;
+        if Path::new(&stored.cwd) != params.cwd
+            || stored.additional_directories != params.additional_directories
+        {
+            return Err(invalid_params(
+                "session/fork: cwd and additional directories must match the source session",
+            ));
+        }
+        let source_path = resolve_session_file_path(&params.cwd, &stored.session_file);
+        if !session_file_matches_id(&source_path, &params.source_id.0) {
+            return Err(invalid_params(
+                "session/fork: source session file is missing or mismatched",
+            ));
+        }
+        if let Some(source) = self.sessions.maybe_get(&params.source_id).await {
+            let state = source.get_state().await.map_err(acp_error_from_pi)?;
+            if state.is_streaming || state.is_compacting {
+                return Err(invalid_params("session/fork: source session is busy"));
+            }
+        }
+
+        let snapshot_dir = tempfile::tempdir().map_err(|error| {
+            AcpError::new(
+                ACP_INTERNAL_ERROR,
+                format!("session/fork: snapshot directory: {error}"),
+            )
+        })?;
+        let snapshot_path = snapshot_dir.path().join("source.jsonl");
+        let source_bytes = std::fs::read(&source_path).map_err(|error| {
+            AcpError::new(
+                ACP_INTERNAL_ERROR,
+                format!("session/fork: read source: {error}"),
+            )
+        })?;
+        if !source_bytes.ends_with(b"\n")
+            || source_bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|row| !row.is_empty())
+                .any(|row| serde_json::from_slice::<Value>(row).is_err())
+        {
+            return Err(invalid_params("session/fork: source file is incomplete"));
+        }
+        std::fs::write(&snapshot_path, source_bytes).map_err(|error| {
+            AcpError::new(
+                ACP_INTERNAL_ERROR,
+                format!("session/fork: copy source: {error}"),
+            )
+        })?;
+
+        let timeout = std::time::Duration::from_secs(self.cfg.rpc_timeout_secs);
+        let mut helper = PiProcess::spawn_with_args_in_dir(
+            &self.cfg.pi_command,
+            &[],
+            Some(&snapshot_path),
+            &params.cwd,
+            timeout,
+        )
+        .await
+        .map_err(acp_error_from_pi)?;
+        let clone_result = async {
+            let before = helper.get_state().await.map_err(acp_error_from_pi)?;
+            if before.session_id != params.source_id.0.as_ref() {
+                return Err(invalid_params(
+                    "session/fork: Pi opened a different source session",
+                ));
+            }
+            let answer = helper
+                .request(&RpcCommand::Clone)
+                .await
+                .map_err(acp_error_from_pi)?;
+            if answer.get("cancelled").and_then(Value::as_bool) != Some(false) {
+                return Err(invalid_params(
+                    "session/fork: Pi cancelled or did not confirm the clone",
+                ));
+            }
+            let after = helper.get_state().await.map_err(acp_error_from_pi)?;
+            if after.session_id == params.source_id.0.as_ref() || after.session_id.is_empty() {
+                return Err(AcpError::new(
+                    ACP_INTERNAL_ERROR,
+                    "session/fork: Pi reused the source session ID",
+                ));
+            }
+            let file = after
+                .session_file
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    AcpError::new(
+                        ACP_INTERNAL_ERROR,
+                        "session/fork: Pi returned no child session file",
+                    )
+                })?;
+            let path = resolve_session_file_path(&params.cwd, file);
+            if path == source_path || !session_file_matches_id(&path, &after.session_id) {
+                return Err(AcpError::new(
+                    ACP_INTERNAL_ERROR,
+                    "session/fork: child session file is not persisted",
+                ));
+            }
+            Ok::<_, AcpError>((SessionId::new(after.session_id), path, file.to_owned()))
+        }
+        .await;
+        helper.dispose().await;
+        let (child_id, child_path, child_file) = clone_result?;
+        if self.store.get(&child_id.0).is_some()
+            || self.sessions.maybe_get(&child_id).await.is_some()
+        {
+            return Err(AcpError::new(
+                ACP_INTERNAL_ERROR,
+                "session/fork: Pi returned an already registered session ID",
+            ));
+        }
+        if let Err(error) = reparent_fork_file(&child_path, &child_id.0, &source_path) {
+            self.cleanup_failed_fork_session(&child_id, &child_path)
+                .await;
+            return Err(error);
+        }
+
+        let file_commands =
+            commands::load_slash_commands_with_roots(&params.cwd, &params.additional_directories);
+        let child = match self
+            .spawn_session(
+                Some(&params.cwd),
+                Some(child_path.clone()),
+                Some(child_id.clone()),
+                cx,
+                SpawnSessionOptions {
+                    file_commands,
+                    mcp_specs: &params.mcp_specs,
+                    additional_directories: &params.additional_directories,
+                },
+            )
+            .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                self.cleanup_failed_fork_session(&child_id, &child_path)
+                    .await;
+                return Err(error);
+            }
+        };
+        if !params.mcp_specs.is_empty() {
+            if let Err(error) = gate_mcp_registered(&child, &params.mcp_specs).await {
+                self.cleanup_failed_fork_session(&child_id, &child_path)
+                    .await;
+                return Err(error);
+            }
+            self.mcp_configs
+                .lock()
+                .await
+                .insert(child_id.0.to_string(), params.mcp_specs);
+        }
+        let state = child.initial_state().clone();
+        let models = match child.get_available_models().await {
+            Ok(models) if !models.is_empty() => models,
+            Ok(_) => {
+                self.cleanup_failed_fork_session(&child_id, &child_path)
+                    .await;
+                return Err(auth_required());
+            }
+            Err(error) => {
+                self.cleanup_failed_fork_session(&child_id, &child_path)
+                    .await;
+                return Err(acp_error_from_pi(error));
+            }
+        };
+        let (config_options, _models, modes) =
+            get_session_configuration(&child, Some(&state), Some(&models)).await;
+        self.store.upsert_with_additional_directories(
+            &child_id.0,
+            &params.cwd.to_string_lossy(),
+            &child_file,
+            &params.additional_directories,
+        );
+        *self.last_session_cwd.lock().await = Some(params.cwd);
+        self.sessions.close_all_except(&child_id).await;
+        self.mcp_configs
+            .lock()
+            .await
+            .retain(|id, _| id == child_id.0.as_ref());
+        Ok(NewSessionFacts {
+            session_id: child_id,
+            config_options,
+            modes,
+            meta: serde_json::Map::new(),
+        })
+    }
+
+    /// Remove only the child whose file header proves its identity; a failed
+    /// fork must never unlink the source session or another thread's mapping.
+    async fn cleanup_failed_fork_session(&self, child_id: &SessionId, path: &Path) {
+        self.sessions.close(child_id).await;
+        self.mcp_configs.lock().await.remove(child_id.0.as_ref());
+        if session_file_matches_id(path, &child_id.0) {
+            let _ = std::fs::remove_file(path);
+        }
+        self.store.delete(&child_id.0);
     }
 
     /// The shared engine behind `session/new`; no protocol types cross it.
@@ -2370,6 +2675,64 @@ fn resolve_session_file_path(cwd: &Path, session_file: &str) -> PathBuf {
     } else {
         cwd.join(path)
     }
+}
+
+/// Pi's clone records the disposable helper's snapshot as `parentSession`.
+/// Change only that header field, atomically, before opening the child: the
+/// durable parent is the original file, not a temporary copy of it.
+fn reparent_fork_file(
+    path: &Path,
+    child_id: &str,
+    source: &Path,
+) -> std::result::Result<(), AcpError> {
+    use std::io::Write as _;
+
+    if !session_file_matches_id(path, child_id) {
+        return Err(invalid_params("session/fork: child file identity changed"));
+    }
+    let raw = std::fs::read(path).map_err(|error| {
+        AcpError::new(
+            ACP_INTERNAL_ERROR,
+            format!("session/fork: read child: {error}"),
+        )
+    })?;
+    let newline = raw
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| invalid_params("session/fork: child header is incomplete"))?;
+    let mut header: Value = serde_json::from_slice(&raw[..newline]).map_err(|error| {
+        AcpError::new(
+            ACP_INTERNAL_ERROR,
+            format!("session/fork: child header: {error}"),
+        )
+    })?;
+    header["parentSession"] = json!(source.to_string_lossy());
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|error| {
+            AcpError::new(
+                ACP_INTERNAL_ERROR,
+                format!("session/fork: temporary child: {error}"),
+            )
+        })?;
+    serde_json::to_writer(&mut tmp, &header).map_err(|error| {
+        AcpError::new(
+            ACP_INTERNAL_ERROR,
+            format!("session/fork: write header: {error}"),
+        )
+    })?;
+    tmp.write_all(&raw[newline..]).map_err(|error| {
+        AcpError::new(
+            ACP_INTERNAL_ERROR,
+            format!("session/fork: write child: {error}"),
+        )
+    })?;
+    tmp.persist(path).map_err(|error| {
+        AcpError::new(
+            ACP_INTERNAL_ERROR,
+            format!("session/fork: persist child: {error}"),
+        )
+    })?;
+    Ok(())
 }
 
 fn invalid_params(msg: &str) -> AcpError {

@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     DeleteSessionRequest, DeleteSessionResponse, ForkSessionRequest, ForkSessionResponse,
     Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
@@ -296,7 +296,11 @@ pub(crate) struct LoadSessionPostResponse {
 }
 
 impl LoadSessionPostResponse {
-    pub(crate) async fn send(self, cx: &ConnectionTo<Client>, protocol: Protocol) {
+    pub(crate) async fn send(
+        self,
+        cx: &ConnectionTo<Client>,
+        protocol: Protocol,
+    ) -> std::result::Result<(), AcpError> {
         let session_id = self.session.session_id().clone();
         if let Some(title) = self.title {
             let _ = crate::render::send_session_info(
@@ -311,7 +315,20 @@ impl LoadSessionPostResponse {
             );
         }
         if self.replay {
-            replay_history(cx, protocol, &self.session, &self.history).await;
+            if protocol.is_v2() {
+                let updates = crate::conversation::replay(session_id.0.as_ref())
+                    .map_err(acp_error_from_pi)?;
+                for update in updates {
+                    cx.send_notification(update)?;
+                }
+                // Even an empty requested replay needs its boundary before current state.
+                cx.send_notification(v2::UpdateSessionNotification::new(
+                    v2::SessionId::new(session_id.0.as_ref()),
+                    v2::SessionUpdate::ReplayComplete(v2::ReplayComplete::new()),
+                ))?;
+            } else {
+                replay_history(cx, protocol, &self.session, &self.history).await;
+            }
         }
         advertise_commands(
             cx,
@@ -321,6 +338,7 @@ impl LoadSessionPostResponse {
             &self.file_commands,
         )
         .await;
+        Ok(())
     }
 }
 
@@ -352,6 +370,7 @@ async fn drain_startup_tasks(
 
 /// The per-connection agent: shared state behind every handler.
 pub struct AcpAgent {
+    v2_insertion_gate: Mutex<()>,
     cfg: Config,
     sessions: SessionManager,
     store: SessionStore,
@@ -378,6 +397,7 @@ impl AcpAgent {
     pub fn new(cfg: Config) -> Self {
         Self {
             cfg,
+            v2_insertion_gate: Mutex::new(()),
             sessions: SessionManager::new(),
             store: SessionStore::new(),
             session_lifecycle: Mutex::new(()),
@@ -426,7 +446,7 @@ impl AcpAgent {
     ///     agent.run_with(agent_end).await
     /// }});
     /// // ... and an ACP client on the other.
-    /// Client.builder()
+    /// Client.v1()
     ///     .name("in-process-client")
     ///     .connect_with(client_end, async |cx| {
     ///         // send_request(InitializeRequest...) / NewSessionRequest / PromptRequest
@@ -438,7 +458,7 @@ impl AcpAgent {
     /// ```
     ///
     /// The transport parameter may equally be a fully built client component
-    /// (`Client.builder()...` implements `ConnectTo<Agent>`), in which case this
+    /// (`Client.v1()...` implements `ConnectTo<Agent>`), in which case this
     /// method drives both sides.
     ///
     /// Only the transport changes: handler registration order, response timing,
@@ -458,7 +478,7 @@ impl AcpAgent {
         let a_set_model = agent.clone();
 
         let builder = Agent
-            .builder()
+            .v1()
             .name("pi-acp")
             .on_receive_request(
                 async move |req: InitializeRequest, responder, _cx| {
@@ -469,6 +489,7 @@ impl AcpAgent {
             )
             .on_receive_request(
                 async move |req: NewSessionRequest, responder, cx| {
+                    let cx = cx.into_raw();
                     let agent = a_new.clone();
                     let result = agent.handle_new_session(&req, &cx).await;
                     match result {
@@ -492,6 +513,7 @@ impl AcpAgent {
             )
             .on_receive_request(
                 async move |req: ForkSessionRequest, responder, cx| {
+                    let cx = cx.into_raw();
                     match a_fork.handle_fork_session(&req, &cx).await {
                         Ok(response) => responder.respond(response),
                         Err(error) => responder.respond_with_error(error),
@@ -501,6 +523,7 @@ impl AcpAgent {
             )
             .on_receive_request(
                 async move |req: PromptRequest, responder, cx| {
+                    let cx = cx.into_raw();
                     // Spawn the turn: the SDK dispatch loop blocks while a
                     // handler runs, and `session/cancel` must stay processable
                     // during a long turn. The responder travels into the task
@@ -537,6 +560,7 @@ impl AcpAgent {
             )
             .on_receive_request(
                 async move |req: LoadSessionRequest, responder, cx| {
+                    let cx = cx.into_raw();
                     let agent = a_load.clone();
                     let result = agent.handle_load_session(&req, &cx).await;
                     match result {
@@ -552,8 +576,10 @@ impl AcpAgent {
                             // the client, so waiting for the response before
                             // publishing has no session-registration purpose.
                             let protocol = agent.protocol();
-                            post_response.send(&cx, protocol).await;
-                            responder.respond(resp)
+                            match post_response.send(&cx, protocol).await {
+                                Ok(()) => responder.respond(resp),
+                                Err(error) => responder.respond_with_error(error),
+                            }
                         }
                         Err(e) => responder.respond_with_error(e),
                     }
@@ -584,6 +610,7 @@ impl AcpAgent {
             )
             .on_receive_request(
                 async move |req: SetSessionModeRequest, responder, cx| {
+                    let cx = cx.into_raw();
                     let agent = a_set_mode.clone();
                     let result = agent.handle_set_mode(&req, &cx).await;
                     match result {
@@ -595,6 +622,7 @@ impl AcpAgent {
             )
             .on_receive_request(
                 async move |req: SetSessionConfigOptionRequest, responder, cx| {
+                    let cx = cx.into_raw();
                     let agent = a_set_config.clone();
                     let result = agent.handle_set_config_option(&req, &cx).await;
                     match result {
@@ -615,7 +643,8 @@ impl AcpAgent {
             // pinned schema cannot type. Claims only that method; everything
             // else passes through untouched.
             .on_receive_dispatch(
-                async move |dispatch: Dispatch<UntypedMessage, UntypedMessage>, cx| {
+                async move |dispatch: Dispatch<UntypedMessage, UntypedMessage, agent_client_protocol::V1>, cx| {
+                    let cx = cx.into_raw();
                     let Dispatch::Request(message, responder) = dispatch else {
                         return Ok(Handled::No {
                             message: dispatch,
@@ -742,8 +771,16 @@ impl AcpAgent {
                 // carries no cwd, so only the global install is probed —
                 // never a project directory. There is no `acp` item:
                 // MCP-over-ACP is out of scope.
-                let (http, sse) =
-                    mcp::advertise_mcp_capabilities(self.cfg.enable_mcp, mcp::adapter_available());
+                let (http, sse) = mcp::advertise_mcp_capabilities(
+                    self.cfg.enable_mcp,
+                    mcp::adapter_available()
+                        || (self.cfg.bounded
+                            && self
+                                .cfg
+                                .bounded_mcp_module
+                                .as_ref()
+                                .is_some_and(|p| p.is_absolute() && p.is_file())),
+                );
                 McpCapabilities::new().http(http).sse(sse)
             })
             .prompt_capabilities(
@@ -756,9 +793,9 @@ impl AcpAgent {
                 // Tip fork is the only ACP fork shape: this capability does
                 // not claim historical message or checkpoint selection.
                 SessionCapabilities::new()
-                    .fork(agent_client_protocol::schema::v1::SessionForkCapabilities::new())
-                    .list(agent_client_protocol::schema::v1::SessionListCapabilities::new())
-                    .delete(agent_client_protocol::schema::v1::SessionDeleteCapabilities::new())
+                    .fork(agent_client_protocol::v1::schema::SessionForkCapabilities::new())
+                    .list(agent_client_protocol::v1::schema::SessionListCapabilities::new())
+                    .delete(agent_client_protocol::v1::schema::SessionDeleteCapabilities::new())
                     .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
             );
 
@@ -792,8 +829,16 @@ impl AcpAgent {
         tracing::info!(protocol_version = ?req.protocol_version, "ACP v2 initialize");
         self.protocol.set(Protocol::V2);
 
-        let (http, _sse) =
-            mcp::advertise_mcp_capabilities(self.cfg.enable_mcp, mcp::adapter_available());
+        let (http, _sse) = mcp::advertise_mcp_capabilities(
+            self.cfg.enable_mcp,
+            mcp::adapter_available()
+                || (self.cfg.bounded
+                    && self
+                        .cfg
+                        .bounded_mcp_module
+                        .as_ref()
+                        .is_some_and(|p| p.is_absolute() && p.is_file())),
+        );
         let mut mcp = v2::McpCapabilities::new();
         if http {
             mcp = mcp.http(Some(v2::McpHttpCapabilities::new()));
@@ -803,12 +848,15 @@ impl AcpAgent {
         if self.cfg.enable_embedded_context {
             prompt = prompt.embedded_context(Some(v2::PromptEmbeddedContextCapabilities::new()));
         }
-        let session = v2::SessionCapabilities::new()
-            .fork(v2::SessionForkCapabilities::new())
+        let mut session = v2::SessionCapabilities::new()
             .delete(v2::SessionDeleteCapabilities::new())
-            .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new())
             .prompt(Some(prompt))
             .mcp(Some(mcp));
+        if !self.cfg.bounded {
+            session = session
+                .fork(v2::SessionForkCapabilities::new())
+                .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new());
+        }
         let capabilities = v2::AgentCapabilities::new().session(Some(session));
 
         v2::InitializeResponse::new(
@@ -833,6 +881,18 @@ impl AcpAgent {
     /// A v2 session id, from an engine fact.
     fn to_v2_session_id(session_id: &SessionId) -> v2::SessionId {
         v2::SessionId::new(session_id.0.to_string())
+    }
+
+    fn execution_options(&self, mut options: Vec<ConfigOptionFact>) -> Vec<ConfigOptionFact> {
+        if self.cfg.bounded {
+            options.push(ConfigOptionFact {
+                id: "execution_profile".into(), name: "Execution profile".into(),
+                description: Some("Fixed workspace coding tools and frozen direct HTTP MCP catalog; no shell, extension commands, remote tasks, sampling, autonomous follow-ups or automatic retry after uncertain delivery.".into()),
+                category: None, current_value: "bounded-coding-v1".into(),
+                choices: vec![ConfigChoiceFact { value: "bounded-coding-v1".into(), name: "Bounded coding".into(), description: None, meta: None }], meta: None,
+            });
+        }
+        options
     }
 
     /// The native ACP v2 `session/new`.
@@ -872,7 +932,7 @@ impl AcpAgent {
         let response = v2::NewSessionResponse::new(Self::to_v2_session_id(&facts.session_id))
             .config_options(crate::render::config_options_v2(&ConfigOptionsFact {
                 session_id: facts.session_id,
-                options: facts.config_options,
+                options: self.execution_options(facts.config_options),
             }))
             .meta(facts.meta);
         Ok((response, post))
@@ -885,6 +945,11 @@ impl AcpAgent {
         req: &v2::ForkSessionRequest,
         cx: &ConnectionTo<Client>,
     ) -> std::result::Result<v2::ForkSessionResponse, AcpError> {
+        if self.cfg.bounded {
+            return Err(invalid_params(
+                "fork is disabled by the bounded execution profile",
+            ));
+        }
         let cwd = req.cwd.0.clone();
         if !cwd.is_absolute() {
             return Err(invalid_params("session/fork: cwd must be absolute"));
@@ -915,7 +980,7 @@ impl AcpAgent {
             v2::ForkSessionResponse::new(Self::to_v2_session_id(&facts.session_id)).config_options(
                 crate::render::config_options_v2(&ConfigOptionsFact {
                     session_id: facts.session_id,
-                    options: facts.config_options,
+                    options: self.execution_options(facts.config_options),
                 }),
             ),
         )
@@ -950,8 +1015,62 @@ impl AcpAgent {
             self.cfg.enable_mcp,
         )?;
         let session_id = Self::to_v1_session_id(&req.session_id);
-        let (facts, mut post) = self
-            .handle_load_session_params(
+        if replay {
+            crate::conversation::replay(session_id.0.as_ref()).map_err(acp_error_from_pi)?;
+        }
+        let (facts, mut post) = if self.cfg.bounded {
+            if let Some(session) = self.sessions.maybe_get(&session_id).await {
+                if session.cwd() != cwd
+                    || session.additional_directories() != additional_directories.as_slice()
+                {
+                    return Err(invalid_params(
+                        "resume cannot change a live bounded session workspace",
+                    ));
+                }
+                // The live transport/catalog cannot be replaced by resume.
+                let prior_specs = self
+                    .mcp_configs
+                    .lock()
+                    .await
+                    .get(session_id.0.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+                if prior_specs != mcp_specs {
+                    return Err(invalid_params(
+                        "resume cannot mutate a live bounded MCP catalog",
+                    ));
+                }
+                let history = session.get_messages().await.map_err(acp_error_from_pi)?;
+                let (config_options, _, modes) =
+                    get_session_configuration(&session, None, None).await;
+                (
+                    LoadSessionFacts {
+                        config_options,
+                        modes,
+                    },
+                    LoadSessionPostResponse {
+                        session,
+                        history,
+                        title: None,
+                        enable_skill_commands: false,
+                        file_commands: vec![],
+                        replay,
+                    },
+                )
+            } else {
+                self.handle_load_session_params(
+                    LoadSessionParams {
+                        session_id: session_id.clone(),
+                        cwd,
+                        additional_directories,
+                        mcp_specs,
+                    },
+                    cx,
+                )
+                .await?
+            }
+        } else {
+            self.handle_load_session_params(
                 LoadSessionParams {
                     session_id: session_id.clone(),
                     cwd,
@@ -960,12 +1079,13 @@ impl AcpAgent {
                 },
                 cx,
             )
-            .await?;
+            .await?
+        };
         post.replay = replay;
         let response = v2::ResumeSessionResponse::new().config_options(
             crate::render::config_options_v2(&ConfigOptionsFact {
                 session_id,
-                options: facts.config_options,
+                options: self.execution_options(facts.config_options),
             }),
         );
         Ok((response, post))
@@ -1008,7 +1128,7 @@ impl AcpAgent {
         req: &v2::DeleteSessionRequest,
     ) -> std::result::Result<v2::DeleteSessionResponse, AcpError> {
         self.handle_delete_session_id(&Self::to_v1_session_id(&req.session_id))
-            .await;
+            .await?;
         Ok(v2::DeleteSessionResponse::new())
     }
 
@@ -1044,26 +1164,120 @@ impl AcpAgent {
         Ok(v2::SetSessionConfigOptionResponse::new(
             crate::render::config_options_v2(&ConfigOptionsFact {
                 session_id,
-                options: config_options,
+                options: self.execution_options(config_options),
             }),
         ))
     }
 
     /// The native ACP v2 `session/prompt`.
     ///
-    /// v2 reports turn completion through `state_update` (published by the
-    /// session pump) and its `PromptResponse` carries only `_meta`, so the
-    /// engine's stop reason is deliberately not carried into the response.
+    /// Validate/admit an insertion, echo and acknowledge its stable identity,
+    /// then run native work separately. Completion is a state observation, not
+    /// an insertion acknowledgement.
     pub(crate) async fn handle_prompt_v2(
-        &self,
+        self: &Arc<Self>,
         req: &v2::PromptRequest,
         cx: &ConnectionTo<Client>,
     ) -> std::result::Result<(v2::PromptResponse, Option<Arc<PiAcpSession>>), AcpError> {
+        let _insertion = self.v2_insertion_gate.lock().await;
+        let sid = Self::to_v1_session_id(&req.session_id);
+        let key = req.idempotency_key.as_ref().map(|k| k.as_str());
+        if let Some(id) =
+            crate::conversation::lookup(sid.0.as_ref(), key).map_err(acp_error_from_pi)?
+        {
+            return Ok((v2::PromptResponse::new(id), None));
+        }
+        let session = self.restore_session(&sid, None, None, cx).await?;
         let pi_prompt = crate::translate::prompt::prompt_to_pi_message_v2(&req.prompt);
-        let (_stop, session) = self
-            .handle_prompt_turn(&Self::to_v1_session_id(&req.session_id), pi_prompt, cx)
-            .await?;
-        Ok((v2::PromptResponse::new(), session))
+        if self.cfg.bounded {
+            if pi_prompt.message.trim_start().starts_with('/')
+                || session.bounded.as_ref().is_some_and(|r| r.uncertain())
+            {
+                return Err(invalid_params(
+                    "bounded prompt has unsupported commands or unresolved prior work",
+                ));
+            }
+            if session
+                .v2_prompt_reserved
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(invalid_params("bounded mode permits one foreground owner"));
+            }
+        }
+        let id = match crate::conversation::insert(sid.0.as_ref(), key, req.prompt.clone()) {
+            Ok((id, true)) => id,
+            Ok((id, false)) => {
+                session
+                    .v2_prompt_reserved
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return Ok((v2::PromptResponse::new(id), None));
+            }
+            Err(error) => {
+                session
+                    .v2_prompt_reserved
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err(acp_error_from_pi(error));
+            }
+        };
+        crate::render::send_v2(
+            cx,
+            v2::UpdateSessionNotification::new(
+                req.session_id.clone(),
+                v2::SessionUpdate::UserMessage(
+                    v2::UserMessage::new(id.clone()).content(req.prompt.clone()),
+                ),
+            ),
+        )
+        .map_err(acp_error_from_pi)?;
+        let agent = self.clone();
+        let cx_for_task = cx.clone();
+        let owner = session.clone();
+        let cancel_epoch = owner
+            .v2_cancel_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        cx.spawn(async move {
+            if owner
+                .v2_cancel_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != cancel_epoch
+            {
+                owner
+                    .v2_prompt_reserved
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                owner
+                    .publish_current_state()
+                    .await
+                    .map_err(acp_error_from_pi)?;
+                return Ok(());
+            }
+            let result = agent
+                .execute_prompt_on_session(owner.clone(), pi_prompt, &cx_for_task)
+                .await;
+            match result {
+                Ok((_, persisted)) => {
+                    if let Some(session) = persisted {
+                        agent.persist_session_if_ready(&session).await;
+                    }
+                }
+                Err(_) => {
+                    owner
+                        .v2_prompt_reserved
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(runtime) = &owner.bounded {
+                        let _ = runtime.mark_uncertain();
+                    }
+                    let _ = crate::render::send_v2(
+                        &cx_for_task,
+                        crate::render::foreground_v2(
+                            owner.session_id(),
+                            crate::session::ForegroundState::Unknown,
+                        ),
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        Ok((v2::PromptResponse::new(id), None))
     }
 
     // -----------------------------------------------------------------------
@@ -1102,7 +1316,7 @@ impl AcpAgent {
             .modes(mode_state_to_acp(&facts.modes))
             .config_options(crate::render::config_options_v1(&ConfigOptionsFact {
                 session_id: facts.session_id,
-                options: facts.config_options,
+                options: self.execution_options(facts.config_options),
             }))
             .meta(facts.meta);
         Ok((response, post))
@@ -1134,7 +1348,7 @@ impl AcpAgent {
             .modes(mode_state_to_acp(&facts.modes))
             .config_options(crate::render::config_options_v1(&ConfigOptionsFact {
                 session_id: facts.session_id,
-                options: facts.config_options,
+                options: self.execution_options(facts.config_options),
             })))
     }
 
@@ -1317,6 +1531,13 @@ impl AcpAgent {
         };
         let (config_options, _models, modes) =
             get_session_configuration(&child, Some(&state), Some(&models)).await;
+        if let Err(error) =
+            crate::conversation::fork(params.source_id.0.as_ref(), child_id.0.as_ref())
+        {
+            self.cleanup_failed_fork_session(&child_id, &child_path)
+                .await;
+            return Err(acp_error_from_pi(error));
+        }
         self.store.upsert_with_additional_directories(
             &child_id.0,
             &params.cwd.to_string_lossy(),
@@ -1657,11 +1878,23 @@ impl AcpAgent {
         let session = self
             .restore_session(request_session_id, None, None, cx)
             .await?;
+        self.execute_prompt_on_session(session, pi_prompt, cx).await
+    }
+
+    async fn execute_prompt_on_session(
+        &self,
+        session: Arc<PiAcpSession>,
+        pi_prompt: crate::translate::prompt::PiPrompt,
+        cx: &ConnectionTo<Client>,
+    ) -> std::result::Result<(SessionStopReason, Option<Arc<PiAcpSession>>), AcpError> {
         let session_id = session.session_id().clone();
 
         // Built-in ACP slash command handling (headless-friendly subset).
         // File-based slash commands are expanded inside session.prompt().
-        if pi_prompt.images.is_empty() && pi_prompt.message.trim_start().starts_with('/') {
+        if !self.cfg.bounded
+            && pi_prompt.images.is_empty()
+            && pi_prompt.message.trim_start().starts_with('/')
+        {
             if let Some(stop) = self
                 .handle_builtin_command(cx, &session, &session_id, &pi_prompt.message)
                 .await?
@@ -1708,6 +1941,9 @@ impl AcpAgent {
         let Some(session) = self.sessions.maybe_get(session_id).await else {
             return;
         };
+        session
+            .v2_cancel_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = session.cancel().await {
             // A notification has no error response; log the failure so it is
             // never silently swallowed (design D5).
@@ -1751,7 +1987,7 @@ impl AcpAgent {
             .modes(mode_state_to_acp(&facts.modes))
             .config_options(crate::render::config_options_v1(&ConfigOptionsFact {
                 session_id: post.session.session_id().clone(),
-                options: facts.config_options,
+                options: self.execution_options(facts.config_options),
             }));
         Ok((response, post))
     }
@@ -1961,7 +2197,7 @@ impl AcpAgent {
         &self,
         req: &DeleteSessionRequest,
     ) -> std::result::Result<DeleteSessionResponse, AcpError> {
-        self.handle_delete_session_id(&req.session_id).await;
+        self.handle_delete_session_id(&req.session_id).await?;
         Ok(DeleteSessionResponse::new())
     }
 
@@ -1969,7 +2205,12 @@ impl AcpAgent {
     ///
     /// Deleting a session that does not exist succeeds idempotently (ACP
     /// `session/delete` semantics).
-    pub(crate) async fn handle_delete_session_id(&self, session_id: &SessionId) {
+    pub(crate) async fn handle_delete_session_id(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<(), AcpError> {
+        self.sessions.close(session_id).await;
+        crate::conversation::delete(session_id.0.as_ref()).map_err(acp_error_from_pi)?;
         // W-483: forget any MCP menu even when the session itself is already
         // gone (idempotent delete must not leave a resurrectable menu).
         self.mcp_configs.lock().await.remove(session_id.0.as_ref());
@@ -1977,7 +2218,7 @@ impl AcpAgent {
         let pi_session = find_pi_session(&session_id.0);
 
         if stored.is_none() && pi_session.is_none() {
-            return;
+            return Ok(());
         }
 
         let session_file = stored
@@ -1991,6 +2232,7 @@ impl AcpAgent {
         self.store.delete(&session_id.0);
         // W-483: forget the session's MCP menu with the session itself.
         self.mcp_configs.lock().await.remove(session_id.0.as_ref());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2042,7 +2284,7 @@ impl AcpAgent {
         Ok(SetSessionConfigOptionResponse::new(
             crate::render::config_options_v1(&ConfigOptionsFact {
                 session_id: req.session_id.clone(),
-                options: config_options,
+                options: self.execution_options(config_options),
             }),
         ))
     }
@@ -2223,9 +2465,65 @@ impl AcpAgent {
         let protocol = self.protocol();
         spawn_outbound_connector(conn, protocol, outbound_rx)?;
 
+        let bounded = if self.cfg.bounded {
+            if !protocol.is_v2() {
+                return Err(invalid_params("bounded mode requires ACP v2"));
+            }
+            if fetch_pi_version(&self.cfg.pi_command).await.as_deref() != Some("1.5.2") {
+                return Err(invalid_params(
+                    "bounded coding profile currently validates native Pi 1.5.2 only",
+                ));
+            }
+            let module =
+                self.cfg.bounded_mcp_module.as_deref().ok_or_else(|| {
+                    invalid_params("bounded mode requires PI_ACP_BOUNDED_MCP_MODULE")
+                })?;
+            let workspace = cwd
+                .unwrap_or_else(|| Path::new("."))
+                .canonicalize()
+                .map_err(|e| invalid_params(&e.to_string()))?;
+            if module
+                .canonicalize()
+                .map_err(|e| invalid_params(&e.to_string()))?
+                .starts_with(&workspace)
+            {
+                return Err(invalid_params(
+                    "bounded bridge module must be outside the coding workspace",
+                ));
+            }
+            let control_root = crate::settings::agent_dir();
+            std::fs::create_dir_all(&control_root).map_err(|e| invalid_params(&e.to_string()))?;
+            if control_root
+                .canonicalize()
+                .map_err(|e| invalid_params(&e.to_string()))?
+                .starts_with(&workspace)
+            {
+                return Err(invalid_params(
+                    "bounded lifecycle/configuration must be outside the coding workspace",
+                ));
+            }
+            if !options.additional_directories.is_empty() {
+                return Err(invalid_params(
+                    "bounded mode supports only the primary coding workspace",
+                ));
+            }
+            let runtime = crate::bounded::BoundedRuntime::prepare(module, options.mcp_specs)
+                .map_err(acp_error_from_pi)?;
+            if !runtime.controls_outside(&workspace) {
+                return Err(invalid_params(
+                    "bounded controls cannot be inside the coding workspace",
+                ));
+            }
+            Some(Arc::new(runtime))
+        } else {
+            None
+        };
         let mut extra_args: Vec<String> = Vec::new();
         let mut extra_env: Vec<(String, String)> = Vec::new();
-        if !options.mcp_specs.is_empty() {
+        if let Some(runtime) = &bounded {
+            extra_args = runtime.args();
+            extra_env = runtime.environment();
+        } else if !options.mcp_specs.is_empty() {
             let registrar = mcp::materialize_registrar().map_err(|e| {
                 AcpError::new(
                     ACP_INTERNAL_ERROR,
@@ -2246,6 +2544,8 @@ impl AcpAgent {
         }
 
         let session = PiAcpSession::spawn(SessionParams {
+            bounded,
+
             pi_command: self.cfg.pi_command.clone(),
             extra_args,
             timeout: std::time::Duration::from_secs(self.cfg.rpc_timeout_secs),
@@ -2789,7 +3089,7 @@ pub(crate) fn check_mcp_specs(
     specs: std::result::Result<Vec<McpServerSpec>, String>,
     mcp_enabled: bool,
 ) -> std::result::Result<Vec<McpServerSpec>, AcpError> {
-    let specs = specs.map_err(|msg| invalid_params(&format!("{method}: {msg}")))?;
+    let mut specs = specs.map_err(|msg| invalid_params(&format!("{method}: {msg}")))?;
     if specs.is_empty() {
         return Ok(specs);
     }
@@ -2800,13 +3100,19 @@ pub(crate) fn check_mcp_specs(
              package with `pi install npm:pi-mcp-adapter`)"
         )));
     }
-    if !mcp::adapter_available() {
+    if !mcp::adapter_available()
+        && !(std::env::var("PI_ACP_EXECUTION_MODE").as_deref() == Ok("bounded")
+            && std::env::var_os("PI_ACP_BOUNDED_MCP_MODULE")
+                .is_some_and(|p| Path::new(&p).is_absolute() && Path::new(&p).is_file()))
+    {
         return Err(invalid_params(&format!(
             "{method} requested MCP servers, but no pi-mcp-adapter is installed \
              for pi (run `pi install npm:pi-mcp-adapter`); refusing to silently drop \
              the requested servers"
         )));
     }
+    mcp::configure_http_protocol(&mut specs)
+        .map_err(|msg| invalid_params(&format!("{method}: {msg}")))?;
     Ok(specs)
 }
 
@@ -2939,7 +3245,7 @@ async fn advertise_commands(
                     description: command.description.clone(),
                     input_hint: match &command.input {
                         Some(
-                            agent_client_protocol::schema::v1::AvailableCommandInput::Unstructured(
+                            agent_client_protocol::v1::schema::AvailableCommandInput::Unstructured(
                                 input,
                             ),
                         ) => Some(input.hint.clone()),
@@ -3497,7 +3803,10 @@ mod tests {
             command: "prompt".into(),
             message: "unauthorized: 401 missing api key".into(),
         });
-        assert_eq!(err.code, ACP_AUTH_REQUIRED.into());
+        assert_eq!(
+            err.code,
+            agent_client_protocol::ErrorCode::from(ACP_AUTH_REQUIRED)
+        );
         let data = err.data.as_ref().expect("authRequired data");
         let methods = data["authMethods"].as_array().expect("authMethods");
         assert_eq!(methods.len(), 1);
@@ -3511,7 +3820,10 @@ mod tests {
         let spawn = acp_error_from_pi(AcpxError::PiSpawn(
             "pi: Permission denied (os error 13)".into(),
         ));
-        assert_eq!(spawn.code, ACP_INTERNAL_ERROR.into());
+        assert_eq!(
+            spawn.code,
+            agent_client_protocol::ErrorCode::from(ACP_INTERNAL_ERROR)
+        );
         assert!(
             !spawn.message.contains("Configure an API key"),
             "{}",
@@ -3523,7 +3835,10 @@ mod tests {
             signal: None,
             stderr: None,
         });
-        assert_eq!(exited.code, ACP_INTERNAL_ERROR.into());
+        assert_eq!(
+            exited.code,
+            agent_client_protocol::ErrorCode::from(ACP_INTERNAL_ERROR)
+        );
         let data = exited.data.as_ref().expect("error data");
         assert_eq!(data["errorType"], "piExited");
         assert_eq!(data["code"], 42);
@@ -3535,7 +3850,10 @@ mod tests {
             command: "get_state".into(),
             message: "something else entirely".into(),
         });
-        assert_eq!(err.code, ACP_INTERNAL_ERROR.into());
+        assert_eq!(
+            err.code,
+            agent_client_protocol::ErrorCode::from(ACP_INTERNAL_ERROR)
+        );
         assert!(
             err.message.contains("something else entirely"),
             "{}",
@@ -3605,7 +3923,10 @@ mod tests {
         );
         let error = validate_additional_directories("session/load", &[PathBuf::from("relative")])
             .expect_err("relative additional roots must be rejected");
-        assert_eq!(error.code, ACP_INVALID_PARAMS.into());
+        assert_eq!(
+            error.code,
+            agent_client_protocol::ErrorCode::from(ACP_INVALID_PARAMS)
+        );
         assert!(error.message.contains("additionalDirectories"));
     }
 

@@ -22,11 +22,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, DeleteSessionRequest, InitializeRequest, NewSessionRequest, PromptRequest,
     SessionNotification, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
     on_receive_notification, AcpAgent, AcpAgentConfig, Client, LineDirection,
 };
@@ -84,7 +84,10 @@ fn normalize_value(v: &mut Value, cwd: &str) {
         }
         Value::Object(map) => {
             for (key, value) in map.iter_mut() {
-                if key == "updatedAt" && value.is_string() {
+                if key == "messageId" && value.as_str().is_some_and(|id| id.starts_with("pi-msg-"))
+                {
+                    *value = Value::String("<MESSAGE_ID>".into());
+                } else if key == "updatedAt" && value.is_string() {
                     *value = Value::String("<TS>".to_string());
                 } else if key == "version" && is_bare_semver(value) {
                     // The adapter's own version (initialize `agentInfo`): the
@@ -167,7 +170,7 @@ async fn capture_frames() -> (Vec<String>, String) {
     });
 
     let result = Client
-        .builder()
+        .v1()
         .name("s8-golden-client")
         .on_receive_notification(
             async move |_notif: SessionNotification, _cx| Ok(()),

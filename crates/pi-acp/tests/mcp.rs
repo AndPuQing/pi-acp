@@ -10,11 +10,11 @@
 use std::fs;
 use std::sync::{Arc, OnceLock};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     InitializeRequest, LoadSessionRequest, McpServer, McpServerHttp, McpServerStdio,
     NewSessionRequest, SessionNotification, SessionUpdate,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, AcpAgent, AcpAgentConfig, Client};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -49,7 +49,7 @@ fn http_server(name: &str) -> McpServer {
 /// Drive one connected client with `extra_env` on the agent child.
 async fn run_client<F, Fut>(extra_env: Vec<(&str, &str)>, agent_dir: &std::path::Path, f: F)
 where
-    F: FnOnce(agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>) -> Fut
+    F: FnOnce(agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Agent>) -> Fut
         + Send
         + 'static,
     Fut: std::future::Future<Output = agent_client_protocol::Result<()>> + Send + 'static,
@@ -65,7 +65,7 @@ where
     }
     let agent = AcpAgent::new(cfg);
     Client
-        .builder()
+        .v1()
         .name("mcp-e2e-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -79,7 +79,7 @@ where
         )
         .connect_with(
             agent,
-            |cx: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>| async move {
+            |cx: agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Agent>| async move {
                 // The ACP handshake is mandatory: the SDK's protocol router reads
                 // `initialize` to select the v1/v2 implementation (W-562).
                 cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -93,7 +93,7 @@ where
 }
 
 async fn initialize_caps(
-    cx: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    cx: &agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Agent>,
 ) -> (bool, bool) {
     let init = cx
         .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -345,4 +345,52 @@ async fn mcp_load_replaces_menu() {
         },
     )
     .await;
+}
+
+/// The shared gate must reject an invalid operator protocol setting over ACP
+/// before starting pi, rather than silently downgrading to legacy.
+#[tokio::test]
+async fn invalid_http_protocol_selection_rejected_over_v2() {
+    use agent_client_protocol::v2::schema as v2;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let agent_dir = agent_dir_with_adapter(tmp.path());
+    // A nonexistent pi executable proves validation occurs before spawn.
+    let cfg = AcpAgentConfig::new(BIN)
+        .env("PI_ACP_PI_COMMAND", "pi-acp-protocol-test-missing-pi")
+        .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+        .env("PI_ACP_ENABLE_MCP", "true")
+        .env("PI_ACP_MCP_HTTP_PROTOCOL_VERSION", "invalid");
+    Client
+        .v2()
+        .name("mcp-protocol-policy-client")
+        .connect_with(AcpAgent::new(cfg), async move |cx| {
+            let init = cx
+                .send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("test", "1"),
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(init.protocol_version, ProtocolVersion::V2);
+            let server = serde_json::from_value(json!({
+                "type": "http", "name": "modern", "url": "http://localhost:9/mcp", "headers": []
+            }))
+            .unwrap();
+            let error = cx
+                .send_request(v2::NewSessionRequest::new(&cwd).mcp_servers(vec![server]))
+                .block_task()
+                .await
+                .expect_err("invalid selection must reject the menu");
+            assert!(
+                error
+                    .to_string()
+                    .contains("PI_ACP_MCP_HTTP_PROTOCOL_VERSION"),
+                "{error}"
+            );
+            Ok(())
+        })
+        .await
+        .expect("ACP v2 transport completes");
 }

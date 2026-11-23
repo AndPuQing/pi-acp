@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_client_protocol::schema::v1::{ToolCall, ToolCallLocation, ToolKind};
+use agent_client_protocol::v1::schema::{ToolCall, ToolCallLocation, ToolKind};
 use serde_json::Value;
 
 /// Render a pi tool result as plain text for the ACP client.
@@ -253,7 +253,7 @@ pub fn tool_call_from_parts(
     tool_call_id: &str,
     title: &str,
     kind: ToolKind,
-    status: agent_client_protocol::schema::v1::ToolCallStatus,
+    status: agent_client_protocol::v1::schema::ToolCallStatus,
     locations: Vec<ToolCallLocation>,
     raw_input: Option<Value>,
 ) -> ToolCall {
@@ -301,7 +301,7 @@ fn string_field(v: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::ToolCallStatus;
+    use agent_client_protocol::v1::schema::ToolCallStatus;
     use serde_json::json;
 
     // --- tool_result_to_text ---

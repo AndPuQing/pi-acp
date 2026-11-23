@@ -57,12 +57,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::McpServer;
+use agent_client_protocol::v1::schema::McpServer;
 use serde::{Deserialize, Serialize};
 
 /// Env gate: `initialize` advertises MCP transports only when this is `true`
 /// (case-insensitive). Unset/anything-else means off; `false` force-closes.
 pub const MCP_ENABLE_ENV: &str = "PI_ACP_ENABLE_MCP";
+/// Operator policy for ACP-injected HTTP servers only. Unset leaves the
+/// adapter's protocol default unchanged; this is not an ACP descriptor field.
+pub const MCP_HTTP_PROTOCOL_ENV: &str = "PI_ACP_MCP_HTTP_PROTOCOL_VERSION";
 /// Scraped from the pi child's stderr, never stdout: pi routes everything
 /// its extensions print (including raw `process.stdout.write`) to the
 /// child's stderr, so the registrar's `console.log` markers land there and
@@ -104,6 +107,9 @@ pub struct ServerEntry {
     /// forces the transport instead of client fallback).
     #[serde(rename = "httpTransport", skip_serializing_if = "Option::is_none")]
     pub http_transport: Option<String>,
+    /// pi-mcp-adapter's supported per-server protocol selection.
+    #[serde(rename = "protocolVersion", skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
 }
 
 /// One validated server: the registry name plus its adapter definition.
@@ -111,6 +117,51 @@ pub struct ServerEntry {
 pub struct McpServerSpec {
     pub name: String,
     pub definition: ServerEntry,
+}
+
+/// Apply operator protocol policy to HTTP entries after ACP normalization.
+/// Stdio and explicitly pinned SSE entries retain their existing behavior.
+/// Validate before mutating anything: an invalid selection must not silently
+/// fall back to legacy, nor partially configure a menu.
+pub fn apply_http_protocol_version(
+    specs: &mut [McpServerSpec],
+    selection: Option<&str>,
+) -> Result<(), String> {
+    let selection = match selection {
+        None => return Ok(()),
+        Some(value) => match value.trim() {
+            "legacy" | "auto" | "2026-07-28" => value.trim(),
+            _ => {
+                return Err(format!(
+                    "{MCP_HTTP_PROTOCOL_ENV} must be legacy, auto, or 2026-07-28"
+                ))
+            }
+        },
+    };
+    for spec in specs {
+        if spec.definition.url.is_some() && spec.definition.http_transport.is_none() {
+            spec.definition.protocol_version = Some(selection.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Read the operator setting only for menus containing HTTP servers.
+/// A bad value is an explicit ACP invalid-params error before pi is spawned.
+pub fn configure_http_protocol(specs: &mut [McpServerSpec]) -> Result<(), String> {
+    if !specs
+        .iter()
+        .any(|spec| spec.definition.url.is_some() && spec.definition.http_transport.is_none())
+    {
+        return Ok(());
+    }
+    match std::env::var(MCP_HTTP_PROTOCOL_ENV) {
+        Ok(value) => apply_http_protocol_version(specs, Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{MCP_HTTP_PROTOCOL_ENV} must be a Unicode string"))
+        }
+    }
 }
 
 /// Validate + normalize ACP `mcp_servers` into adapter definitions.
@@ -162,6 +213,7 @@ fn normalize_one(server: &McpServer) -> Result<McpServerSpec, String> {
                     url: None,
                     headers: None,
                     http_transport: None,
+                    protocol_version: None,
                 },
             })
         }
@@ -178,6 +230,7 @@ fn normalize_one(server: &McpServer) -> Result<McpServerSpec, String> {
                     url: Some(url),
                     headers,
                     http_transport: None,
+                    protocol_version: None,
                 },
             })
         }
@@ -194,6 +247,7 @@ fn normalize_one(server: &McpServer) -> Result<McpServerSpec, String> {
                     url: Some(url),
                     headers,
                     http_transport: Some("sse".to_string()),
+                    protocol_version: None,
                 },
             })
         }
@@ -261,6 +315,7 @@ fn normalize_one_v2(
                     url: None,
                     headers: None,
                     http_transport: None,
+                    protocol_version: None,
                 },
             })
         }
@@ -277,6 +332,7 @@ fn normalize_one_v2(
                     url: Some(url),
                     headers,
                     http_transport: None,
+                    protocol_version: None,
                 },
             })
         }
@@ -345,7 +401,7 @@ fn checked_http_url(url: &str, server: &str) -> Result<String, String> {
 }
 
 fn headers_map(
-    headers: &[agent_client_protocol::schema::v1::HttpHeader],
+    headers: &[agent_client_protocol::v1::schema::HttpHeader],
     server: &str,
 ) -> Result<Option<HashMap<String, String>>, String> {
     let mut map = HashMap::new();
@@ -590,7 +646,7 @@ pub fn materialize_registrar() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         EnvVariable, HttpHeader, McpServerHttp, McpServerSse, McpServerStdio,
     };
 
@@ -641,6 +697,57 @@ mod tests {
         let s = &specs[2];
         assert_eq!(s.definition.url.as_deref(), Some("https://example.com/sse"));
         assert_eq!(s.definition.http_transport.as_deref(), Some("sse"));
+    }
+
+    #[test]
+    fn http_protocol_selection_preserves_defaults_and_other_transports() {
+        let original = normalize_mcp_servers(&[stdio("a"), http("b"), sse("c")]).unwrap();
+        let mut specs = original.clone();
+        apply_http_protocol_version(&mut specs, None).unwrap();
+        assert_eq!(specs, original);
+        let payload = McpSessionManager::new(specs.clone())
+            .payload_json()
+            .unwrap();
+        assert!(!payload.contains("protocolVersion"));
+
+        for selection in ["legacy", "auto", "2026-07-28"] {
+            apply_http_protocol_version(&mut specs, Some(selection)).unwrap();
+            assert_eq!(specs[0], original[0], "stdio unchanged");
+            assert_eq!(specs[2], original[2], "SSE unchanged");
+            let payload: serde_json::Value = serde_json::from_str(
+                &McpSessionManager::new(specs.clone())
+                    .payload_json()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(payload[1]["definition"]["protocolVersion"], selection);
+            assert_eq!(payload[1]["definition"]["url"], "http://localhost:8000/mcp");
+        }
+
+        let before = specs.clone();
+        for invalid in ["", "2026-07-29", "modern", "LEGACY"] {
+            let error = apply_http_protocol_version(&mut specs, Some(invalid)).unwrap_err();
+            assert!(error.contains(MCP_HTTP_PROTOCOL_ENV));
+            assert_eq!(
+                specs, before,
+                "invalid policy cannot partially change a menu"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_http_protocol_selection_survives_payload_serialization() {
+        let server = serde_json::from_value(serde_json::json!({
+            "type": "http", "name": "modern", "url": "http://localhost:8000/mcp",
+            "headers": [{"name": "X-Test", "value": "synthetic"}]
+        }))
+        .unwrap();
+        let mut specs = normalize_mcp_servers_v2(&[server]).unwrap();
+        apply_http_protocol_version(&mut specs, Some(" 2026-07-28 ")).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&McpSessionManager::new(specs).payload_json().unwrap()).unwrap();
+        assert_eq!(payload[0]["definition"]["protocolVersion"], "2026-07-28");
+        assert_eq!(payload[0]["definition"]["headers"]["X-Test"], "synthetic");
     }
 
     #[test]

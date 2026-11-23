@@ -5,7 +5,7 @@
 //! the `terminal_info` / `terminal_output` / `terminal_exit` `_meta` values
 //! built here (see the ACP execute tool schema).
 
-use agent_client_protocol::schema::v1::{Meta, Terminal, TerminalId, ToolCallContent};
+use agent_client_protocol::v1::schema::{Meta, Terminal, TerminalId, ToolCallContent};
 use serde_json::{json, Value};
 
 /// Whether a pi tool name is the bash tool (case-insensitive).

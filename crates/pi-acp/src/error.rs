@@ -290,7 +290,10 @@ mod tests {
             secs: 30,
         }
         .into();
-        assert_eq!(err.code, ACP_INTERNAL_ERROR.into());
+        assert_eq!(
+            err.code,
+            agent_client_protocol::ErrorCode::from(ACP_INTERNAL_ERROR)
+        );
         let data = err.data.as_ref().expect("error data");
         assert_eq!(data["errorType"], "rpcTimeout");
         assert_eq!(data["command"], "prompt");
@@ -326,7 +329,10 @@ mod tests {
             actual: "reported".into(),
         }
         .into();
-        assert_eq!(err.code, ACP_INTERNAL_ERROR.into());
+        assert_eq!(
+            err.code,
+            agent_client_protocol::ErrorCode::from(ACP_INTERNAL_ERROR)
+        );
         let data = err.data.as_ref().expect("error data");
         assert_eq!(data["errorType"], "sessionIdMismatch");
         assert_eq!(data["expectedSessionId"], "requested");
@@ -350,7 +356,10 @@ mod tests {
     #[test]
     fn auth_required_maps_to_auth_required_code_with_auth_methods() {
         let err: AcpError = AcpxError::AuthRequired("no key".into()).into();
-        assert_eq!(err.code, ACP_AUTH_REQUIRED.into());
+        assert_eq!(
+            err.code,
+            agent_client_protocol::ErrorCode::from(ACP_AUTH_REQUIRED)
+        );
         assert!(err.message.contains("Configure an API key"));
         let data = err.data.as_ref().expect("authRequired data");
         let methods = data["authMethods"].as_array().expect("authMethods array");

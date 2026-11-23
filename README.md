@@ -112,12 +112,15 @@ in the environment that launches `pi-acp-rs`:
 
 | Variable | Default | Use |
 | --- | --- | --- |
+| `PI_ACP_EXECUTION_MODE` | unset | Set to `bounded` for the opt-in fixed coding/MCP profile described in [work completion](docs/work-completion.md). |
+| `PI_ACP_BOUNDED_MCP_MODULE` | unset | Absolute public host-managed bridge TS module supporting the modern Client pin; required by the bounded profile. |
 | `PI_ACP_PI_COMMAND` | `pi` | Path or command name for pi. On Windows, use the full path to the npm-generated `pi.cmd` when it is not on `PATH`. |
 | `PI_ACP_VERSION_CHECK` | `false` | Set to `true` to show a startup notice when a newer pi version is available. |
 | `PI_ACP_ENABLE_EMBEDDED_CONTEXT` | `false` | Set to `true` for ACP clients that send embedded context. |
 | `PI_ACP_ENABLE_MCP` | `false` | Set to `true` to accept and wire non-empty ACP `mcpServers` through `pi-mcp-adapter`. |
+| `PI_ACP_MCP_HTTP_PROTOCOL_VERSION` | unset | Protocol selection for all ACP-injected HTTP MCP servers: `legacy`, `auto`, or `2026-07-28`. Unset preserves the adapter default. |
 | `PI_ACP_RPC_TIMEOUT_SECS` | `30` | Maximum time to wait for an individual pi request. |
-| `PI_ACP_SETTLE_TIMEOUT_SECS` | `600` | Maximum time to wait for pi to finish a turn after accepting a prompt. Set to `0` to disable this fallback. |
+| `PI_ACP_SETTLE_TIMEOUT_SECS` | `600` | Silence budget after pi accepts a prompt, reset by events and suspended while a tool runs. This is not a total turn deadline. Set to `0` to disable it. |
 | `RUST_LOG` | `warn` | Set to `pi_acp=debug` for diagnostic logs. Logs are written to stderr so ACP stdout remains available for protocol messages. |
 
 ## MCP support
@@ -180,6 +183,42 @@ To enable this path:
    Create a new ACP session after changing either configuration. The server
    command, arguments, and environment must be usable by the process that runs
    pi. MCP registrations are session-scoped and are not persisted to disk.
+
+### Modern-only HTTP MCP servers
+
+With pi-mcp-adapter **7.0.1 or newer**, set the following in the environment
+that launches pi-acp to select stateless MCP `2026-07-28` for ACP-injected
+HTTP servers:
+
+```json
+{
+  "PI_ACP_ENABLE_MCP": "true",
+  "PI_ACP_MCP_HTTP_PROTOCOL_VERSION": "2026-07-28"
+}
+```
+
+This passes the adapter's `protocolVersion` selection in each runtime HTTP
+registration. The pinned connection does not negotiate a legacy version or
+fall back to SSE; a server that does not support the selected version fails
+explicitly when connected or called. Registration itself is lazy and does not
+prove protocol compatibility. Server errors remain the adapter's responsibility.
+
+Note: published pi-mcp-adapter 7.0.1 independently probes endpoints to enrich connection
+errors. That diagnostic path can send a legacy `initialize` after a pinned
+connection fails. The setting does not disable the bridge's diagnostic probes
+or guarantee absence of legacy traffic on error paths.
+
+Leaving the variable unset preserves existing behavior (the adapter's legacy
+default). `legacy` explicitly selects that mode; `auto` permits the adapter's
+modern negotiation with legacy fallback. Unknown or empty values reject an
+HTTP server menu before spawning pi instead of silently using the default.
+
+The setting applies to **all HTTP servers supplied over ACP**, for both ACP
+versions and new/resumed/forked sessions. It does not affect stdio, explicit
+SSE entries, or servers independently configured in pi-mcp-adapter. Use
+separate pi-acp processes if different HTTP menus need different policies.
+Create a new session or resume with its server menu after changing the setting.
+No extra ACP descriptor field or on-disk MCP configuration is needed.
 
 ### Remote development
 
@@ -261,18 +300,15 @@ The binary is written to `target/release/pi-acp`.
 
 ### ACP protocol v2 (experimental)
 
-ACP protocol v2 is an unstable draft. It is behind the off-by-default
-`protocol-v2` feature, so a normal build is unaffected in behavior, dependency
-set, and ACP semantics:
+ACP protocol v2 is an unstable draft. A normal build includes both v1 and v2;
+there is no `protocol-v2` Cargo feature. The adapter negotiates the version
+from the client's `initialize`. Both protocols have native handlers and
+renderers over the shared session engine.
 
-```bash
-cargo build --release --features protocol-v2
-```
-
-With it enabled, the adapter negotiates the version from the client's
-`initialize` and serves either; each connection gets the version it asked for.
-The translation core still speaks v1 only — v1 <-> v2 conversion happens once,
-at the connection boundary, using the schema crate's conversion layer.
+See [work completion and lifecycle guarantees](docs/work-completion.md) before
+using foreground idle as a work boundary. The opt-in bounded coding profile enforces a fixed activity surface; the default
+profile retains unknown background coverage. Neither attests arbitrary host or
+remote process termination.
 
 Two v2-specific behaviors are worth knowing:
 

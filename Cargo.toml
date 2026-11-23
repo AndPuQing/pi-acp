@@ -8,18 +8,18 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/AndPuQing/pi-acp"
 authors = ["PuQing <me@puqing.work>"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # --- ACP (Agent Client Protocol) — first-party SDK (S2 spike, W-449) ---
-# SDK locked to 2.0.x; schema pinned to the exact version the SDK requires so
+# Released SDK 5.5.1 + schema 1.21.2 implement v2 beta.3 (source 94824f11).
+# Schema pinned to the exact version the SDK requires so
 # there is a single schema copy in the dependency tree (type identity matters
 # between the re-exported `agent_client_protocol::schema` and a direct dep).
-agent-client-protocol = { version = "2.0.0", features = ["unstable_session_fork"] }
+agent-client-protocol = { version = "=5.5.1", features = ["unstable_session_fork", "process", "stdio"] }
 # Same pinned schema version as the SDK (single copy in the dep tree, W-449
-# constraint 1); `unstable_auth_methods` unlocks the terminal auth method
-# (AuthMethod::Terminal) the ACP `authMethods` registry shape needs (S6).
-agent-client-protocol-schema = { version = "=1.5.0", features = ["unstable_auth_methods", "unstable_session_fork"] }
+# constraint 1). Terminal authentication is a stable v1 schema surface.
+agent-client-protocol-schema = { version = "=1.21.2", features = ["unstable_session_fork"] }
 # --- async runtime (S2 spike validated + locked tokio, W-449 / decision D9) ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "signal"] }
 # --- serialization ---

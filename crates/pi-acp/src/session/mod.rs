@@ -32,7 +32,7 @@ pub use session::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::SessionId;
+use agent_client_protocol::v1::schema::SessionId;
 use tokio::sync::Mutex;
 
 use crate::error::{AcpxError, Result};

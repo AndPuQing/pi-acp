@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, DeleteSessionRequest, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
     NewSessionRequest, PromptRequest, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, AcpAgent, AcpAgentConfig};
 
 /// The prompt we send; the LLM is instructed to echo exactly one word so the
@@ -91,7 +91,7 @@ async fn one_real_text_round_trip() {
     );
 
     agent_client_protocol::Client
-        .builder()
+        .v1()
         .name("spike-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -169,7 +169,7 @@ async fn full_chain_against_real_pi() {
     );
 
     agent_client_protocol::Client
-        .builder()
+        .v1()
         .name("spike-full-chain-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {

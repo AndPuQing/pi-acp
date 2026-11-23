@@ -24,9 +24,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{InitializeRequest, NewSessionRequest};
-use agent_client_protocol::schema::v2;
 use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{InitializeRequest, NewSessionRequest};
+use agent_client_protocol::v2::schema as v2;
 use agent_client_protocol::{on_receive_notification, Channel, Client};
 use pi_acp::agent::AcpAgent;
 use pi_acp::config::Config;
@@ -34,6 +34,200 @@ use tokio::sync::Mutex;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-acp");
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Insertion ACKs are independent of model completion. Concurrent retries,
+/// replay and a replacement native subprocess must preserve message identity.
+#[tokio::test]
+async fn v2_insertion_keys_and_retained_ids_are_truthful() {
+    let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let env = MockEnv::new();
+    let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+    let received = log.clone();
+    let (agent_end, client_end) = Channel::duplex();
+    let agent = Arc::new(AcpAgent::new(Config::from_env()));
+    let agent_task = tokio::spawn(async move { agent.run_with(agent_end).await });
+    Client
+        .v2()
+        .on_receive_notification(
+            async move |notification: v2::UpdateSessionNotification, _cx| {
+                received
+                    .lock()
+                    .await
+                    .push(serde_json::to_value(notification).unwrap());
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_end, async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(
+                ProtocolVersion::V2,
+                v2::Implementation::new("identity-test", "1"),
+            ))
+            .block_task()
+            .await?;
+            // Invalid identity cannot produce a fictional insertion echo.
+            assert!(cx
+                .send_request(v2::PromptRequest::new(
+                    "missing-session",
+                    vec![v2::ContentBlock::Text(v2::TextContent::new("invalid"))]
+                ))
+                .block_task()
+                .await
+                .is_err());
+            assert!(!log
+                .lock()
+                .await
+                .iter()
+                .any(|v| kind(v) == Some("user_message")));
+            let session = cx
+                .send_request(v2::NewSessionRequest::new(&env.cwd))
+                .block_task()
+                .await?;
+            let key = v2::IdempotencyKey::new("concurrent-insertion-0001").unwrap();
+            let request = v2::PromptRequest::new(
+                session.session_id.clone(),
+                vec![v2::ContentBlock::Text(v2::TextContent::new("one turn"))],
+            )
+            .idempotency_key(key.clone());
+            let (first, duplicate) = tokio::join!(
+                cx.send_request(request.clone()).block_task(),
+                cx.send_request(request.clone()).block_task()
+            );
+            let first = first?;
+            let duplicate = duplicate?;
+            assert_eq!(first.message_id, duplicate.message_id);
+            wait_for_raw(
+                &log,
+                |v| kind(v) == Some("state_update") && update(v)["state"] == "idle",
+                "first owned turn",
+            )
+            .await;
+            let before = log.lock().await.clone();
+            let users: Vec<_> = before
+                .iter()
+                .filter(|v| kind(v) == Some("user_message"))
+                .collect();
+            assert_eq!(
+                users.len(),
+                1,
+                "concurrent same-key retry must neither echo nor execute twice"
+            );
+            assert_eq!(update(users[0])["messageId"], first.message_id.0.as_ref());
+            assert_eq!(
+                before
+                    .iter()
+                    .filter(|v| kind(v) == Some("state_update") && update(v)["state"] == "running")
+                    .count(),
+                1
+            );
+            let assistant = before
+                .iter()
+                .find(|v| kind(v) == Some("agent_message"))
+                .expect("complete assistant snapshot");
+            let assistant_id = update(assistant)["messageId"].clone();
+            log.lock().await.clear();
+            // Resume replaces the native subprocess, replaying the ACP-owned IDs.
+            cx.send_request(
+                v2::ResumeSessionRequest::new(session.session_id.clone(), &env.cwd)
+                    .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+            )
+            .block_task()
+            .await?;
+            let replay = log.lock().await.clone();
+            assert!(replay.iter().any(|v| kind(v) == Some("user_message")
+                && update(v)["messageId"] == first.message_id.0.as_ref()));
+            assert!(replay.iter().any(
+                |v| kind(v) == Some("agent_message") && update(v)["messageId"] == assistant_id
+            ));
+            log.lock().await.clear();
+            assert_eq!(
+                cx.send_request(request.clone())
+                    .block_task()
+                    .await?
+                    .message_id,
+                first.message_id,
+                "retained retry must reuse recorded insertion"
+            );
+            assert!(!log
+                .lock()
+                .await
+                .iter()
+                .any(|v| kind(v) == Some("user_message") || kind(v) == Some("agent_message")));
+            let second = cx
+                .send_request(v2::PromptRequest::new(
+                    session.session_id.clone(),
+                    vec![v2::ContentBlock::Text(v2::TextContent::new("new turn"))],
+                ))
+                .block_task()
+                .await?;
+            assert_ne!(second.message_id, first.message_id);
+            wait_for_raw(
+                &log,
+                |v| kind(v) == Some("state_update") && update(v)["state"] == "idle",
+                "new turn after restored history",
+            )
+            .await;
+            assert!(
+                log.lock()
+                    .await
+                    .iter()
+                    .filter(|v| kind(v) == Some("agent_message"))
+                    .all(|v| update(v)["messageId"] != assistant_id),
+                "new assistant IDs cannot overwrite retained history"
+            );
+            log.lock().await.clear();
+            cx.send_request(v2::DeleteSessionRequest::new(session.session_id.clone()))
+                .block_task()
+                .await?;
+            assert!(
+                pi_acp::conversation::replay(session.session_id.0.as_ref())
+                    .unwrap()
+                    .is_empty(),
+                "delete removes retained content"
+            );
+            assert!(
+                pi_acp::conversation::lookup(
+                    session.session_id.0.as_ref(),
+                    Some("concurrent-insertion-0001")
+                )
+                .unwrap()
+                .is_none(),
+                "delete removes retained keys"
+            );
+            pi_acp::conversation::record(&v2::UpdateSessionNotification::new(
+                session.session_id.clone(),
+                v2::SessionUpdate::UserMessage(
+                    v2::UserMessage::new(first.message_id.clone()).content(vec![
+                        v2::ContentBlock::Text(v2::TextContent::new("late frame")),
+                    ]),
+                ),
+            ))
+            .unwrap();
+            assert!(
+                pi_acp::conversation::replay(session.session_id.0.as_ref())
+                    .unwrap()
+                    .is_empty(),
+                "late frames cannot restore deleted content"
+            );
+            assert!(
+                cx.send_request(request).block_task().await.is_err(),
+                "deleted session cannot ACK an old key"
+            );
+            assert!(!log
+                .lock()
+                .await
+                .iter()
+                .any(|v| kind(v) == Some("user_message")));
+            Ok(())
+        })
+        .await
+        .expect("v2 insertion identity flow");
+    tokio::time::timeout(TIMEOUT, agent_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
 
 /// Serializes the process-env mutation these in-process tests require.
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -175,8 +369,9 @@ async fn drive_v2(
             let sid = new_session.session_id.clone();
             *new_slot.lock().await = Some(new_session);
 
-            // 3. session/prompt — v2 acknowledges acceptance immediately; the
-            // turn's terminal state arrives as a `state_update` notification.
+            // 3. session/prompt — this endpoint waits for settlement before
+            // responding. The terminal reason is a separate state_update;
+            // the response/notification delivery order is not a guarantee.
             let prompt_resp = cx
                 .send_request(v2::PromptRequest::new(
                     sid.clone(),
@@ -243,7 +438,7 @@ async fn v2_end_to_end_handshake_prompt_and_patch_object() {
     // true while the prelude's chunk was being dropped on the way out.
     let all_chunk_ids: Vec<String> = entries
         .iter()
-        .filter(|v| kind(v) == Some("agent_message_chunk"))
+        .filter(|v| matches!(kind(v), Some("agent_message_chunk") | Some("agent_message")))
         .filter_map(|v| update(v)["messageId"].as_str().map(str::to_string))
         .collect();
     assert!(
@@ -521,15 +716,18 @@ async fn v2_resume_history_is_complete_when_the_response_returns() {
             // Deliberately no `wait_for_raw`: the response is the boundary.
             let entries = log.lock().await;
             let after: Vec<&serde_json::Value> = entries.iter().skip(boundary).collect();
+            let snapshot = after.iter().find(|v| kind(v) == Some("state_update")).expect("resume must synchronize current execution state before responding");
+            assert_eq!(update(snapshot)["state"], "idle");
+            assert!(update(snapshot).get("background").is_none(), "unrestricted sessions must retain unknown background coverage");
             let user = after
                 .iter()
-                .position(|v| kind(v) == Some("user_message_chunk"))
+                .position(|v| matches!(kind(v),Some("user_message_chunk") | Some("user_message")))
                 .expect(
                     "the replayed user message must already be applied when the response returns",
                 );
             let assistant = after
                 .iter()
-                .position(|v| kind(v) == Some("agent_message_chunk"))
+                .position(|v| matches!(kind(v),Some("agent_message_chunk") | Some("agent_message")))
                 .expect(
                     "the replayed assistant message must already be applied when the response returns",
                 );
@@ -537,10 +735,17 @@ async fn v2_resume_history_is_complete_when_the_response_returns() {
                 user < assistant,
                 "replay preserves the stored order (user message before the answer)"
             );
+            let markers: Vec<_> = after.iter().enumerate()
+                .filter(|(_, value)| kind(value) == Some("replay_complete"))
+                .map(|(index, _)| index).collect();
+            assert_eq!(markers.len(), 1, "one replay_complete must precede the response");
+            let snapshot_index = after.iter().position(|value| kind(value) == Some("state_update")).unwrap();
+            assert!(assistant < markers[0] && markers[0] < snapshot_index,
+                "history, replay_complete, and the current snapshot must be ordered");
             assert_eq!(
                 after
                     .iter()
-                    .filter(|v| kind(v) == Some("agent_message_chunk"))
+                    .filter(|v| matches!(kind(v),Some("agent_message_chunk") | Some("agent_message")))
                     .count(),
                 1,
                 "loading history is not a turn: exactly the stored answer is replayed, \
@@ -622,6 +827,11 @@ async fn v2_resume_without_replay_from_does_not_replay() {
                 .await?;
             assert!(!resumed.config_options.is_empty());
 
+            cx.send_request(agent_client_protocol::UntypedMessage::new("session/resume",
+                serde_json::json!({"sessionId": sid.0.as_ref(), "cwd": cwd.to_string_lossy(), "replayFrom": null}))
+                .expect("null replay request"))
+                .block_task().await?;
+
             // Give the (absent) replay a chance to arrive, then prove no
             // history chunks followed the resume response.
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -629,7 +839,8 @@ async fn v2_resume_without_replay_from_does_not_replay() {
             let history_after = entries[before..].iter().any(|v| {
                 matches!(
                     kind(v),
-                    Some("user_message_chunk") | Some("agent_message_chunk")
+                    Some("user_message_chunk") | Some("agent_message_chunk") |
+                    Some("user_message") | Some("agent_message") | Some("replay_complete")
                 )
             });
             *replayed_in_handler.lock().await = history_after;
@@ -740,12 +951,12 @@ async fn v2_client_against_v1_only_agent_is_rejected() {
     let (agent_end, client_end) = Channel::duplex();
     let agent_task = tokio::spawn(async move {
         agent_client_protocol::Agent
-            .builder()
+            .v1()
             .on_receive_request(
                 async |_init: InitializeRequest, responder, _cx| {
-                    // A v1-only agent must never see a v2 request: the
-                    // negotiation fails before any handler runs.
-                    responder.respond_with_internal_error("v1 implementation should not run")
+                    responder.respond(agent_client_protocol::v1::schema::InitializeResponse::new(
+                        ProtocolVersion::V1,
+                    ))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -767,7 +978,7 @@ async fn v2_client_against_v1_only_agent_is_rejected() {
                 .expect_err("a v1-only agent cannot serve a v2 client");
             let text = err.to_string();
             assert!(
-                text.contains("only supports ACP protocol version 1"),
+                text.contains("version") || text.contains("protocol"),
                 "the rejection must name the version the agent supports: {text}"
             );
             Ok(())
@@ -921,6 +1132,12 @@ async fn v2_tip_fork_uses_a_distinct_persisted_branch() {
         env.cwd.display()
     );
     std::fs::write(&source_file, &original).unwrap();
+    let (source_message_id, _) = pi_acp::conversation::insert(
+        "source-session",
+        Some("parent-insertion-key"),
+        vec![v2::ContentBlock::Text(v2::TextContent::new("before fork"))],
+    )
+    .unwrap();
     let cwd = env.cwd.clone();
     let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
     let notifications = log.clone();
@@ -957,6 +1174,31 @@ async fn v2_tip_fork_uses_a_distinct_persisted_branch() {
             let child = forked.session_id;
             assert_ne!(child.0.as_ref(), "source-session");
             assert!(!forked.config_options.is_empty());
+            assert!(
+                pi_acp::conversation::lookup(child.0.as_ref(), Some("parent-insertion-key"))
+                    .unwrap()
+                    .is_none(),
+                "fork does not copy parent-scoped insertion keys"
+            );
+            assert_eq!(
+                pi_acp::conversation::lookup("source-session", Some("parent-insertion-key"))
+                    .unwrap(),
+                Some(source_message_id.clone())
+            );
+            cx.send_request(
+                v2::ResumeSessionRequest::new(child.clone(), &cwd)
+                    .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+            )
+            .block_task()
+            .await?;
+            assert!(
+                log.lock()
+                    .await
+                    .iter()
+                    .any(|v| kind(v) == Some("user_message")
+                        && update(v)["messageId"] == source_message_id.0.as_ref()),
+                "tip fork retains original ACP message identities"
+            );
             let child_file = source_file.with_file_name(format!("{}.jsonl", child.0));
             assert!(std::fs::read_to_string(&child_file)
                 .unwrap()
@@ -1016,7 +1258,7 @@ async fn v1_client_still_negotiates_v1_when_the_agent_serves_both() {
     let agent_task = tokio::spawn(async move { agent.run_with(agent_end).await });
 
     Client
-        .builder()
+        .v1()
         .name("w562-v1-client")
         .connect_with(client_end, async move |cx| {
             let init = cx
@@ -1046,4 +1288,120 @@ async fn v1_client_still_negotiates_v1_when_the_agent_serves_both() {
         .expect("agent run_with did not finish")
         .expect("agent run_with task panicked")
         .expect("agent run_with returned an error");
+}
+
+/// Empty requested history still ends explicitly; unreadable history must not.
+#[tokio::test]
+async fn v2_resume_empty_or_unreadable_history_has_truthful_replay_boundary() {
+    let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    for corrupt in [false, true] {
+        let env = MockEnv::new();
+        let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
+        let received = log.clone();
+        let (agent_end, client_end) = Channel::duplex();
+        let agent = Arc::new(AcpAgent::new(Config::from_env()));
+        let agent_task = tokio::spawn(async move { agent.run_with(agent_end).await });
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |notification: v2::UpdateSessionNotification, _cx| {
+                    received
+                        .lock()
+                        .await
+                        .push(serde_json::to_value(notification).unwrap());
+                    Ok(())
+                },
+                on_receive_notification!(),
+            )
+            .connect_with(client_end, async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("replay-boundary", "1"),
+                ))
+                .block_task()
+                .await?;
+                let created = cx
+                    .send_request(v2::NewSessionRequest::new(&env.cwd))
+                    .block_task()
+                    .await?;
+                // Seed native persistence, then control the retained ACP history.
+                // The mock provider is local and never contacts a model service.
+                cx.send_request(v2::PromptRequest::new(
+                    created.session_id.clone(),
+                    vec![v2::ContentBlock::Text(v2::TextContent::new("seed"))],
+                ))
+                .block_task()
+                .await?;
+                wait_for_raw(
+                    &log,
+                    |value| kind(value) == Some("state_update") && update(value)["state"] == "idle",
+                    "seed turn settlement",
+                )
+                .await;
+                let encoded = created
+                    .session_id
+                    .0
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let directory = env._tmp.path().join("agent/pi-acp/conversations");
+                std::fs::create_dir_all(&directory).unwrap();
+                let retained = if corrupt {
+                    b"{".as_slice()
+                } else {
+                    br#"{"keys":{},"updates":[]}"#.as_slice()
+                };
+                std::fs::write(directory.join(format!("{encoded}.json")), retained).unwrap();
+                let boundary = log.lock().await.len();
+                let resumed = cx
+                    .send_request(
+                        v2::ResumeSessionRequest::new(created.session_id, &env.cwd)
+                            .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+                    )
+                    .block_task()
+                    .await;
+                let entries = log.lock().await;
+                let after: Vec<_> = entries.iter().skip(boundary).collect();
+                let markers: Vec<_> = after
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| kind(value) == Some("replay_complete"))
+                    .map(|(index, _)| index)
+                    .collect();
+                if corrupt {
+                    assert!(
+                        resumed.is_err(),
+                        "unreadable retained history must reject replay"
+                    );
+                    assert!(
+                        markers.is_empty(),
+                        "failed replay cannot emit replay_complete"
+                    );
+                } else {
+                    assert!(resumed.is_ok());
+                    assert_eq!(
+                        markers.len(),
+                        1,
+                        "empty successful replay needs exactly one marker"
+                    );
+                    let snapshot = after
+                        .iter()
+                        .position(|value| kind(value) == Some("state_update"))
+                        .unwrap();
+                    assert!(
+                        markers[0] < snapshot,
+                        "current execution state follows the replay marker"
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .expect("replay boundary client");
+        tokio::time::timeout(TIMEOUT, agent_task)
+            .await
+            .expect("agent shutdown")
+            .expect("agent task")
+            .expect("agent result");
+    }
 }

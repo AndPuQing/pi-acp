@@ -17,6 +17,7 @@ name = "pi-acp"
 path = "src/main.rs"
 
 [dependencies]
+uuid = { version = "1", features = ["v4"] }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

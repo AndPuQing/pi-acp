@@ -10,6 +10,8 @@
 //! - `PI_ACP_ENABLE_MCP` — advertise ACP MCP transports and wire
 //!   `session/new|load` `mcp_servers` through pi-mcp-adapter's
 //!   `runtime-register` event (default: **off**; W-483).
+//! - `PI_ACP_MCP_HTTP_PROTOCOL_VERSION` — optional adapter protocol selection
+//!   for ACP-injected HTTP servers (validated when accepting an HTTP menu).
 
 /// Default per-request pi RPC deadline in seconds (design D2).
 pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
@@ -28,6 +30,10 @@ pub const DEFAULT_SETTLE_TIMEOUT_SECS: u64 = 600;
 /// Resolved runtime configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Opt-in fixed coding/MCP execution profile; defaults preserve upstream.
+    pub bounded: bool,
+    /// Absolute public host-managed bridge module entry, loaded by Pi's TS loader.
+    pub bounded_mcp_module: Option<std::path::PathBuf>,
     /// `pi` executable to spawn.
     pub pi_command: String,
     /// Whether to advertise ACP `promptCapabilities.embeddedContext`.
@@ -48,6 +54,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            bounded: false,
+            bounded_mcp_module: None,
             pi_command: "pi".to_string(),
             enable_embedded_context: false,
             enable_version_check: false,
@@ -61,7 +69,11 @@ impl Default for Config {
 impl Config {
     /// Build a [`Config`] from the current process environment.
     pub fn from_env() -> Self {
-        let mut cfg = Self::default();
+        let mut cfg = Self {
+            bounded: std::env::var("PI_ACP_EXECUTION_MODE").as_deref() == Ok("bounded"),
+            bounded_mcp_module: std::env::var_os("PI_ACP_BOUNDED_MCP_MODULE").map(Into::into),
+            ..Self::default()
+        };
 
         if let Some(cmd) = std::env::var("PI_ACP_PI_COMMAND")
             .ok()

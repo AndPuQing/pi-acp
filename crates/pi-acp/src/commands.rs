@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AvailableCommand, AvailableCommandInput, UnstructuredCommandInput,
 };
 use serde_json::Value;

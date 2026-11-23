@@ -35,6 +35,25 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   try {
+    let msg = null;
+    let invalidJson = false;
+    if (req.method === "POST") {
+      try { msg = JSON.parse(await readBody(req)); }
+      catch { invalidJson = true; }
+    }
+    // Observe every request, including POSTs to rejected paths and GET/SSE.
+    // Never record arbitrary headers (they may contain authentication data).
+    log.append({ httpRequest: {
+      httpMethod: req.method, path: url.pathname, message: msg,
+      protocolVersionHeader: req.headers["mcp-protocol-version"] ?? null,
+      methodHeader: req.headers["mcp-method"] ?? null,
+      sessionHeaderPresent: req.headers["mcp-session-id"] !== undefined,
+    } });
+    if (invalidJson) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({jsonrpc:"2.0", id:null, error:{code:-32700, message:"Parse error"}}));
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/sse") {
       const sessionId = randomUUID();
       res.writeHead(200, {
@@ -51,21 +70,6 @@ const server = http.createServer(async (req, res) => {
       req.method === "POST" &&
       (url.pathname === "/mcp" || url.pathname === "/messages")
     ) {
-      const body = await readBody(req);
-      let msg;
-      try {
-        msg = JSON.parse(body);
-      } catch {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: null,
-            error: { code: -32700, message: "Parse error" },
-          }),
-        );
-        return;
-      }
       const out = handleMessage(msg, tools, log);
       if (url.pathname === "/messages") {
         // Legacy SSE: ack the POST, deliver the response on the event stream.

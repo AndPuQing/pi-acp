@@ -47,8 +47,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::MessageId;
-use agent_client_protocol::schema::v1::{SessionId, ToolCallStatus};
+use agent_client_protocol::v1::schema::MessageId;
+use agent_client_protocol::v1::schema::{SessionId, ToolCallStatus};
 use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -367,7 +367,7 @@ pub struct TextChunk {
     /// The chunk's text.
     pub text: String,
     /// Chunk-scoped `_meta`, when the producer carries any.
-    pub meta: Option<agent_client_protocol::schema::v1::Meta>,
+    pub meta: Option<agent_client_protocol::v1::schema::Meta>,
 }
 
 /// The three streamed text channels ACP defines.
@@ -442,6 +442,11 @@ pub enum BashToolStatus {
 pub enum ForegroundState {
     /// A turn started: foreground work is in progress.
     Running,
+    BoundedRunning,
+    BoundedIdle(StopReason),
+    IdleSnapshot,
+    BoundedIdleSnapshot,
+    Unknown,
     /// A turn ended; carries the reason so v2 clients see the same stop reason
     /// a v1 client reads from the prompt response.
     Idle(StopReason),
@@ -644,9 +649,9 @@ pub enum ToolKindFact {
     Unknown(String),
 }
 
-impl From<agent_client_protocol::schema::v1::ToolKind> for ToolKindFact {
-    fn from(kind: agent_client_protocol::schema::v1::ToolKind) -> Self {
-        use agent_client_protocol::schema::v1::ToolKind as K;
+impl From<agent_client_protocol::v1::schema::ToolKind> for ToolKindFact {
+    fn from(kind: agent_client_protocol::v1::schema::ToolKind) -> Self {
+        use agent_client_protocol::v1::schema::ToolKind as K;
         match kind {
             K::Read => Self::Read,
             K::Edit => Self::Edit,
@@ -678,9 +683,9 @@ pub enum ToolStatusFact {
     Unknown(String),
 }
 
-impl From<agent_client_protocol::schema::v1::ToolCallStatus> for ToolStatusFact {
-    fn from(status: agent_client_protocol::schema::v1::ToolCallStatus) -> Self {
-        use agent_client_protocol::schema::v1::ToolCallStatus as S;
+impl From<agent_client_protocol::v1::schema::ToolCallStatus> for ToolStatusFact {
+    fn from(status: agent_client_protocol::v1::schema::ToolCallStatus) -> Self {
+        use agent_client_protocol::v1::schema::ToolCallStatus as S;
         match status {
             S::Pending => Self::Pending,
             S::InProgress => Self::InProgress,
@@ -716,8 +721,8 @@ pub struct ToolLocationFact {
     pub line: Option<u32>,
 }
 
-impl From<agent_client_protocol::schema::v1::ToolCallLocation> for ToolLocationFact {
-    fn from(location: agent_client_protocol::schema::v1::ToolCallLocation) -> Self {
+impl From<agent_client_protocol::v1::schema::ToolCallLocation> for ToolLocationFact {
+    fn from(location: agent_client_protocol::v1::schema::ToolCallLocation) -> Self {
         Self {
             path: location.path.to_string_lossy().into_owned(),
             line: location.line,
@@ -809,6 +814,7 @@ pub struct PermissionRequest {
 
 /// Parameters for spawning a session (S6 agent wiring / tests).
 pub struct SessionParams {
+    pub bounded: Option<Arc<crate::bounded::BoundedRuntime>>,
     /// `pi` executable to spawn.
     pub pi_command: String,
     /// Extra CLI flags appended after the standard pi RPC arguments
@@ -849,6 +855,9 @@ pub struct SessionParams {
 /// it with the ACP agent handlers.
 #[derive(Debug)]
 pub struct PiAcpSession {
+    pub v2_prompt_reserved: Arc<AtomicBool>,
+    pub v2_cancel_epoch: std::sync::atomic::AtomicU64,
+    pub bounded: Option<Arc<crate::bounded::BoundedRuntime>>,
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
@@ -912,14 +921,21 @@ enum SessionCommand {
     },
     /// Publish the empty initial context usage once the ACP session is known
     /// to the client (`session/new` response has been sent).
-    PublishInitialUsage { respond: oneshot::Sender<()> },
+    PublishInitialUsage {
+        respond: oneshot::Sender<()>,
+    },
+    PublishCurrentState {
+        respond: oneshot::Sender<()>,
+    },
     /// Snapshot the MCP registrar markers scraped from pi's stderr (W-483
     /// handshake gate input).
     McpMarkerSnapshot {
         respond: oneshot::Sender<Vec<String>>,
     },
     /// Graceful teardown: dispose the pi process, then signal completion.
-    Shutdown { done: oneshot::Sender<()> },
+    Shutdown {
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// A queued (not yet started) turn.
@@ -983,6 +999,8 @@ struct FileSnapshot {
 
 /// Per-session state machine state, owned by the pump task.
 struct Pump {
+    v2_prompt_reserved: Arc<AtomicBool>,
+    bounded: Option<Arc<crate::bounded::BoundedRuntime>>,
     proc: Arc<Mutex<PiProcess>>,
     /// Shared request transport. Request waits do not hold `proc`, allowing
     /// cancellation to send `abort` while the prompt response is pending.
@@ -1093,6 +1111,7 @@ struct Pump {
     /// local uniqueness is all the protocol requires; sessions are told apart
     /// by `session_id`.
     next_message_seq: u64,
+    message_id_prefix: String,
 }
 
 impl PiAcpSession {
@@ -1157,7 +1176,13 @@ impl PiAcpSession {
         let (extension_tx, extension_rx) = mpsc::channel(8);
         let death = Arc::new(std::sync::Mutex::new(None));
         let extension_commands = Arc::new(Mutex::new(None));
+        if let Some(runtime) = &params.bounded {
+            runtime.bind(session_id.0.as_ref(), params.session_path.is_some())?;
+        }
+        let v2_prompt_reserved = Arc::new(AtomicBool::new(false));
         let pump = Pump {
+            v2_prompt_reserved: v2_prompt_reserved.clone(),
+            bounded: params.bounded.clone(),
             proc: Arc::new(Mutex::new(proc)),
             rpc,
             outbound: params.outbound.clone(),
@@ -1197,10 +1222,14 @@ impl PiAcpSession {
             context_window: state.model.as_ref().and_then(|m| m.context_window),
             current_message_id: None,
             next_message_seq: 0,
+            message_id_prefix: uuid::Uuid::new_v4().to_string(),
         };
         tokio::spawn(pump_loop(pump));
 
         Ok(Arc::new(Self {
+            v2_prompt_reserved,
+            v2_cancel_epoch: std::sync::atomic::AtomicU64::new(0),
+            bounded: params.bounded,
             session_id,
             cwd: params.cwd,
             additional_directories: params.additional_directories,
@@ -1269,6 +1298,12 @@ impl PiAcpSession {
     /// when `cancel()` was requested, or `Err` when the turn failed (pi error /
     /// process death) — surfaced explicitly per design D5.
     pub async fn prompt(&self, message: String, images: Vec<ImageContent>) -> Result<StopReason> {
+        if self.bounded.is_some() && message.trim_start().starts_with('/') {
+            return Err(AcpxError::RpcFailed {
+                command: "prompt".into(),
+                message: "bounded mode disables slash commands".into(),
+            });
+        }
         // Query pi lazily for slash prompts so command discovery remains off
         // the session/new critical path. A pi extension command wins over a
         // same-named local prompt file, matching pi's command precedence.
@@ -1289,6 +1324,15 @@ impl PiAcpSession {
             .await
             .map_err(|_| self.death_error())?;
         rx.await.map_err(|_| self.death_error())?
+    }
+
+    pub async fn publish_current_state(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::PublishCurrentState { respond: tx })
+            .await
+            .map_err(|_| self.death_error())?;
+        rx.await.map_err(|_| self.death_error())
     }
 
     /// Return whether a prompt names a pi extension command. The cache is
@@ -1558,6 +1602,7 @@ impl PiAcpSession {
 
 async fn pump_loop(mut pump: Pump) {
     let mut shutdown_done: Option<oneshot::Sender<()>> = None;
+    let mut closing_active = true;
 
     loop {
         // A tool pi has started and not ended is proof of life however long it
@@ -1596,6 +1641,16 @@ async fn pump_loop(mut pump: Pump) {
                         }
                         let _ = respond.send(());
                     }
+                    Some(SessionCommand::PublishCurrentState { respond }) => {
+                        let state = if pump.bounded.as_ref().is_some_and(|r| r.uncertain()) {
+                            ForegroundState::Unknown
+                        } else if pump.pending_turn.is_some() || pump.recovering || pump.in_agent_loop || pump.v2_prompt_reserved.load(Ordering::SeqCst) {
+                            ForegroundState::Running
+                        } else { ForegroundState::IdleSnapshot };
+                        pump.emit_foreground(state).await;
+                        pump.flush_outbound().await;
+                        let _ = respond.send(());
+                    }
                     Some(SessionCommand::PublishInitialUsage { respond }) => {
                         pump.emit_initial_usage_update().await;
                         let _ = respond.send(());
@@ -1605,6 +1660,10 @@ async fn pump_loop(mut pump: Pump) {
                         let _ = respond.send(lines);
                     }
                     Some(SessionCommand::Shutdown { done }) => {
+                        closing_active = pump.pending_turn.is_some()
+                            || pump.recovering
+                            || pump.in_agent_loop
+                            || pump.v2_prompt_reserved.load(Ordering::SeqCst);
                         shutdown_done = Some(done);
                         break;
                     }
@@ -1688,6 +1747,12 @@ async fn pump_loop(mut pump: Pump) {
     // on this session fail with `PiExited` (code/signal + hint) instead of a
     // generic "session closed" (S8 / fixes #82). Graceful shutdowns skip this.
     if pump.pi_died {
+        if let Some(runtime) = &pump.bounded {
+            let _ = runtime.mark_uncertain();
+        }
+        if pump.bounded.is_some() {
+            pump.emit_foreground(ForegroundState::Unknown).await;
+        }
         let status = {
             let mut proc = pump.proc.lock().await;
             proc.wait_exited(std::time::Duration::from_millis(200))
@@ -1702,7 +1767,21 @@ async fn pump_loop(mut pump: Pump) {
             });
         }
     }
-    pump.proc.lock().await.dispose().await;
+    {
+        let mut proc = pump.proc.lock().await;
+        proc.dispose().await;
+        let exited = proc.wait_exited(Duration::from_millis(200)).await.is_some();
+        if let Some(runtime) = &pump.bounded {
+            let result = if shutdown_done.is_some() {
+                runtime.close(closing_active || !exited)
+            } else {
+                runtime.mark_uncertain()
+            };
+            if result.is_err() {
+                tracing::error!("bounded lifecycle persistence failed");
+            }
+        }
+    }
     if let Some(done) = shutdown_done {
         let _ = done.send(());
     }
@@ -1712,7 +1791,15 @@ impl Pump {
     // --- commands ---
 
     fn session_closed_error(&self) -> AcpxError {
-        AcpxError::SessionClosed(self.session_id.0.to_string())
+        if let Some(exit) = self.death.lock().unwrap().clone() {
+            AcpxError::PiExited {
+                code: exit.code,
+                signal: exit.signal,
+                stderr: exit.stderr,
+            }
+        } else {
+            AcpxError::SessionClosed(self.session_id.0.to_string())
+        }
     }
 
     fn fail_queued_turns(&mut self) {
@@ -1738,6 +1825,14 @@ impl Pump {
             extension_command,
             resolve: respond,
         };
+        if self.bounded.is_some() && (self.pending_turn.is_some() || self.recovering) {
+            let _ = queued.resolve.send(Err(AcpxError::RpcFailed {
+                command: "prompt".into(),
+                message: "bounded mode permits one foreground owner; overlapping prompts refused"
+                    .into(),
+            }));
+            return;
+        }
         if self.pending_turn.is_some() || self.recovering {
             // One-at-a-time: a turn is running, queue this one. While
             // recovering from a settle timeout (W-480) no turn is running,
@@ -1804,6 +1899,12 @@ impl Pump {
         // is buffered by the event channel while the RPC is in flight.
         let result = self.rpc.request(&RpcCommand::Abort).await.map(|_| ());
         if result.is_err() {
+            if let Some(runtime) = &self.bounded {
+                let _ = runtime.mark_uncertain();
+            }
+            if self.bounded.is_some() {
+                self.emit_foreground(ForegroundState::Unknown).await;
+            }
             // Without a confirmed abort, pi may still settle asynchronously;
             // retire the session so that event cannot resolve a later turn.
             self.poisoned = true;
@@ -1891,6 +1992,26 @@ impl Pump {
                 }
             }
             Err(result) => {
+                // RPC failure can arrive before stdout EOF. Retain the cause
+                // before resolving this turn or rejecting queued/later work.
+                if let AcpxError::PiExited {
+                    code,
+                    signal,
+                    stderr,
+                } = &result
+                {
+                    *self.death.lock().unwrap() = Some(PiExitInfo {
+                        code: *code,
+                        signal: *signal,
+                        stderr: stderr.clone(),
+                    });
+                }
+                if let Some(runtime) = &self.bounded {
+                    let _ = runtime.mark_uncertain();
+                }
+                if self.bounded.is_some() {
+                    self.emit_foreground(ForegroundState::Unknown).await;
+                }
                 self.settle_deadline = None;
                 let Some(pending) = self.pending_turn.take() else {
                     return;
@@ -1907,6 +2028,13 @@ impl Pump {
     }
 
     async fn start_turn(&mut self, queued: QueuedTurn) {
+        if let Some(runtime) = &self.bounded {
+            if let Err(error) = runtime.begin(&queued.message) {
+                self.emit_foreground(ForegroundState::Unknown).await;
+                let _ = queued.resolve.send(Err(error));
+                return;
+            }
+        }
         self.cancel_requested = false;
         self.in_agent_loop = false;
         self.last_message_error = None;
@@ -2034,7 +2162,10 @@ impl Pump {
     /// the v1 path did not have before.
     fn mint_message_id(&mut self) -> MessageId {
         self.next_message_seq += 1;
-        let id = MessageId::new(format!("pi-msg-{}", self.next_message_seq));
+        let id = MessageId::new(format!(
+            "pi-msg-{}-{}",
+            self.message_id_prefix, self.next_message_seq
+        ));
         self.current_message_id = Some(id.clone());
         id
     }
@@ -2069,7 +2200,7 @@ impl Pump {
         kind: TextChunkKind,
         message_id: Option<String>,
         text: String,
-        meta: Option<agent_client_protocol::schema::v1::Meta>,
+        meta: Option<agent_client_protocol::v1::schema::Meta>,
     ) {
         if self
             .outbound
@@ -2091,6 +2222,20 @@ impl Pump {
     /// the prompt response's `stopReason` in favor of `state_update`; v1 reads
     /// completion from the response, so the connector drops this there.
     async fn emit_foreground(&mut self, state: ForegroundState) {
+        let state = if let Some(runtime) = &self.bounded {
+            if runtime.uncertain() {
+                ForegroundState::Unknown
+            } else {
+                match state {
+                    ForegroundState::Running => ForegroundState::BoundedRunning,
+                    ForegroundState::Idle(reason) => ForegroundState::BoundedIdle(reason),
+                    ForegroundState::IdleSnapshot => ForegroundState::BoundedIdleSnapshot,
+                    other => other,
+                }
+            }
+        } else {
+            state
+        };
         // v2 reports completion through state updates; v1 reads it from the
         // prompt response. The renderer decides what to send, so the fact is
         // always published here.
@@ -2414,7 +2559,16 @@ impl Pump {
             RpcEvent::BashExecutionUpdate { id, delta } => {
                 self.on_bash_execution_update(id.as_deref(), &delta).await
             }
-            RpcEvent::AgentStart => self.in_agent_loop = true,
+            RpcEvent::AgentStart => {
+                self.in_agent_loop = true;
+                if self.bounded.is_some() && self.pending_turn.is_none() {
+                    if let Some(runtime) = &self.bounded {
+                        let _ = runtime.mark_uncertain();
+                    }
+                    self.emit_foreground(ForegroundState::Unknown).await;
+                    let _ = self.rpc.request(&RpcCommand::Abort).await;
+                }
+            }
             // pi emits `agent_end` for every low-level run (retry, compaction,
             // queued continuation) — the ACP turn stays open until `agent_settled`.
             RpcEvent::AgentEnd { .. } => self.in_agent_loop = false,
@@ -2540,9 +2694,29 @@ impl Pump {
         } else {
             StopReason::EndTurn
         };
+        if let Some(runtime) = &self.bounded {
+            // Cancellation is a foreground settlement only. The guard decides
+            // whether any tool delivery remains unknown; do not force it clean.
+            let clean = runtime.finish(true).unwrap_or_else(|_| {
+                let _ = runtime.mark_uncertain();
+                false
+            });
+            if !clean {
+                self.emit_foreground(ForegroundState::Unknown).await;
+                let _ = pending.resolve.send(Err(AcpxError::RpcFailed {
+                    command: "prompt".into(),
+                    message: "foreground ended with unresolved bounded activity/delivery".into(),
+                }));
+                self.in_agent_loop = false;
+                return;
+            }
+        }
+        self.v2_prompt_reserved.store(false, Ordering::SeqCst);
         let _ = pending.resolve.send(Ok(reason));
         self.in_agent_loop = false;
-        self.emit_foreground(ForegroundState::Idle(reason)).await;
+        if self.queue.is_empty() {
+            self.emit_foreground(ForegroundState::Idle(reason)).await;
+        }
 
         if let Some(next) = self.queue.pop_front() {
             self.emit_text(&format!(
@@ -2573,6 +2747,11 @@ impl Pump {
             (status, stderr)
         };
         let (code, signal) = status.unwrap_or((None, None));
+        *self.death.lock().unwrap() = Some(PiExitInfo {
+            code,
+            signal,
+            stderr: stderr.clone(),
+        });
         let pending_err = AcpxError::PiExited {
             code,
             signal,
@@ -2615,6 +2794,12 @@ impl Pump {
     /// still arrive, and queued retries must wait for it (the abort is
     /// already confirmed, so only the settle side is outstanding).
     async fn on_settle_timeout(&mut self) {
+        if let Some(runtime) = &self.bounded {
+            let _ = runtime.mark_uncertain();
+        }
+        if self.bounded.is_some() {
+            self.emit_foreground(ForegroundState::Unknown).await;
+        }
         self.settle_deadline = None;
         let Some(pending) = self.pending_turn.take() else {
             tracing::debug!("settle deadline fired with no pending turn; ignoring");
@@ -3517,7 +3702,7 @@ async fn send_extension_notice(
     outbound: &mpsc::Sender<OutboundMessage>,
     session_id: &SessionId,
     text: &str,
-    meta: Option<agent_client_protocol::schema::v1::Meta>,
+    meta: Option<agent_client_protocol::v1::schema::Meta>,
 ) {
     // An extension notice has no message of its own; the v2 renderer mints an
     // id for it (v2 requires one), the v1 renderer leaves it out.

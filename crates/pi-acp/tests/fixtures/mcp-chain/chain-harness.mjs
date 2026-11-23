@@ -139,7 +139,11 @@ let script = [];
 if (scriptFile) script = JSON.parse(fs.readFileSync(scriptFile, "utf8"));
 for (const step of script) {
   try {
-    if (step.op === "connect" || step.op === "list") {
+    if (step.op === "probe") {
+      const { probeMcpEndpoint } = await import(pathToFileURL(path.join(adapterDir, "mcp-probe.ts")).href);
+      const result = await probeMcpEndpoint(step.url, { protocolVersion: step.protocolVersion });
+      emit({ event: "probe", server: step.server, result });
+    } else if (step.op === "connect" || step.op === "list") {
       // connect: lazy connect + metadata refresh (its result already carries
       // the tool list); list: serve the list from live metadata.
       const res =

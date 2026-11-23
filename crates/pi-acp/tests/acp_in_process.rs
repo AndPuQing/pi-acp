@@ -21,11 +21,11 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionNotification,
     SessionUpdate, StopReason, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, Channel, Client};
 use pi_acp::agent::AcpAgent;
 use pi_acp::config::Config;
@@ -86,7 +86,7 @@ async fn drive_in_process(
     };
 
     Client
-        .builder()
+        .v1()
         .name("w559-in-process-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {

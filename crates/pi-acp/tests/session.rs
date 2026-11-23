@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
 };
 use pi_acp::error::AcpxError;
@@ -107,6 +107,8 @@ async fn fixture_with_options(
     tokio::spawn(run_recorder(outbound_rx, rec, answer_rx, protocol));
 
     let session = PiAcpSession::spawn(SessionParams {
+        bounded: None,
+
         pi_command: BIN.to_string(),
         extra_args: args,
         timeout: TIMEOUT,
@@ -243,7 +245,7 @@ async fn run_recorder(
 /// Record one v1-rendered frame.
 async fn record_v1(
     recorded: &Arc<Mutex<Vec<Recorded>>>,
-    notif: agent_client_protocol::schema::v1::SessionNotification,
+    notif: agent_client_protocol::v1::schema::SessionNotification,
 ) {
     recorded.lock().await.push(Recorded::Notify(notif.update));
 }
@@ -308,6 +310,9 @@ fn text_chunks(recorded: &[Recorded]) -> Vec<String> {
                 ContentBlock::Text(t) => Some(t.text.clone()),
                 _ => None,
             },
+            Recorded::V2(v) if v["update"]["sessionUpdate"] == "agent_message_chunk" => {
+                v["update"]["content"]["text"].as_str().map(str::to_string)
+            }
             _ => None,
         })
         .collect()
@@ -386,6 +391,150 @@ fn read_log(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .map(|s| s.lines().map(str::to_string).collect())
         .unwrap_or_default()
+}
+
+/// Foreground updates as actually rendered for an ACP v2 client. These describe
+/// managed turns, not the lifetime of arbitrary tools or remote work.
+fn foreground_updates(recorded: &[Recorded]) -> Vec<Value> {
+    recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::V2(v) if v["update"]["sessionUpdate"] == "state_update" => {
+                Some(v["update"].clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ACP v2 work-completion boundaries (#34)
+// ---------------------------------------------------------------------------
+
+/// `agent_end` and `turn_end` are intermediate boundaries. Hold the mock at a
+/// permission request after them so the negative assertion cannot race settle.
+#[tokio::test]
+async fn v2_idle_requires_settlement_after_intermediate_end_events() {
+    let fx = fixture_v2().await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[
+            json!({"type": "agent_end", "messages": [], "willRetry": false}),
+            json!({"type": "turn_end", "message": {}, "toolResults": []}),
+            json!({
+                "type": "extension_ui_request", "id": "settle-barrier",
+                "method": "confirm", "title": "Continue?", "message": "Wait for settlement"
+            }),
+            json!({"type": "agent_settled"}),
+        ],
+    );
+    let session = fx.session.clone();
+    let turn = tokio::spawn(async move { session.prompt("one".into(), vec![]).await });
+    wait_until(&fx, |r| {
+        r.iter().any(|m| matches!(m, Recorded::Permission(_)))
+    })
+    .await;
+    let before = foreground_updates(&fx.recorded.lock().await);
+    assert_eq!(before.len(), 1, "no idle before settlement: {before:?}");
+    assert_eq!(before[0]["state"], "running");
+    assert!(
+        !turn.is_finished(),
+        "intermediate events must not resolve the prompt"
+    );
+
+    fx.permission_answers
+        .send(PermissionOutcomeFact::Selected("yes".into()))
+        .await
+        .unwrap();
+    assert_eq!(turn.await.unwrap().unwrap(), StopReason::EndTurn);
+    wait_until(&fx, |r| foreground_updates(r).len() == 2).await;
+    let states = foreground_updates(&fx.recorded.lock().await);
+    assert_eq!(states[1]["state"], "idle");
+    assert_eq!(states[1]["stopReason"], "end_turn");
+    fx.session.dispose().await;
+}
+
+/// Cancellation settles the foreground turn, but must not invent a terminal
+/// tool result. The mock deliberately never reports this tool as completed.
+#[tokio::test]
+async fn v2_cancelled_idle_does_not_attest_tool_completion() {
+    let fx = fixture_with_options(
+        &["--mock-no-settle"],
+        Duration::ZERO,
+        pi_acp::protocol::Protocol::V2,
+    )
+    .await;
+    write_scenario(
+        &fx.scenarios,
+        1,
+        &[json!({
+            "type": "tool_execution_start", "toolCallId": "unfinished-tool",
+            "toolName": "read", "args": {"path": "a.txt"}
+        })],
+    );
+    let session = fx.session.clone();
+    let turn = tokio::spawn(async move { session.prompt("one".into(), vec![]).await });
+    wait_until(&fx, |r| {
+        r.iter().any(|m| {
+            matches!(m,
+                Recorded::V2(v) if v["update"]["toolCallId"] == "unfinished-tool"
+            )
+        })
+    })
+    .await;
+    assert_eq!(foreground_updates(&fx.recorded.lock().await).len(), 1);
+    fx.session.cancel().await.unwrap();
+    assert_eq!(turn.await.unwrap().unwrap(), StopReason::Cancelled);
+    wait_until(&fx, |r| foreground_updates(r).len() == 2).await;
+    let recorded = fx.recorded.lock().await.clone();
+    let states = foreground_updates(&recorded);
+    assert_eq!(states[1]["state"], "idle");
+    assert_eq!(states[1]["stopReason"], "cancelled");
+    let statuses: Vec<&Value> = recorded
+        .iter()
+        .filter_map(|m| match m {
+            Recorded::V2(v) if v["update"]["toolCallId"] == "unfinished-tool" => {
+                v["update"].get("status")
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!statuses.is_empty());
+    assert!(
+        statuses.iter().all(|status| **status == "in_progress"),
+        "{statuses:?}"
+    );
+    assert!(read_log(&fx.command_log).iter().any(|c| c == "abort"));
+    fx.session.dispose().await;
+}
+
+/// Closing an interrupted turn is an error boundary, not an idle success or
+/// cancellation attestation. No remote or descendant termination is simulated.
+#[tokio::test]
+async fn v2_dispose_interrupts_prompt_without_fabricating_idle() {
+    let fx = fixture_with_options(
+        &["--mock-no-settle"],
+        Duration::ZERO,
+        pi_acp::protocol::Protocol::V2,
+    )
+    .await;
+    let session = fx.session.clone();
+    let turn = tokio::spawn(async move { session.prompt("one".into(), vec![]).await });
+    wait_until(&fx, |r| !foreground_updates(r).is_empty()).await;
+    fx.session.dispose().await;
+    assert!(matches!(
+        turn.await.unwrap(),
+        Err(AcpxError::PiExited { .. })
+    ));
+    let states = foreground_updates(&fx.recorded.lock().await);
+    assert_eq!(
+        states.len(),
+        1,
+        "dispose must not fabricate idle: {states:?}"
+    );
+    assert_eq!(states[0]["state"], "running");
+    assert!(fx.session.get_state().await.is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -472,10 +621,10 @@ async fn message_ids_group_chunks_per_assistant_message() {
     // Same message -> same id (never re-minted per chunk).
     assert_eq!(ids[0], ids[1], "chunks of one message share its id");
     assert!(ids[0].is_some(), "v1 chunks now carry a message_id");
-    assert_eq!(ids[0].as_deref(), Some("pi-msg-1"));
+    assert!(ids[0].as_deref().unwrap().ends_with("-1"));
     // A new message -> a new id.
     assert_ne!(ids[1], ids[2], "a new message starts a new id");
-    assert_eq!(ids[2].as_deref(), Some("pi-msg-2"));
+    assert!(ids[2].as_deref().unwrap().ends_with("-2"));
 
     // v1 has no full-object update and no foreground state: rendering the
     // neutral facts for v1 must never produce a v2 frame.
@@ -526,10 +675,10 @@ async fn message_end_yields_the_v2_patch_with_the_same_message_id() {
         })
         .expect("message_end carries the authoritative message and must yield a patch");
 
-    assert_eq!(
-        patch["update"]["messageId"], "pi-msg-1",
-        "the patch reuses the streamed id"
-    );
+    assert!(patch["update"]["messageId"]
+        .as_str()
+        .unwrap()
+        .ends_with("-1"));
     let content = patch["update"]["content"]
         .as_array()
         .expect("patch content");
@@ -692,7 +841,18 @@ async fn forwards_message_end_error_and_unknown_error_shape() {
 /// one-at-a-time, each turn completing on `agent_settled` (never `agent_end`).
 #[tokio::test]
 async fn prompts_queue_and_drain_serially() {
-    let fx = fixture(&["--mock-event-delay-ms", "150"]).await;
+    assert_prompts_queue_and_drain_serially(pi_acp::protocol::Protocol::V1).await;
+}
+
+/// Settling one queued prompt does not end the aggregate foreground workflow.
+#[tokio::test]
+async fn v2_queued_turns_keep_aggregate_foreground_running() {
+    assert_prompts_queue_and_drain_serially(pi_acp::protocol::Protocol::V2).await;
+}
+
+async fn assert_prompts_queue_and_drain_serially(protocol: pi_acp::protocol::Protocol) {
+    let fx =
+        fixture_with_options(&["--mock-event-delay-ms", "150"], Duration::ZERO, protocol).await;
     // Turn 1 streams one chunk then emits agent_end (a low-level run end) —
     // the ACP turn must NOT complete there. Turn 2 is a plain text turn.
     write_scenario(
@@ -723,7 +883,30 @@ async fn prompts_queue_and_drain_serially() {
     assert_eq!(turn1.await.unwrap().unwrap(), StopReason::EndTurn);
     assert_eq!(turn2.await.unwrap().unwrap(), StopReason::EndTurn);
 
+    // Wait for the pump's final publication, not only the prompt receiver.
+    wait_until(&fx, |r| {
+        if protocol.is_v2() {
+            foreground_updates(r).len() == 3
+        } else {
+            queue_depths(r).last() == Some(&(0, false))
+        }
+    })
+    .await;
     let recorded = fx.recorded.lock().await.clone();
+
+    if protocol.is_v2() {
+        let states = foreground_updates(&recorded);
+        assert_eq!(
+            states
+                .iter()
+                .map(|v| v["state"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["running", "running", "idle"]
+        );
+        assert_eq!(states[2]["stopReason"], "end_turn");
+        fx.session.dispose().await;
+        return;
+    }
 
     // Text streamed in order, with the queueing notices around them.
     let chunks = text_chunks(&recorded);
@@ -1053,7 +1236,7 @@ async fn tool_statuses_are_monotonic_and_bash_terminals_stream() {
         match r {
             Recorded::Notify(SessionUpdate::ToolCall(c)) if c.tool_call_id.0.as_ref() == "t2" => {
                 seen_tool_call = true;
-                assert_eq!(c.kind, agent_client_protocol::schema::v1::ToolKind::Execute);
+                assert_eq!(c.kind, agent_client_protocol::v1::schema::ToolKind::Execute);
                 assert!(
                     matches!(c.content.first(), Some(ToolCallContent::Terminal(_))),
                     "initial bash tool_call must embed a terminal: {c:?}"
@@ -1488,7 +1671,7 @@ async fn unknown_events_do_not_break_the_turn() {
 /// picker and thinking dropdown follow (W-475).
 #[tokio::test]
 async fn thinking_level_changed_pushes_mode_and_config_updates() {
-    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+    use agent_client_protocol::v1::schema::{SessionConfigKind, SessionConfigSelectOptions};
     let fx = fixture(&[]).await;
     write_scenario(
         &fx.scenarios,
@@ -1665,6 +1848,8 @@ async fn missing_agent_settled_resolves_with_settle_timeout() {
     let _ = answer_tx;
 
     let session = PiAcpSession::spawn(SessionParams {
+        bounded: None,
+
         pi_command: BIN.to_string(),
         extra_args: vec!["--mock-rpc".to_string(), "--mock-no-settle".to_string()],
         timeout: TIMEOUT,
@@ -1926,6 +2111,8 @@ async fn session_id_override_mismatch_is_rejected() {
     let (outbound_tx, _outbound_rx) = mpsc::channel(16);
 
     let result = PiAcpSession::spawn(SessionParams {
+        bounded: None,
+
         pi_command: BIN.to_string(),
         extra_args: vec!["--mock-rpc".to_string()],
         timeout: TIMEOUT,
@@ -1963,6 +2150,8 @@ async fn session_manager_registers_and_disposes_sessions() {
     let _ = outbound_rx; // no consumer needed for this test
     let manager = SessionManager::new();
     let session = PiAcpSession::spawn(SessionParams {
+        bounded: None,
+
         pi_command: BIN.to_string(),
         extra_args: vec!["--mock-rpc".to_string()],
         timeout: TIMEOUT,
@@ -2002,6 +2191,8 @@ async fn session_manager_replacement_disposes_previous_instance() {
     let manager = SessionManager::new();
 
     let params = |outbound| SessionParams {
+        bounded: None,
+
         pi_command: BIN.to_string(),
         extra_args: vec!["--mock-rpc".to_string()],
         timeout: TIMEOUT,

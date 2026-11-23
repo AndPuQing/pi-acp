@@ -11,13 +11,13 @@
 use std::fs;
 use std::sync::{Arc, OnceLock};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, DeleteSessionRequest, InitializeRequest, LoadSessionRequest, McpServer,
     McpServerHttp, McpServerStdio, NewSessionRequest, PromptRequest, SessionNotification,
     SessionUpdate, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::ConnectionTo;
+use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{on_receive_notification, AcpAgent, AcpAgentConfig, Client};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -65,7 +65,7 @@ where
     }
     let agent = AcpAgent::new(cfg);
     Client
-        .builder()
+        .v1()
         .name("mcp-acceptance-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {

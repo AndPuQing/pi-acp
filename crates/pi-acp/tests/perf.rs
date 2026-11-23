@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionId,
     SessionNotification, SessionUpdate, SetSessionModeRequest, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, AcpAgent, AcpAgentConfig, Client};
 use pi_acp::session::{OutboundMessage, PiAcpSession, SessionParams};
 use tokio::sync::{mpsc, Mutex};
@@ -124,6 +124,8 @@ async fn spawn_session_with_delay(delay_ms: u64) -> SessionFixture {
     });
 
     let session = PiAcpSession::spawn(SessionParams {
+        bounded: None,
+
         pi_command: BIN.to_string(),
         extra_args: args,
         timeout: TIMEOUT,
@@ -284,7 +286,7 @@ async fn e2e_handshake_and_refresh_rpc_budget() {
     let mut sid_holder: Option<SessionId> = None;
 
     Client
-        .builder()
+        .v1()
         .name("perf-budget-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {

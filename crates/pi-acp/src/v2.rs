@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::{ConnectionTo, Dispatch, Handled, UntypedMessage};
+use agent_client_protocol::{Dispatch, Handled, UntypedMessage};
 use agent_client_protocol_schema::v2;
 use serde_json::Value;
 
@@ -62,9 +62,14 @@ fn to_value<T: serde::Serialize>(value: T) -> Result<Value, agent_client_protoco
 /// SDK answers with `methodNotFound` rather than the adapter inventing one.
 pub async fn handle_dispatch(
     agent: &Arc<AcpAgent>,
-    dispatch: Dispatch<UntypedMessage, UntypedMessage>,
-    cx: &ConnectionTo<Client>,
-) -> Result<Handled<Dispatch<UntypedMessage, UntypedMessage>>, agent_client_protocol::Error> {
+    dispatch: Dispatch<UntypedMessage, UntypedMessage, agent_client_protocol::V2>,
+    cx: &agent_client_protocol::v2::ConnectionTo<Client>,
+) -> Result<
+    Handled<Dispatch<UntypedMessage, UntypedMessage, agent_client_protocol::V2>>,
+    agent_client_protocol::Error,
+> {
+    let raw_cx = cx.clone().into_raw();
+    let cx = &raw_cx;
     let Dispatch::Request(message, responder) = dispatch else {
         // Notifications are handled by their own typed registrations.
         return Ok(Handled::No {
@@ -88,8 +93,12 @@ pub async fn handle_dispatch(
                     responder.respond(to_value(response)?)?;
                     let cx_for_task = cx.clone();
                     let protocol = agent.protocol();
+                    let session = post.session.clone();
                     cx.spawn(async move {
                         post.send(&cx_for_task, protocol).await;
+                        if session.bounded.is_some() {
+                            let _ = session.publish_current_state().await;
+                        }
                         Ok(())
                     })?;
                     Ok(Handled::Yes)
@@ -148,7 +157,15 @@ pub async fn handle_dispatch(
                     // completion boundary, matching the v1 `session/load`
                     // handler.
                     let protocol = agent.protocol();
-                    post.send(cx, protocol).await;
+                    let session = post.session.clone();
+                    if let Err(error) = post.send(cx, protocol).await {
+                        responder.respond_with_error(error)?;
+                        return Ok(Handled::Yes);
+                    }
+                    session
+                        .publish_current_state()
+                        .await
+                        .map_err(|e| invalid_params(e.to_string()))?;
                     responder.respond(to_value(response)?)?;
                     Ok(Handled::Yes)
                 }

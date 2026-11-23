@@ -46,7 +46,7 @@
 //! # async fn example() -> anyhow::Result<()> {
 //! let agent = Arc::new(AcpAgent::new(Config::default()));
 //! // The agent end of an in-process duplex pair; drive the other end with an
-//! // ACP client (e.g. `Client.builder()...connect_to(other_end)`).
+//! // ACP client (e.g. `Client.v1()...connect_to(other_end)`).
 //! let (agent_end, _peer) = Channel::duplex();
 //! agent.run_with(agent_end).await?;
 //! # Ok(())
@@ -57,8 +57,10 @@
 
 pub mod agent;
 pub mod auth;
+pub mod bounded;
 pub mod commands;
 pub mod config;
+pub mod conversation;
 pub mod error;
 pub mod mcp;
 pub mod pi;

@@ -6,7 +6,7 @@
 //! are rendered as explicit human-readable markers so context is never
 //! silently dropped.
 
-use agent_client_protocol::schema::v1::{ContentBlock, EmbeddedResourceResource};
+use agent_client_protocol::v1::schema::{ContentBlock, EmbeddedResourceResource};
 
 /// A pi image attachment (`ImageContent`, base64 without data-url prefix).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +185,7 @@ fn base64_decoded_len(data: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         AudioContent, BlobResourceContents, EmbeddedResource, ImageContent, ResourceLink,
         TextContent, TextResourceContents,
     };

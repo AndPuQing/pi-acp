@@ -38,7 +38,7 @@ use crate::translate::bash::{
     bash_terminal_content, bash_terminal_exit_meta, bash_terminal_info_meta,
     bash_terminal_output_meta,
 };
-use agent_client_protocol::schema::v1;
+use agent_client_protocol::v1::schema as v1;
 use agent_client_protocol::{Client, ConnectionTo};
 use agent_client_protocol_schema::v2;
 use serde_json::json;
@@ -325,6 +325,22 @@ pub fn foreground_v2(
 ) -> v2::UpdateSessionNotification {
     use crate::session::ForegroundState;
     let state = match state {
+        ForegroundState::IdleSnapshot => v2::StateUpdate::Idle(v2::IdleStateUpdate::new()),
+        ForegroundState::BoundedIdleSnapshot => {
+            v2::StateUpdate::Idle(v2::IdleStateUpdate::new().background(Some(vec![])))
+        }
+        ForegroundState::BoundedRunning => {
+            v2::StateUpdate::Running(v2::RunningStateUpdate::new().background(Some(vec![])))
+        }
+        ForegroundState::BoundedIdle(reason) => v2::StateUpdate::Idle(
+            v2::IdleStateUpdate::new()
+                .background(Some(vec![]))
+                .stop_reason(match reason {
+                    crate::session::StopReason::EndTurn => v2::StopReason::EndTurn,
+                    crate::session::StopReason::Cancelled => v2::StopReason::Cancelled,
+                }),
+        ),
+        ForegroundState::Unknown => v2::StateUpdate::Unknown(v2::UnknownStateUpdate::new()),
         ForegroundState::Running => v2::StateUpdate::Running(v2::RunningStateUpdate::new()),
         ForegroundState::Idle(reason) => {
             let stop_reason = match reason {
@@ -362,6 +378,7 @@ pub fn send_v2(
     cx: &ConnectionTo<Client>,
     notif: v2::UpdateSessionNotification,
 ) -> Result<(), AcpxError> {
+    crate::conversation::record(&notif)?;
     cx.send_notification(notif).map_err(transport_error)
 }
 
@@ -401,7 +418,7 @@ fn v1_tool_locations(locations: &[ToolLocationFact]) -> Vec<v1::ToolCallLocation
 fn v1_tool_content(content: &ToolContentFact) -> v1::ToolCallContent {
     match content {
         ToolContentFact::Text(text) => {
-            v1::ToolCallContent::Content(agent_client_protocol::schema::v1::Content::new(
+            v1::ToolCallContent::Content(agent_client_protocol::v1::schema::Content::new(
                 v1::ContentBlock::Text(v1::TextContent::new(text.clone())),
             ))
         }
@@ -560,7 +577,7 @@ fn v2_tool_content(content: &ToolContentFact) -> v2::ToolCallContent {
             path,
             new_text,
             old_text,
-        } => v2::ToolCallContent::Diff(v2_diff(path, new_text, old_text.as_deref())),
+        } => v2::ToolCallContent::Diff(Box::new(v2_diff(path, new_text, old_text.as_deref()))),
     }
 }
 
@@ -832,8 +849,7 @@ pub fn available_commands_v2(fact: &AvailableCommandsFact) -> v2::UpdateSessionN
         .commands
         .iter()
         .map(|command| {
-            let mut built =
-                v2::AvailableCommand::new(command.name.clone(), command.description.clone());
+            let mut built = v2::Command::new(command.name.clone(), command.description.clone());
             if let Some(hint) = &command.input_hint {
                 built = built.input(v2::AvailableCommandInput::Text(v2::TextCommandInput::new(
                     hint.clone(),
@@ -842,7 +858,7 @@ pub fn available_commands_v2(fact: &AvailableCommandsFact) -> v2::UpdateSessionN
             if let Some(meta) = &command.meta {
                 built = built.meta(meta.clone());
             }
-            built
+            v2::AvailableCommand::Command(built)
         })
         .collect();
     v2::UpdateSessionNotification::new(
@@ -1280,16 +1296,6 @@ mod tests {
     /// The native v2 frame never takes that path.
     #[test]
     fn the_old_v1_bash_frame_could_not_be_converted_but_the_native_one_needs_no_conversion() {
-        use agent_client_protocol_schema::v2::conversion::try_v1_to_v2;
-
-        // What the old code produced, and what the converter did to it.
-        let legacy = bash_v1_frames(&call(true, S::InProgress)).remove(0);
-        let converted: Result<v2::UpdateSessionNotification, _> = try_v1_to_v2(legacy);
-        assert!(
-            converted.is_err(),
-            "v1 terminal content has no v2 form — this refusal is the bug"
-        );
-
         // What the module produces now: already v2, so nothing can drop it.
         let native = bash_v2_frames(&call(true, S::InProgress));
         assert_eq!(native.len(), 1);

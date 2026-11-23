@@ -25,12 +25,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     DeleteSessionRequest, InitializeRequest, McpServer, McpServerHttp, McpServerSse,
     McpServerStdio, NewSessionRequest, SessionNotification, SessionUpdate,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::ConnectionTo;
+use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{on_receive_notification, AcpAgent, AcpAgentConfig, Client};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -147,6 +147,10 @@ struct ChainEnv {
 /// Provision (or reuse) the harness env. `None` = skip: no node/npm or the
 /// registry is unreachable. Never fails the suite on its own.
 fn ensure_chain_env() -> Option<ChainEnv> {
+    ensure_chain_env_with_versions(ADAPTER_PIN, PI_PIN)
+}
+
+fn ensure_chain_env_with_versions(adapter_pin: &str, pi_pin: &str) -> Option<ChainEnv> {
     let node = find_on_path("node").or_else(|| {
         eprintln!("SKIP: `node` not on PATH (real-chain tests need Node 20+)");
         None
@@ -159,12 +163,12 @@ fn ensure_chain_env() -> Option<ChainEnv> {
     let base = std::env::temp_dir()
         .join("pi-acp-mcp-chain")
         .join(CHAIN_CACHE_VERSION);
-    let env_dir = base.join(format!("adapter-{ADAPTER_PIN}"));
+    let env_dir = base.join(format!("adapter-{adapter_pin}"));
     let ready = env_dir.join(".ready");
     let ready_ok = fs::read_to_string(&ready)
         .ok()
         .map(|s| s.trim().to_string())
-        == Some(ADAPTER_PIN.to_string());
+        == Some(adapter_pin.to_string());
     if !ready_ok {
         let _ = fs::remove_dir_all(&env_dir);
         fs::create_dir_all(&env_dir).ok()?;
@@ -175,12 +179,12 @@ fn ensure_chain_env() -> Option<ChainEnv> {
             );
         }
         let packages = [
-            format!("pi-mcp-adapter@{ADAPTER_PIN}"),
+            format!("pi-mcp-adapter@{adapter_pin}"),
             "tsx".to_string(),
             "typebox".to_string(),
-            format!("@earendil-works/pi-coding-agent@{PI_PIN}"),
-            format!("@earendil-works/pi-tui@{PI_PIN}"),
-            format!("@earendil-works/pi-ai@{PI_PIN}"),
+            format!("@earendil-works/pi-coding-agent@{pi_pin}"),
+            format!("@earendil-works/pi-tui@{pi_pin}"),
+            format!("@earendil-works/pi-ai@{pi_pin}"),
         ];
         if let Err(e) = npm_install(&env_dir, &npm, &packages) {
             eprintln!("SKIP: chain env provisioning failed (offline registry?): {e}");
@@ -206,7 +210,7 @@ fn ensure_chain_env() -> Option<ChainEnv> {
             eprintln!("SKIP: provisioned adapter has no index.ts");
             return None;
         }
-        fs::write(&ready, ADAPTER_PIN).ok()?;
+        fs::write(&ready, adapter_pin).ok()?;
     }
     let adapter_src = env_dir.join("adapter-src");
     if !adapter_src.join("index.ts").is_file() {
@@ -216,6 +220,33 @@ fn ensure_chain_env() -> Option<ChainEnv> {
         env_dir,
         adapter_src,
         node,
+    })
+}
+
+/// Optional package prepared by prepare-local-bridge.py. Legacy acceptance
+/// keeps its published pins; modern acceptance can use an exact local artifact.
+fn local_chain_env() -> Option<ChainEnv> {
+    let setup = std::env::var_os("PI_ACP_TEST_BRIDGE_SETUP")?;
+    let setup: Value =
+        serde_json::from_str(&fs::read_to_string(setup).expect("read local bridge setup"))
+            .expect("valid bridge setup JSON");
+    assert_eq!(setup["schemaVersion"], 1);
+    assert_eq!(setup["nativePiVersion"], "1.5.2");
+    let path = |key: &str| PathBuf::from(setup[key].as_str().expect("setup path"));
+    let env = ChainEnv {
+        env_dir: path("envDir"),
+        adapter_src: path("adapterSrc"),
+        node: path("node"),
+    };
+    assert!(env.adapter_src.join("index.ts").is_file());
+    assert!(env.env_dir.join("node_modules/tsx/package.json").is_file());
+    Some(env)
+}
+
+fn modern_chain_env() -> ChainEnv {
+    local_chain_env().unwrap_or_else(|| {
+        ensure_chain_env_with_versions("7.0.1", "1.5.2")
+            .expect("modern acceptance requires Node/npm and the pinned bridge packages")
     })
 }
 
@@ -239,9 +270,18 @@ struct FakeHttp {
 }
 
 async fn spawn_fake_http(env: &ChainEnv, tag: &str, dir: &Path) -> Option<FakeHttp> {
+    spawn_http_script(env, tag, dir, "fake-mcp-http.mjs").await
+}
+
+async fn spawn_http_script(
+    env: &ChainEnv,
+    tag: &str,
+    dir: &Path,
+    script: &str,
+) -> Option<FakeHttp> {
     let log = dir.join(format!("fake-{tag}.log"));
     let mut child = tokio::process::Command::new(&env.node)
-        .arg(fixtures_dir().join("fake-mcp-http.mjs"))
+        .arg(fixtures_dir().join(script))
         .arg("--tag")
         .arg(tag)
         .arg("--port")
@@ -880,7 +920,7 @@ async fn real_pi_session_new_registers_and_replaces() {
     let cwd_c = cwd.clone();
     let http_port = http.port;
     Client
-        .builder()
+        .v1()
         .name("mcp-realpi-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -1012,4 +1052,461 @@ async fn real_pi_session_new_registers_and_replaces() {
     assert!(offenders.is_empty(), "config residue: {offenders:?}");
 
     let _ = http.child.start_kill();
+}
+
+/// Modern-only wire acceptance with the selected bridge, real registrar and
+/// normalized ACP v2 HTTP descriptor. No pi model/provider is contacted.
+#[tokio::test]
+async fn harness_modern_http_pin_calls_tool_without_legacy_fallback() {
+    use pi_acp::mcp::{apply_http_protocol_version, normalize_mcp_servers_v2, McpSessionManager};
+    let _guard = acquire_test_lock().await;
+    let env = modern_chain_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join("agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    let modern = spawn_http_script(&env, "modern", tmp.path(), "fake-mcp-modern-http.mjs")
+        .await
+        .expect("modern-only HTTP server starts");
+    let legacy = spawn_fake_http(&env, "legacy", tmp.path())
+        .await
+        .expect("legacy-only HTTP server starts");
+    let descriptors: Vec<agent_client_protocol_schema::v2::McpServer> = serde_json::from_value(json!([
+        {"type": "http", "name": "modern", "url": format!("http://127.0.0.1:{}/mcp", modern.port), "headers": []},
+        {"type": "http", "name": "incompatible", "url": format!("http://127.0.0.1:{}/mcp", legacy.port), "headers": []}
+    ])).unwrap();
+    let mut specs = normalize_mcp_servers_v2(&descriptors).unwrap();
+    apply_http_protocol_version(&mut specs, Some("2026-07-28")).unwrap();
+    let servers =
+        serde_json::from_str(&McpSessionManager::new(specs).payload_json().unwrap()).unwrap();
+    let script = json!([
+        {"op": "connect", "server": "modern"},
+        {"op": "list", "server": "modern"},
+        {"op": "call", "server": "modern", "tool": "get_assignment", "args": {}},
+        {"op": "connect", "server": "incompatible"}
+    ]);
+    let events = run_harness(&env, &agent_dir, &servers, &script, tmp.path())
+        .await
+        .expect("modern harness completes");
+    let call = find(&events, "call", Some("modern")).expect("modern tool call");
+    assert_eq!(
+        call.pointer("/result/content/0/text")
+            .and_then(Value::as_str),
+        Some("MODERN_MCP_FIXTURE_OK"),
+        "{call}"
+    );
+    let methods = server_log_methods(&modern.log);
+    for method in ["server/discover", "tools/list", "tools/call"] {
+        assert!(
+            methods.contains(&method.to_string()),
+            "missing {method}: {methods:?}"
+        );
+    }
+    assert!(!methods.contains(&"initialize".to_string()), "{methods:?}");
+    let incompatible = find(&events, "connect", Some("incompatible")).unwrap();
+    assert_eq!(
+        incompatible
+            .pointer("/result/details/error")
+            .and_then(Value::as_str),
+        Some("connect_failed"),
+        "{incompatible}"
+    );
+    if std::env::var_os("PI_ACP_TEST_BRIDGE_SETUP").is_some() {
+        assert_no_legacy_http(&modern.log);
+        assert_no_legacy_http(&legacy.log);
+    }
+    // Bridge 7.0.1 enriches connection errors with an independent endpoint
+    // probe that can send legacy initialize. The pinned connection still
+    // fails: do not mistake the diagnostic probe for successful fallback.
+    // This test proves no legacy traffic only on the successful modern path.
+    let modern_requests = fs::read_to_string(&modern.log).unwrap();
+    for line in modern_requests.lines() {
+        let request: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(request["accepted"], true, "{request}");
+    }
+    if let Some(directory) = std::env::var_os("PI_ACP_TEST_MCP_EVIDENCE_DIR") {
+        let directory = PathBuf::from(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::copy(&modern.log, directory.join("modern-http.jsonl")).unwrap();
+        fs::copy(&legacy.log, directory.join("incompatible-http.jsonl")).unwrap();
+        fs::write(
+            directory.join("registrations.json"),
+            serde_json::to_vec_pretty(&servers).unwrap(),
+        )
+        .unwrap();
+        let report = json!({
+            "bridgeVersion": serde_json::from_str::<Value>(&fs::read_to_string(env.adapter_src.join("package.json")).unwrap()).unwrap()["version"],
+            "localBridge": std::env::var_os("PI_ACP_TEST_BRIDGE_SETUP").is_some(),
+            "host": "stub pi ExtensionAPI; real registrar and selected bridge; no model",
+            "modernRequests": server_log_methods(&modern.log),
+            "incompatibleRequests": server_log_methods(&legacy.log),
+            "modernMarkerReturned": true,
+            "modernRequestsAllAccepted": true,
+            "incompatibleConnectionFailed": true,
+            "noLegacyRequestsOnSuccess": true,
+            "noLegacyRequestsOnFailure": !server_log_methods(&legacy.log).contains(&"initialize".to_string()),
+            "events": events.iter().map(|event| &event.payload).collect::<Vec<_>>(),
+        });
+        fs::write(
+            directory.join("report.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+/// Inspect HTTP envelopes, including GET/SSE attempts, rather than assuming
+/// absence of a successful legacy connection means absence of legacy traffic.
+fn assert_no_legacy_http(log: &Path) {
+    let requests = fs::read_to_string(log).expect("wire log exists");
+    let mut count = 0;
+    for line in requests.lines() {
+        let entry: Value = serde_json::from_str(line).unwrap();
+        let request = entry.get("httpRequest").unwrap_or(&entry);
+        if request.get("httpMethod").is_none() {
+            continue;
+        }
+        count += 1;
+        assert_eq!(request["httpMethod"], "POST", "no GET/SSE: {request}");
+        assert_eq!(request["protocolVersionHeader"], "2026-07-28", "{request}");
+        assert_eq!(request["sessionHeaderPresent"], false, "{request}");
+        let message = request.get("message").unwrap_or(request);
+        assert_ne!(message["method"], "initialize", "{request}");
+        assert_eq!(
+            message["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28",
+            "{request}"
+        );
+        assert!(
+            message["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"].is_object(),
+            "{request}"
+        );
+        assert_eq!(request["methodHeader"], message["method"], "{request}");
+    }
+    assert!(count > 0, "must observe actual wire requests");
+}
+
+/// Required local-candidate acceptance: every connect/error diagnostic stays
+/// modern, and diagnostics recognize a valid modern discovery response.
+#[tokio::test]
+async fn harness_local_bridge_modern_errors_and_discovery() {
+    use pi_acp::mcp::{apply_http_protocol_version, normalize_mcp_servers_v2, McpSessionManager};
+    let _guard = acquire_test_lock().await;
+    let Some(env) = local_chain_env() else {
+        eprintln!("SKIP: set PI_ACP_TEST_BRIDGE_SETUP to run local-candidate error acceptance");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = tmp.path().join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    let modern = spawn_http_script(&env, "errors", tmp.path(), "fake-mcp-modern-http.mjs")
+        .await
+        .expect("modern HTTP fixture");
+    let legacy = spawn_fake_http(&env, "legacy-errors", tmp.path())
+        .await
+        .expect("legacy HTTP fixture");
+    let mut descriptors = Vec::new();
+    let mut script = Vec::new();
+    for path in ["incompatible", "error", "malformed", "auth"] {
+        descriptors.push(json!({"type":"http", "name":path, "url":format!("http://127.0.0.1:{}/{path}", modern.port), "headers":[]}));
+        script.push(json!({"op":"connect", "server":path}));
+    }
+    descriptors.push(json!({"type":"http", "name":"sse", "url":format!("http://127.0.0.1:{}/sse", legacy.port), "headers":[]}));
+    script.push(json!({"op":"connect", "server":"sse"}));
+    script.push(json!({"op":"probe", "server":"valid-discovery", "url":format!("http://127.0.0.1:{}/mcp", modern.port), "protocolVersion":"2026-07-28"}));
+    let descriptors: Vec<agent_client_protocol_schema::v2::McpServer> =
+        serde_json::from_value(json!(descriptors)).unwrap();
+    let mut specs = normalize_mcp_servers_v2(&descriptors).unwrap();
+    apply_http_protocol_version(&mut specs, Some("2026-07-28")).unwrap();
+    let mut servers: Value =
+        serde_json::from_str(&McpSessionManager::new(specs).payload_json().unwrap()).unwrap();
+    // This data-plane host explicitly selects the bridge's public no-OAuth
+    // policy. Ordinary pi-acp does not add an ACP descriptor OAuth field.
+    // The bounded host-managed API is verified separately without authProvider.
+    for server in servers.as_array_mut().unwrap() {
+        server["definition"]["oauth"] = json!(false);
+    }
+    let events = run_harness(&env, &agent, &servers, &json!(script), tmp.path())
+        .await
+        .expect("local bridge harness");
+    if let Some(directory) = std::env::var_os("PI_ACP_TEST_MCP_EVIDENCE_DIR") {
+        let directory = PathBuf::from(directory).join("error-matrix");
+        fs::create_dir_all(&directory).unwrap();
+        fs::copy(&modern.log, directory.join("modern-http.jsonl")).unwrap();
+        fs::copy(&legacy.log, directory.join("sse-endpoint-http.jsonl")).unwrap();
+        fs::write(
+            directory.join("events.json"),
+            serde_json::to_vec_pretty(&events.iter().map(|e| &e.payload).collect::<Vec<_>>())
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    for name in ["incompatible", "error", "malformed", "auth", "sse"] {
+        let connect = find(&events, "connect", Some(name)).expect("explicit connect result");
+        assert_eq!(
+            connect
+                .pointer("/result/details/error")
+                .and_then(Value::as_str),
+            Some("connect_failed"),
+            "{connect}"
+        );
+    }
+    let discovery = find(&events, "probe", Some("valid-discovery")).expect("diagnostic result");
+    assert_eq!(
+        discovery.pointer("/result/isMcp"),
+        Some(&json!(true)),
+        "valid modern discovery recognized: {discovery}"
+    );
+    assert_no_legacy_http(&modern.log);
+    assert_no_legacy_http(&legacy.log);
+}
+
+/// A corrected local bridge must not remove modes chosen by other consumers.
+#[tokio::test]
+async fn harness_local_bridge_legacy_and_auto_still_connect() {
+    use pi_acp::mcp::{apply_http_protocol_version, normalize_mcp_servers_v2, McpSessionManager};
+    let _guard = acquire_test_lock().await;
+    let Some(env) = local_chain_env() else {
+        eprintln!("SKIP: set PI_ACP_TEST_BRIDGE_SETUP for local compatibility acceptance");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let legacy = spawn_fake_http(&env, "compat", tmp.path())
+        .await
+        .expect("legacy fixture");
+    for selection in ["legacy", "auto"] {
+        let directory = tmp.path().join(selection);
+        fs::create_dir_all(&directory).unwrap();
+        let agent = directory.join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let descriptor = serde_json::from_value(json!({"type":"http", "name":"compat", "url":format!("http://127.0.0.1:{}/mcp", legacy.port), "headers":[]})).unwrap();
+        let mut specs = normalize_mcp_servers_v2(&[descriptor]).unwrap();
+        apply_http_protocol_version(&mut specs, Some(selection)).unwrap();
+        let servers =
+            serde_json::from_str(&McpSessionManager::new(specs).payload_json().unwrap()).unwrap();
+        let script = json!([{"op":"connect","server":"compat"},{"op":"call","server":"compat","tool":"compat_echo","args":{"text":selection}}]);
+        let events = run_harness(&env, &agent, &servers, &script, &directory)
+            .await
+            .expect("compatibility harness");
+        let call = find(&events, "call", Some("compat")).unwrap();
+        let expected = format!("echo:{selection}");
+        assert_eq!(
+            call.pointer("/result/content/0/text")
+                .and_then(Value::as_str),
+            Some(expected.as_str()),
+            "{call}"
+        );
+    }
+}
+
+/// Verify the documented native Pi TypeScript extension path, without a model
+/// prompt, a normal profile, or assuming a compiled host-managed.js exists.
+#[tokio::test]
+async fn real_pi_local_host_managed_typescript_loads_over_acp_v2() {
+    use agent_client_protocol::v2::schema as v2;
+    let _guard = acquire_test_lock().await;
+    let Some(setup_path) = std::env::var_os("PI_ACP_TEST_BRIDGE_SETUP") else {
+        eprintln!("SKIP: set PI_ACP_TEST_BRIDGE_SETUP for native TS loading acceptance");
+        return;
+    };
+    let setup: Value = serde_json::from_str(&fs::read_to_string(setup_path).unwrap()).unwrap();
+    assert_eq!(setup["nativePiVersion"], "1.5.2");
+    let module = PathBuf::from(setup["envDir"].as_str().unwrap())
+        .join("node_modules/pi-mcp-adapter/host-managed.ts");
+    assert!(module.is_file(), "supported public TS module");
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join("agent");
+    let extension_dir = agent_dir.join("extensions");
+    fs::create_dir_all(&extension_dir).unwrap();
+    let log = tmp.path().join("loaded.json");
+    let quoted_module = serde_json::to_string(&module.to_string_lossy()).unwrap();
+    let extension = format!(
+        r#"
+import {{ createHostManagedMcpAdapter }} from {quoted_module};
+import fs from "node:fs";
+export default async function(pi) {{
+  const adapter = createHostManagedMcpAdapter({{
+    servers: {{}}, onToolCall: async call => call.dispatch(),
+  }});
+  await adapter.ready();
+  adapter.extensionFactory(pi);
+  fs.writeFileSync(process.env.PI_ACP_HOST_LOAD_LOG, JSON.stringify({{ loaded: true }}));
+  pi.on("session_shutdown", () => adapter.close());
+}}
+"#
+    );
+    fs::write(extension_dir.join("host-managed-load.ts"), extension).unwrap();
+    fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"extensions":["-builtin:mcp"]}"#,
+    )
+    .unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let cfg = AcpAgentConfig::new(BIN)
+        .env("PI_ACP_PI_COMMAND", setup["nativePi"].as_str().unwrap())
+        .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+        .env("PI_OFFLINE", "1")
+        // Synthetic value permits a catalog; no prompt or provider call occurs.
+        .env("ANTHROPIC_API_KEY", "pi-acp-loading-test-dummy")
+        .env("PI_ACP_HOST_LOAD_LOG", log.to_str().unwrap());
+    Client
+        .v2()
+        .name("local-host-module-loading")
+        .connect_with(AcpAgent::new(cfg), async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(
+                ProtocolVersion::V2,
+                v2::Implementation::new("loading-test", "1"),
+            ))
+            .block_task()
+            .await?;
+            let session = cx
+                .send_request(v2::NewSessionRequest::new(&cwd))
+                .block_task()
+                .await?;
+            let _ = cx
+                .send_request(v2::CloseSessionRequest::new(session.session_id))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await
+        .expect("native Pi session loads the supported TS extension");
+    let loaded: Value =
+        serde_json::from_str(&fs::read_to_string(log).expect("actual native extension load"))
+            .unwrap();
+    assert_eq!(loaded["loaded"], true);
+    // Native Pi may initialize its own auth storage in this temporary profile.
+    // The test does not inspect or copy it; no normal profile is accessed.
+}
+
+/// The selected host-managed path uses its public client-era option, its own
+/// SDK dependency root, and a transport with no authProvider. Exercise it in
+/// actual native Pi, still without a model prompt or normal profile.
+#[tokio::test]
+async fn real_pi_local_host_managed_modern_success_and_errors() {
+    use agent_client_protocol::v2::schema as v2;
+    let _guard = acquire_test_lock().await;
+    let Some(env) = local_chain_env() else {
+        eprintln!("SKIP: set PI_ACP_TEST_BRIDGE_SETUP for native host-managed wire acceptance");
+        return;
+    };
+    let setup: Value = serde_json::from_str(
+        &fs::read_to_string(std::env::var_os("PI_ACP_TEST_BRIDGE_SETUP").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let modern = spawn_http_script(&env, "native-host", tmp.path(), "fake-mcp-modern-http.mjs")
+        .await
+        .expect("native host modern fixture");
+    let legacy = spawn_fake_http(&env, "native-sse", tmp.path())
+        .await
+        .expect("native host SSE-only fixture");
+    let module = PathBuf::from(setup["envDir"].as_str().unwrap())
+        .join("node_modules/pi-mcp-adapter/host-managed.ts");
+    let extension = r#"
+import { createHostManagedMcpAdapter } from __MODULE__;
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+export default async function(pi) {
+  const sdk = await import(pathToFileURL(createRequire(__MODULE__).resolve("@modelcontextprotocol/client")).href);
+  const server = url => ({ protocolVersion: "2026-07-28", createTransport: () => new sdk.StreamableHTTPClientTransport(new URL(url)) });
+  const calls = [];
+  const adapter = createHostManagedMcpAdapter({
+    servers: { fixture: server(__BASE__ + "/mcp") },
+    onToolCall: async call => call.dispatch(), requestTimeoutMs: 3000,
+  });
+  await adapter.ready();
+  adapter.extensionFactory({
+    registerTool: tool => { calls.push(tool); pi.registerTool(tool); },
+    events: { emit: (_name, request) => {
+      if (typeof request?.claim === "function") request.claim(() =>
+        request.serverName === "fixture" && request.originalToolName === "get_assignment" ? "allow_once" : "deny");
+    } },
+  });
+  if (calls.length !== 1) throw new Error("Unexpected host-managed tool catalog");
+  const result = await calls[0].execute("native-fixture-call", {}, undefined);
+  await adapter.close();
+  const failures = {};
+  for (const path of ["incompatible", "error", "malformed", "auth", "sse"]) {
+    const url = path === "sse" ? __SSE__ : __BASE__ + "/" + path;
+    const negative = createHostManagedMcpAdapter({servers:{fixture:server(url)},onToolCall:async call => call.dispatch(),requestTimeoutMs:3000});
+    try { await negative.ready(); failures[path] = false; }
+    catch { failures[path] = true; }
+    finally { await negative.close(); }
+  }
+  fs.writeFileSync(process.env.PI_ACP_HOST_LOAD_LOG, JSON.stringify({ result, failures }));
+}
+"#
+        .replace("__MODULE__", &serde_json::to_string(&module.to_string_lossy()).unwrap())
+        .replace("__BASE__", &serde_json::to_string(&format!("http://127.0.0.1:{}", modern.port)).unwrap())
+        .replace("__SSE__", &serde_json::to_string(&format!("http://127.0.0.1:{}/sse", legacy.port)).unwrap());
+    let agent = tmp.path().join("agent");
+    let extensions = agent.join("extensions");
+    fs::create_dir_all(&extensions).unwrap();
+    fs::write(extensions.join("host-managed-wire.ts"), &extension).unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"extensions":["-builtin:mcp"]}"#,
+    )
+    .unwrap();
+    let log = tmp.path().join("native-result.json");
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let cfg = AcpAgentConfig::new(BIN)
+        .env("PI_ACP_PI_COMMAND", setup["nativePi"].as_str().unwrap())
+        .env("PI_CODING_AGENT_DIR", agent.to_str().unwrap())
+        .env("PI_OFFLINE", "1")
+        .env("ANTHROPIC_API_KEY", "pi-acp-loading-test-dummy")
+        .env("PI_ACP_HOST_LOAD_LOG", log.to_str().unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        Client
+            .v2()
+            .name("native-host-wire")
+            .connect_with(AcpAgent::new(cfg), async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("native-host-wire", "1"),
+                ))
+                .block_task()
+                .await?;
+                let session = cx
+                    .send_request(v2::NewSessionRequest::new(&cwd))
+                    .block_task()
+                    .await?;
+                cx.send_request(v2::CloseSessionRequest::new(session.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            }),
+    )
+    .await
+    .expect("native host acceptance bounded")
+    .expect("ACP v2 session");
+    let result: Value =
+        serde_json::from_str(&fs::read_to_string(&log).expect("native host result")).unwrap();
+    if let Some(directory) = std::env::var_os("PI_ACP_TEST_MCP_EVIDENCE_DIR") {
+        let directory = PathBuf::from(directory).join("native-host-managed");
+        fs::create_dir_all(&directory).unwrap();
+        fs::copy(&modern.log, directory.join("modern-http.jsonl")).unwrap();
+        fs::copy(&legacy.log, directory.join("sse-endpoint-http.jsonl")).unwrap();
+        fs::copy(&log, directory.join("result.json")).unwrap();
+        fs::write(directory.join("extension.ts"), extension).unwrap();
+    }
+    assert_eq!(
+        result
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str),
+        Some("MODERN_MCP_FIXTURE_OK"),
+        "{result}"
+    );
+    for path in ["incompatible", "error", "malformed", "auth", "sse"] {
+        assert_eq!(result["failures"][path], true, "{result}");
+    }
+    assert_no_legacy_http(&modern.log);
+    assert_no_legacy_http(&legacy.log);
+    let methods = server_log_methods(&modern.log);
+    for method in ["server/discover", "tools/list", "tools/call"] {
+        assert!(methods.contains(&method.to_string()), "{methods:?}");
+    }
 }

@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     AuthMethod, CancelNotification, ContentBlock, DeleteSessionRequest, InitializeRequest,
     ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionConfigKind,
     SessionConfigOptionCategory, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
     on_receive_notification, AcpAgent, AcpAgentConfig, Client, UntypedMessage,
 };
@@ -111,9 +111,9 @@ fn all_text(log: &[(String, SessionUpdate)]) -> String {
 }
 
 fn find_config_option<'a>(
-    options: &'a [agent_client_protocol::schema::v1::SessionConfigOption],
+    options: &'a [agent_client_protocol::v1::schema::SessionConfigOption],
     id: &str,
-) -> Option<&'a agent_client_protocol::schema::v1::SessionConfigOption> {
+) -> Option<&'a agent_client_protocol::v1::schema::SessionConfigOption> {
     options.iter().find(|o| o.id.0.as_ref() == id)
 }
 
@@ -173,7 +173,7 @@ async fn full_method_set_against_mock_pi() {
     let log_in_handler = log.clone();
 
     Client
-        .builder()
+        .v1()
         .name("s6-e2e-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -541,14 +541,14 @@ async fn full_method_set_against_mock_pi() {
                 .send_request(DeleteSessionRequest::new("old-session"))
                 .block_task()
                 .await?;
-            let _: agent_client_protocol::schema::v1::DeleteSessionResponse = deleted;
+            let _: agent_client_protocol::v1::schema::DeleteSessionResponse = deleted;
             assert!(!pi_session.exists(), "session file must be deleted");
 
             let deleted_again = cx
                 .send_request(DeleteSessionRequest::new("old-session"))
                 .block_task()
                 .await?;
-            let _: agent_client_protocol::schema::v1::DeleteSessionResponse = deleted_again;
+            let _: agent_client_protocol::v1::schema::DeleteSessionResponse = deleted_again;
 
             Ok(())
         })
@@ -601,7 +601,7 @@ async fn new_session_map_waits_for_persisted_session_file() {
     );
 
     let result = Client
-        .builder()
+        .v1()
         .name("s6-session-persistence-client")
         .connect_with(agent, async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -693,7 +693,7 @@ async fn additional_workspace_roots_roundtrip_and_load_empty_clears_them() {
     let log: NotifLog = Arc::new(Mutex::new(Vec::new()));
     let log_in_handler = log.clone();
     let result = Client
-        .builder()
+        .v1()
         .name("additional-roots-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -838,7 +838,7 @@ async fn unpersisted_new_session_is_unknown_after_restart() {
     };
 
     let first = Client
-        .builder()
+        .v1()
         .name("s6-session-restart-create-client")
         .connect_with(make_agent(), async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -859,7 +859,7 @@ async fn unpersisted_new_session_is_unknown_after_restart() {
     first.expect("initial connection should complete");
 
     let second = Client
-        .builder()
+        .v1()
         .name("s6-session-restart-load-client")
         .connect_with(make_agent(), async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -896,7 +896,7 @@ async fn set_session_model_unknown_session_errors() {
     let log_in_handler = log.clone();
 
     let result = Client
-        .builder()
+        .v1()
         .name("s6-e2e-client-2")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -949,7 +949,7 @@ async fn unknown_config_option_errors() {
     );
 
     let result = Client
-        .builder()
+        .v1()
         .name("s6-e2e-client-3")
         .connect_with(agent, async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -1000,7 +1000,7 @@ async fn thinking_max_level_round_trips() {
     );
 
     let result = Client
-        .builder()
+        .v1()
         .name("thinking-max-client")
         .connect_with(agent, async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -1059,7 +1059,7 @@ async fn thinking_max_level_round_trips() {
 /// `thought_level` options and the mode list.
 #[tokio::test]
 async fn model_switch_reshapes_thinking_levels() {
-    use agent_client_protocol::schema::v1::SessionConfigSelectOptions;
+    use agent_client_protocol::v1::schema::SessionConfigSelectOptions;
     let _test_guard = acquire_test_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
@@ -1070,7 +1070,7 @@ async fn model_switch_reshapes_thinking_levels() {
     );
 
     fn thought_ids(
-        options: &[agent_client_protocol::schema::v1::SessionConfigOption],
+        options: &[agent_client_protocol::v1::schema::SessionConfigOption],
     ) -> Vec<String> {
         let thought = find_config_option(options, "thought_level").expect("thought_level option");
         if let SessionConfigKind::Select(sel) = &thought.kind {
@@ -1086,7 +1086,7 @@ async fn model_switch_reshapes_thinking_levels() {
     let log_in_handler = log.clone();
 
     let result = Client
-        .builder()
+        .v1()
         .name("thinking-dynamic-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -1180,7 +1180,7 @@ async fn prompt_after_pi_death_returns_explicit_error() {
     );
 
     let result = Client
-        .builder()
+        .v1()
         .name("s8-dead-pi-client")
         .connect_with(agent, async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -1206,7 +1206,7 @@ async fn prompt_after_pi_death_returns_explicit_error() {
                 .expect_err("prompt must fail when pi dies mid-turn");
             assert_eq!(
                 err.code,
-                agent_client_protocol::schema::v1::ErrorCode::InternalError
+                agent_client_protocol::v1::schema::ErrorCode::InternalError
             );
             assert!(err.message.contains("pi process exited"), "{}", err.message);
             assert!(
@@ -1230,7 +1230,7 @@ async fn prompt_after_pi_death_returns_explicit_error() {
                 .expect_err("later prompt on a dead session must error");
             assert_eq!(
                 err2.code,
-                agent_client_protocol::schema::v1::ErrorCode::InternalError
+                agent_client_protocol::v1::schema::ErrorCode::InternalError
             );
             assert!(
                 err2.message.contains("pi process exited"),
@@ -1270,7 +1270,7 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
     );
 
     let result = Client
-        .builder()
+        .v1()
         .name("s8-auth-prompt-client")
         .connect_with(agent, async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -1293,7 +1293,7 @@ async fn auth_looking_prompt_error_surfaces_auth_required() {
                 .expect_err("auth-looking pi error must promote to authRequired");
             assert_eq!(
                 err.code,
-                agent_client_protocol::schema::v1::ErrorCode::AuthRequired
+                agent_client_protocol::v1::schema::ErrorCode::AuthRequired
             );
             assert!(
                 err.message.contains("Configure an API key"),
@@ -1331,7 +1331,7 @@ async fn auth_looking_models_error_on_new_surfaces_auth_required() {
     );
 
     let result = Client
-        .builder()
+        .v1()
         .name("s8-auth-new-client")
         .connect_with(agent, async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -1346,7 +1346,7 @@ async fn auth_looking_models_error_on_new_surfaces_auth_required() {
                 .expect_err("auth-looking models error must fail session/new");
             assert_eq!(
                 err.code,
-                agent_client_protocol::schema::v1::ErrorCode::AuthRequired
+                agent_client_protocol::v1::schema::ErrorCode::AuthRequired
             );
             let data = err.data.as_ref().expect("authRequired data");
             let methods = data["authMethods"].as_array().expect("authMethods array");
@@ -1382,7 +1382,7 @@ async fn load_session_surfaces_get_messages_failure() {
     );
 
     let result = Client
-        .builder()
+        .v1()
         .name("s8-load-error-client")
         .connect_with(agent, async |cx| {
             // initialize (the ACP handshake is mandatory: the protocol
@@ -1397,7 +1397,7 @@ async fn load_session_surfaces_get_messages_failure() {
                 .expect_err("get_messages failure must fail session/load");
             assert_eq!(
                 err.code,
-                agent_client_protocol::schema::v1::ErrorCode::InternalError
+                agent_client_protocol::v1::schema::ErrorCode::InternalError
             );
             assert!(err.message.contains("pi process exited"), "{}", err.message);
             assert_eq!(
@@ -1443,7 +1443,7 @@ async fn load_history_is_complete_when_the_response_returns() {
     let log_in_handler = log.clone();
 
     Client
-        .builder()
+        .v1()
         .name("load-boundary-client")
         .on_receive_notification(
             async move |notif: SessionNotification, _cx| {
@@ -1514,7 +1514,7 @@ async fn v1_tip_fork_preserves_source_and_restores_the_child() {
             .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
     );
     Client
-        .builder()
+        .v1()
         .name("tip-fork-v1")
         .connect_with(agent, async |cx| {
             let init = cx
@@ -1523,7 +1523,7 @@ async fn v1_tip_fork_preserves_source_and_restores_the_child() {
                 .await?;
             assert!(init.agent_capabilities.session_capabilities.fork.is_some());
             let response = cx
-                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                .send_request(agent_client_protocol::v1::schema::ForkSessionRequest::new(
                     "source-session",
                     &cwd,
                 ))
@@ -1558,7 +1558,7 @@ async fn v1_tip_fork_preserves_source_and_restores_the_child() {
                 .await?;
             assert_eq!(fs::read(&source_file).unwrap(), original);
             let unknown = cx
-                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                .send_request(agent_client_protocol::v1::schema::ForkSessionRequest::new(
                     "not-a-session",
                     &cwd,
                 ))
@@ -1588,14 +1588,14 @@ async fn failed_tip_fork_does_not_delete_the_source_or_leave_a_child() {
             .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
     );
     Client
-        .builder()
+        .v1()
         .name("tip-fork-failure")
         .connect_with(agent, async |cx| {
             cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
             assert!(cx
-                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                .send_request(agent_client_protocol::v1::schema::ForkSessionRequest::new(
                     "source-session",
                     &cwd
                 ))
@@ -1627,14 +1627,14 @@ async fn cancelled_tip_fork_leaves_only_the_source_session() {
             .env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap()),
     );
     Client
-        .builder()
+        .v1()
         .name("tip-fork-cancel")
         .connect_with(agent, async |cx| {
             cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
             assert!(cx
-                .send_request(agent_client_protocol::schema::v1::ForkSessionRequest::new(
+                .send_request(agent_client_protocol::v1::schema::ForkSessionRequest::new(
                     "source-session",
                     &cwd
                 ))
